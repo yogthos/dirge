@@ -812,7 +812,12 @@ pub async fn run_interactive(
                                     let mut mgr = pm.lock().unwrap();
                                     if let Ok(result) = mgr.dispatch(
                                         "on-prompt",
-                                        &format!("@{{:prompt \"{}\"}}", text.replace('"', "\\\"")),
+                                        &format!(
+                                            "@{{:prompt \"{}\"}}",
+                                            text.replace('\\', "\\\\")
+                                                .replace('"', "\\\"")
+                                                .replace('\n', "\\n")
+                                        ),
                                     ) {
                                         if !result.is_empty() {
                                             renderer.write_line(
@@ -966,7 +971,13 @@ pub async fn run_interactive(
                             let mut mgr = pm.lock().unwrap();
                             if let Ok(result) = mgr.dispatch(
                                 "on-response",
-                                &format!("@{{:response \"{}\"}}", response.replace('"', "\\\"")),
+                                &format!(
+                                    "@{{:response \"{}\"}}",
+                                    response
+                                        .replace('\\', "\\\\")
+                                        .replace('"', "\\\"")
+                                        .replace('\n', "\\n")
+                                ),
                             ) {
                                 if !result.is_empty() {
                                     renderer.write_line(
