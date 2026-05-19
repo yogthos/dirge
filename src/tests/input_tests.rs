@@ -842,3 +842,49 @@ fn paste_mark_chars_stripped_from_input() {
     // (still >= 4) so it should collapse.
     assert_eq!(editor.expanded().as_str(), "a\nb\n\nc\nd");
 }
+
+#[test]
+fn ctrl_w_does_not_split_paste_marker() {
+    // Regression: word-skip-back from position past a paste marker used
+    // prev_word_boundary directly, which treats \x01 as punctuation and
+    // would happily land mid-marker — corrupting it.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "before ");
+    editor.handle_paste("L1\nL2\nL3\nL4");
+    type_str(&mut editor, " after");
+    // Cursor at end of buffer. Ctrl+W should kill "after"; the marker stays.
+    editor.handle_key(ctrl(KeyCode::Char('w')));
+    // Buffer should still contain the paste marker intact.
+    let mark_count = editor.buffer.matches('\u{0001}').count();
+    assert_eq!(mark_count, 2, "marker bytes corrupted by Ctrl+W");
+    assert_eq!(editor.expanded().as_str(), "before L1\nL2\nL3\nL4 ");
+}
+
+#[test]
+fn meta_b_skips_past_paste_marker() {
+    // Meta+B from after the marker should land before the marker, not inside.
+    let mut editor = InputEditor::new();
+    editor.handle_paste("L1\nL2\nL3\nL4");
+    type_str(&mut editor, " trailing");
+    // Meta+B once: lands at the start of "trailing".
+    editor.handle_key(meta(KeyCode::Char('b')));
+    // Meta+B again: should jump past the entire marker block.
+    let before = editor.cursor;
+    editor.handle_key(meta(KeyCode::Char('b')));
+    // Now cursor should be at byte 0 (before the marker).
+    assert_eq!(editor.cursor, 0);
+    assert!(editor.cursor < before);
+    // Marker still intact.
+    assert_eq!(editor.buffer.matches('\u{0001}').count(), 2);
+}
+
+#[test]
+fn paste_during_picker_is_ignored() {
+    // When the picker is active, paste should not insert marker bytes into
+    // the buffer (the picker doesn't know about them, would render badly).
+    let mut editor = InputEditor::new();
+    editor.handle_key(press(KeyCode::Char('@')));
+    let buffer_before = editor.buffer.to_string();
+    editor.handle_paste("a\nb\nc\nd");
+    assert_eq!(editor.buffer.as_str(), buffer_before);
+}

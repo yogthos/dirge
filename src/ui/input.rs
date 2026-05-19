@@ -226,6 +226,19 @@ fn next_pos(s: &str, cursor: usize) -> usize {
     skip_right_over_marker(s, next_char_boundary(s, cursor))
 }
 
+/// Word-skip left, but never land mid-marker. `prev_word_boundary` is
+/// marker-blind (it sees `\x01` as punctuation and would happily split the
+/// marker open), so we post-process with `skip_left_over_marker` to round any
+/// in-marker landing back to the marker's left edge.
+fn prev_word_pos(s: &str, cursor: usize) -> usize {
+    skip_left_over_marker(s, prev_word_boundary(s, cursor))
+}
+
+/// Word-skip right, with the symmetric marker-safety post-process.
+fn next_word_pos(s: &str, cursor: usize) -> usize {
+    skip_right_over_marker(s, next_word_boundary(s, cursor))
+}
+
 /// What range a backspace at `cursor` should remove. If the character to the
 /// left is the closing mark of a placeholder, return the whole block;
 /// otherwise return a single char.
@@ -311,6 +324,14 @@ impl InputEditor {
     /// by a placeholder, expand that placeholder inline instead (so a second
     /// paste of the same content reveals the body).
     pub fn handle_paste(&mut self, text: &str) {
+        // The file picker (`@query`) maintains its own filter state. A paste
+        // landing here would write marker bytes into the buffer that the
+        // picker doesn't know about, leaving a stale/corrupt query. Easiest
+        // to just ignore pastes while the picker is active — the user can
+        // close the picker (Esc) and re-paste.
+        if self.picker.as_ref().is_some_and(|p| p.active) {
+            return;
+        }
         // Strip PASTE_MARK so it can never appear in paste content and confuse
         // the marker parser.
         let cleaned: String = text.chars().filter(|&c| c != PASTE_MARK).collect();
@@ -674,7 +695,7 @@ impl InputEditor {
             // Ctrl+W → kill word before
             KeyCode::Char('w') if ctrl => {
                 if self.cursor > 0 {
-                    let start = prev_word_boundary(&self.buffer, self.cursor);
+                    let start = prev_word_pos(&self.buffer, self.cursor);
                     let killed: CompactString = self.buffer[start..self.cursor].into();
                     self.buffer.replace_range(start..self.cursor, "");
                     self.cursor = start;
@@ -748,7 +769,7 @@ impl InputEditor {
             // Meta+D → delete word after
             KeyCode::Char('d') if alt => {
                 if self.cursor < self.buffer.len() {
-                    let end = next_word_boundary(&self.buffer, self.cursor);
+                    let end = next_word_pos(&self.buffer, self.cursor);
                     self.buffer.replace_range(self.cursor..end, "");
                 }
                 self.reset_kill_accumulation();
@@ -758,7 +779,7 @@ impl InputEditor {
             // Meta+B → prev word (Emacs style)
             KeyCode::Char('b') if alt => {
                 if self.cursor > 0 {
-                    self.cursor = prev_word_boundary(&self.buffer, self.cursor);
+                    self.cursor = prev_word_pos(&self.buffer, self.cursor);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -767,7 +788,7 @@ impl InputEditor {
             // Meta+F → next word (Emacs style)
             KeyCode::Char('f') if alt => {
                 if self.cursor < self.buffer.len() {
-                    self.cursor = next_word_boundary(&self.buffer, self.cursor);
+                    self.cursor = next_word_pos(&self.buffer, self.cursor);
                 } else {
                     self.cursor = self.buffer.len();
                 }
@@ -778,7 +799,7 @@ impl InputEditor {
             // Meta+Left → prev word
             KeyCode::Left if alt => {
                 if self.cursor > 0 {
-                    self.cursor = prev_word_boundary(&self.buffer, self.cursor);
+                    self.cursor = prev_word_pos(&self.buffer, self.cursor);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -787,7 +808,7 @@ impl InputEditor {
             // Meta+Right → next word
             KeyCode::Right if alt => {
                 if self.cursor < self.buffer.len() {
-                    self.cursor = next_word_boundary(&self.buffer, self.cursor);
+                    self.cursor = next_word_pos(&self.buffer, self.cursor);
                 } else {
                     self.cursor = self.buffer.len();
                 }
@@ -798,7 +819,7 @@ impl InputEditor {
             // Meta+Backspace → delete word before
             KeyCode::Backspace if alt => {
                 if self.cursor > 0 {
-                    let start = prev_word_boundary(&self.buffer, self.cursor);
+                    let start = prev_word_pos(&self.buffer, self.cursor);
                     self.buffer.replace_range(start..self.cursor, "");
                     self.cursor = start;
                 }
