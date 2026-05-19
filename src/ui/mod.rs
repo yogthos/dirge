@@ -598,7 +598,7 @@ pub async fn run_interactive(
                                     is_running,
                                 )?;
                                 if let Some(ref picker) = input.picker {
-                                    picker.draw()?;
+                                    picker.draw(renderer.input_top_row())?;
                                 }
                                 continue;
                             }
@@ -868,7 +868,7 @@ pub async fn run_interactive(
                             is_running,
                         )?;
                         if let Some(ref picker) = input.picker {
-                            picker.draw()?;
+                            picker.draw(renderer.input_top_row())?;
                         }
                     }
                 }
@@ -1275,7 +1275,7 @@ pub async fn run_interactive(
                     is_running,
                 )?;
                 if let Some(ref picker) = input.picker {
-                    picker.draw()?;
+                    picker.draw(renderer.input_top_row())?;
                 }
             }
             Some(ask_req) = async {
@@ -1354,7 +1354,7 @@ pub async fn run_interactive(
                     is_running,
                 )?;
                 if let Some(ref picker) = input.picker {
-                    picker.draw()?;
+                    picker.draw(renderer.input_top_row())?;
                 }
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if is_running => {
@@ -1364,7 +1364,7 @@ pub async fn run_interactive(
                     is_running,
                 )?;
                 if let Some(ref picker) = input.picker {
-                    picker.draw()?;
+                    picker.draw(renderer.input_top_row())?;
                 }
             }
             else => {

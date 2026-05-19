@@ -116,6 +116,14 @@ impl Renderer {
         rows.saturating_sub(self.input_rows + 1) as usize
     }
 
+    /// The screen row index where the input box starts. Overlays that need
+    /// to anchor *above* the input box (e.g. the file picker) should treat
+    /// this as their bottom limit.
+    pub fn input_top_row(&self) -> u16 {
+        let (_, rows) = self.terminal_size();
+        rows.saturating_sub(self.input_rows + 1)
+    }
+
     pub fn buffer_line_at_row(&self, row: u16) -> Option<usize> {
         let (_, rows) = self.terminal_size();
         let visible = rows.saturating_sub(self.input_rows + 1) as usize;
@@ -529,7 +537,12 @@ impl Renderer {
         // glance which row is "the" prompt and which are wrapped lines.
         let prompt_cont = "· ";
 
-        let visible_width = cols.saturating_sub(2) as usize;
+        // Reserve right-edge space for the token counter so it never
+        // overdraws line content. Width is the width of the longest
+        // realistic counter string ("  (NNNN tk)" ~= 12 chars).
+        let token_est = editor.expanded().len() as u64 / 4;
+        let counter_reserve: u16 = if token_est > 0 { 12 } else { 0 };
+        let visible_width = cols.saturating_sub(2 + counter_reserve) as usize;
 
         // Recompute horizontal scroll based on the cursor's line. Each draw
         // re-anchors so very long single lines still pan horizontally.
@@ -572,14 +585,11 @@ impl Renderer {
             write!(stdout, "{}", visible)?;
         }
 
-        // Token estimate counts the expanded text on the last visible row's
-        // trailing space, so it doesn't shift around while editing.
-        let last_row = input_top + (visible_input_rows as u16 - 1);
-        let token_est = editor.expanded().len() as u64 / 4;
-        if token_est > 0 {
-            stdout.execute(MoveTo(0, last_row))?;
-            // Place the counter at the right side of the row, beyond any
-            // visible text so we don't overdraw line content.
+        // Token counter on the last visible row, sitting in the reserved
+        // right-edge gap (see `counter_reserve` above). Doesn't overdraw
+        // line content because `visible_width` already excludes this band.
+        if counter_reserve > 0 {
+            let last_row = input_top + (visible_input_rows as u16 - 1);
             let counter = format!("  ({} tk)", token_est);
             let counter_col = cols.saturating_sub(counter.len() as u16);
             stdout.execute(MoveTo(counter_col, last_row))?;

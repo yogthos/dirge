@@ -224,18 +224,26 @@ impl FilePicker {
         *self.file_cache.lock().unwrap_or_else(|e| e.into_inner()) = files;
     }
 
-    pub fn draw(&self) -> std::io::Result<()> {
+    /// Draw the picker overlay just above the input box.
+    ///
+    /// `input_top` is the screen row where the input box begins — the picker
+    /// stops one row above it. With the multi-line input feature, the input
+    /// box can be several rows tall, so we can't hardcode `rows - 2` here
+    /// anymore.
+    pub fn draw(&self, input_top: u16) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
-        let (cols, rows) = crossterm::terminal::size()?;
+        let (cols, _rows) = crossterm::terminal::size()?;
         let mut stdout = std::io::stdout();
 
-        let max_items = (rows.saturating_sub(4)).min(10) as usize;
+        // Bottom anchor row for the picker — one above the input box.
+        let bottom_anchor = input_top.saturating_sub(1);
+        // Cap list height so we don't run off the top of the screen.
+        let max_items = (bottom_anchor as usize).min(10);
 
         if self.matches.is_empty() {
-            let r = rows.saturating_sub(3);
-            stdout.execute(MoveTo(0, r))?;
+            stdout.execute(MoveTo(0, bottom_anchor))?;
             write!(
                 stdout,
                 "{}",
@@ -254,7 +262,7 @@ impl FilePicker {
             .min(self.matches.len().saturating_sub(list_height));
         let end_idx = (start_idx + list_height).min(self.matches.len());
 
-        let top_row = rows.saturating_sub(3).saturating_sub(list_height as u16);
+        let top_row = bottom_anchor.saturating_sub(list_height as u16);
 
         for i in start_idx..end_idx {
             let render_row = top_row + (i - start_idx) as u16;
