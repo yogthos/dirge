@@ -2,7 +2,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::tools::ToolError;
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
 /// Exa search result item.
 #[derive(Debug, Deserialize)]
@@ -11,12 +11,6 @@ struct ExaResult {
     url: Option<String>,
     #[serde(default)]
     text: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    published_date: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    author: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,12 +34,22 @@ struct ExaContents {
 }
 
 pub struct WebSearchTool {
-    pub api_key: String,
+    pub permission: Option<PermCheck>,
+    pub ask_tx: Option<AskSender>,
+    api_key: String,
 }
 
 impl WebSearchTool {
-    pub fn new(api_key: String) -> Self {
-        Self { api_key }
+    pub fn new(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        api_key: String,
+    ) -> Self {
+        Self {
+            permission,
+            ask_tx,
+            api_key,
+        }
     }
 }
 
@@ -113,6 +117,14 @@ impl Tool for WebSearchTool {
     }
 
     async fn call(&self, args: WebSearchArgs) -> Result<String, ToolError> {
+        check_perm(
+            &self.permission,
+            &self.ask_tx,
+            "websearch",
+            &args.query,
+        )
+        .await?;
+
         let client = reqwest::Client::new();
         let body = ExaRequest {
             query: &args.query,
@@ -163,8 +175,6 @@ mod tests {
             title: Some("Test Title".to_string()),
             url: Some("https://example.com".to_string()),
             text: Some("Some text content".to_string()),
-            published_date: None,
-            author: None,
         }];
         let formatted = format_search_results(&results);
         assert!(formatted.contains("**Test Title**"));
@@ -185,15 +195,11 @@ mod tests {
                 title: Some("First".to_string()),
                 url: Some("https://first.example".to_string()),
                 text: Some("First text".to_string()),
-                published_date: None,
-                author: None,
             },
             ExaResult {
                 title: Some("Second".to_string()),
                 url: Some("https://second.example".to_string()),
                 text: Some("Second text".to_string()),
-                published_date: None,
-                author: None,
             },
         ];
         let formatted = format_search_results(&results);
@@ -204,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_definition_has_correct_name() {
-        let tool = WebSearchTool::new("test-key".to_string());
+        let tool = WebSearchTool::new(None, None, "test-key".to_string());
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "websearch");
     }

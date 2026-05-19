@@ -2,13 +2,19 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 
-use crate::agent::tools::ToolError;
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
-pub struct WebFetchTool;
+pub struct WebFetchTool {
+    pub permission: Option<PermCheck>,
+    pub ask_tx: Option<AskSender>,
+}
 
 impl WebFetchTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
+        Self {
+            permission,
+            ask_tx,
+        }
     }
 }
 
@@ -24,18 +30,23 @@ fn default_max_chars() -> usize {
 }
 
 fn html_to_markdown(html: &str) -> String {
-    html2text::from_read(html.as_bytes(), html.len())
+    // Second arg is line-wrap width (100 cols), not buffer size
+    html2text::from_read(html.as_bytes(), 100)
         .unwrap_or_else(|_| html.to_string())
 }
 
-async fn fetch_url(client: &reqwest::Client, url: &str) -> Result<String, String> {
-    let url = if url.starts_with("http://") {
-        url.replacen("http://", "https://", 1)
-    } else if !url.starts_with("https://") {
-        format!("https://{}", url)
-    } else {
+/// Normalize a URL. Respects explicit http:// (localhost, internal services).
+/// Only prepends https:// when no scheme is present.
+fn normalize_url(url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
         url.to_string()
-    };
+    } else {
+        format!("https://{}", url)
+    }
+}
+
+async fn fetch_url(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let url = normalize_url(url);
 
     let resp = client
         .get(&url)
@@ -73,7 +84,7 @@ impl Tool for WebFetchTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "webfetch".to_string(),
-            description: "Fetch the content of one or more URLs and return it as markdown. HTTP URLs are automatically upgraded to HTTPS. Use for reading documentation pages, API references, or any web content."
+            description: "Fetch the content of one or more URLs and return it as markdown. Schemeless URLs get https:// prepended. Explicit http:// URLs (localhost, internal services) are respected. Use for reading documentation pages, API references, or any web content."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -102,6 +113,14 @@ impl Tool for WebFetchTool {
                 "maximum 10 URLs per call".to_string(),
             ));
         }
+
+        check_perm(
+            &self.permission,
+            &self.ask_tx,
+            "webfetch",
+            &format!("fetch {} urls", args.urls.len()),
+        )
+        .await?;
 
         let client = reqwest::Client::builder()
             .user_agent("dirge/1.0")
@@ -135,15 +154,29 @@ impl Tool for WebFetchTool {
     }
 }
 
-impl Default for WebFetchTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_url_https() {
+        assert_eq!(normalize_url("https://example.com"), "https://example.com");
+    }
+
+    #[test]
+    fn test_normalize_url_http_preserved() {
+        assert_eq!(normalize_url("http://localhost:3000"), "http://localhost:3000");
+    }
+
+    #[test]
+    fn test_normalize_url_schemeless_prepends_https() {
+        assert_eq!(normalize_url("example.com"), "https://example.com");
+    }
+
+    #[test]
+    fn test_normalize_url_internal_http() {
+        assert_eq!(normalize_url("http://169.254.169.254"), "http://169.254.169.254");
+    }
 
     #[test]
     fn test_html_to_markdown_basic() {
@@ -160,23 +193,9 @@ mod tests {
         assert!(md.contains("click here"));
     }
 
-    #[test]
-    fn test_url_upgrade_http_to_https() {
-        // Test the URL upgrade logic via fetch_url's URL normalization
-        let urls = vec![
-            "http://example.com".to_string(),
-            "example.com/page".to_string(),
-            "https://secure.example".to_string(),
-        ];
-        for url in urls {
-            // Just verify the upgrade logic compiles and runs
-            assert!(!url.is_empty());
-        }
-    }
-
     #[tokio::test]
     async fn test_definition_has_correct_name() {
-        let tool = WebFetchTool::new();
+        let tool = WebFetchTool::new(None, None);
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "webfetch");
     }
