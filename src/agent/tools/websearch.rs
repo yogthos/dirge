@@ -40,11 +40,7 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
-    pub fn new(
-        permission: Option<PermCheck>,
-        ask_tx: Option<AskSender>,
-        api_key: String,
-    ) -> Self {
+    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>, api_key: String) -> Self {
         Self {
             permission,
             ask_tx,
@@ -117,13 +113,7 @@ impl Tool for WebSearchTool {
     }
 
     async fn call(&self, args: WebSearchArgs) -> Result<String, ToolError> {
-        check_perm(
-            &self.permission,
-            &self.ask_tx,
-            "websearch",
-            &args.query,
-        )
-        .await?;
+        check_perm(&self.permission, &self.ask_tx, "websearch", &args.query).await?;
 
         let client = reqwest::Client::new();
         let body = ExaRequest {
@@ -156,10 +146,8 @@ impl Tool for WebSearchTool {
             )));
         }
 
-        let parsed: ExaResponse =
-            serde_json::from_str(&body_text).map_err(|e| {
-                ToolError::Msg(format!("websearch parse error: {}", e))
-            })?;
+        let parsed: ExaResponse = serde_json::from_str(&body_text)
+            .map_err(|e| ToolError::Msg(format!("websearch parse error: {}", e)))?;
 
         Ok(format_search_results(&parsed.results))
     }

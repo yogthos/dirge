@@ -185,22 +185,22 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             || std::env::var("WEBSEARCH_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false);
-        let webfetch_enabled = cfg
-            .tools
-            .as_ref()
-            .and_then(|t| t.webfetch)
-            .unwrap_or(false);
+        let webfetch_enabled = cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(false);
 
         let websearch_tool = websearch_enabled
             .then(|| std::env::var("EXA_API_KEY").ok())
             .flatten()
-            .map(|key| Box::new(tools::WebSearchTool::new(
-                permission.clone(),
-                ask_tx.clone(),
-                key,
-            )) as Box<dyn rig::tool::ToolDyn>);
-        let webfetch_tool = webfetch_enabled
-            .then(|| Box::new(tools::WebFetchTool::new(permission.clone(), ask_tx.clone())) as Box<dyn rig::tool::ToolDyn>);
+            .map(|key| {
+                Box::new(tools::WebSearchTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    key,
+                )) as Box<dyn rig::tool::ToolDyn>
+            });
+        let webfetch_tool = webfetch_enabled.then(|| {
+            Box::new(tools::WebFetchTool::new(permission.clone(), ask_tx.clone()))
+                as Box<dyn rig::tool::ToolDyn>
+        });
 
         #[allow(unused_mut)]
         let mut builder = builder.tools(base_tools);

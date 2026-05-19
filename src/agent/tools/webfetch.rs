@@ -11,10 +11,7 @@ pub struct WebFetchTool {
 
 impl WebFetchTool {
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self {
-            permission,
-            ask_tx,
-        }
+        Self { permission, ask_tx }
     }
 }
 
@@ -31,8 +28,7 @@ fn default_max_chars() -> usize {
 
 fn html_to_markdown(html: &str) -> String {
     // Second arg is line-wrap width (100 cols), not buffer size
-    html2text::from_read(html.as_bytes(), 100)
-        .unwrap_or_else(|_| html.to_string())
+    html2text::from_read(html.as_bytes(), 100).unwrap_or_else(|_| html.to_string())
 }
 
 /// Normalize a URL. Respects explicit http:// (localhost, internal services).
@@ -109,9 +105,7 @@ impl Tool for WebFetchTool {
             return Err(ToolError::Msg("no URLs provided".to_string()));
         }
         if args.urls.len() > 10 {
-            return Err(ToolError::Msg(
-                "maximum 10 URLs per call".to_string(),
-            ));
+            return Err(ToolError::Msg("maximum 10 URLs per call".to_string()));
         }
 
         check_perm(
@@ -165,7 +159,10 @@ mod tests {
 
     #[test]
     fn test_normalize_url_http_preserved() {
-        assert_eq!(normalize_url("http://localhost:3000"), "http://localhost:3000");
+        assert_eq!(
+            normalize_url("http://localhost:3000"),
+            "http://localhost:3000"
+        );
     }
 
     #[test]
@@ -175,7 +172,10 @@ mod tests {
 
     #[test]
     fn test_normalize_url_internal_http() {
-        assert_eq!(normalize_url("http://169.254.169.254"), "http://169.254.169.254");
+        assert_eq!(
+            normalize_url("http://169.254.169.254"),
+            "http://169.254.169.254"
+        );
     }
 
     #[test]
