@@ -73,13 +73,13 @@ impl Tool for PlanEnterTool {
             .map_err(|_| ToolError::Msg("plan system unavailable".to_string()))?;
 
         match reply_rx.await {
-            Ok(PlanSwitchResponse::Accepted) => {
-                Ok("plan mode activated".to_string())
-            }
+            Ok(PlanSwitchResponse::Accepted) => Ok("plan mode activated".to_string()),
             Ok(PlanSwitchResponse::Rejected) => {
                 Err(ToolError::Msg("user declined plan mode".to_string()))
             }
-            Err(_) => Err(ToolError::Msg("plan channel closed unexpectedly".to_string())),
+            Err(_) => Err(ToolError::Msg(
+                "plan channel closed unexpectedly".to_string(),
+            )),
         }
     }
 }
@@ -131,13 +131,13 @@ impl Tool for PlanExitTool {
             .map_err(|_| ToolError::Msg("plan system unavailable".to_string()))?;
 
         match reply_rx.await {
-            Ok(PlanSwitchResponse::Accepted) => {
-                Ok("switched to implementation mode".to_string())
-            }
+            Ok(PlanSwitchResponse::Accepted) => Ok("switched to implementation mode".to_string()),
             Ok(PlanSwitchResponse::Rejected) => {
                 Err(ToolError::Msg("user declined mode switch".to_string()))
             }
-            Err(_) => Err(ToolError::Msg("plan channel closed unexpectedly".to_string())),
+            Err(_) => Err(ToolError::Msg(
+                "plan channel closed unexpectedly".to_string(),
+            )),
         }
     }
 }

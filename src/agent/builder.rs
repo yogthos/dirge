@@ -180,10 +180,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             .map(|tx| Box::new(tools::QuestionTool::new(tx)) as Box<dyn rig::tool::ToolDyn>);
 
         let plan_tools = plan_tx.map(|tx| {
-            let enter = Box::new(tools::PlanEnterTool::new(tx.clone()))
-                as Box<dyn rig::tool::ToolDyn>;
-            let exit = Box::new(tools::PlanExitTool::new(tx))
-                as Box<dyn rig::tool::ToolDyn>;
+            let enter =
+                Box::new(tools::PlanEnterTool::new(tx.clone())) as Box<dyn rig::tool::ToolDyn>;
+            let exit = Box::new(tools::PlanExitTool::new(tx)) as Box<dyn rig::tool::ToolDyn>;
             vec![enter, exit]
         });
 

@@ -311,7 +311,7 @@ async fn main() -> anyhow::Result<()> {
                 permission,
                 ask_tx,
                 question_tx.clone(),
-            plan_tx.clone(),
+                plan_tx.clone(),
                 sandbox.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
