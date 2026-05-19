@@ -73,7 +73,7 @@ fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> String {
     let primary_keys: &[&str] = match name {
         "read" | "write" | "edit" | "list_dir" => &["path"],
         "grep" => &["pattern", "path"],
-        "find_files" => &["pattern"],
+        "find_files" | "glob" => &["pattern"],
         "bash" => &["command"],
         "question" => &["questions"],
         "task" | "task_status" => &["prompt", "task_id"],

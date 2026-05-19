@@ -2683,6 +2683,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
+ "glob",
  "html2text",
  "http 1.4.0",
  "ignore",
