@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
-use crate::agent::tools::{MAX_FIND_RESULTS, is_skip_dir};
+use crate::agent::tools::MAX_FIND_RESULTS;
 
 pub struct GlobTool {
     pub permission: Option<PermCheck>,
@@ -70,7 +70,7 @@ impl Tool for GlobTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "glob".to_string(),
-            description: "Find files matching a glob pattern (e.g., '**/*.rs', 'src/**/*.tsx'). Respects .gitignore. Returns matching file paths sorted by modification time. Use this for natural path pattern matching instead of regex-based find_files."
+            description: "Find files matching a glob pattern (e.g., '**/*.rs', 'src/**/*.tsx'). Respects .gitignore via ignore crate. Returns matching relative file paths sorted by modification time (newest first). Returns empty string when no files match. Use this for natural path pattern matching instead of regex-based find_files."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -108,7 +108,7 @@ impl Tool for GlobTool {
             .filter(|p| p.is_dir())
             .unwrap_or_else(|| Path::new("."));
 
-        let mut matches: Vec<String> = Vec::new();
+        let mut matches: Vec<(String, std::path::PathBuf)> = Vec::new();
 
         let walker = WalkBuilder::new(root)
             .hidden(false)
@@ -123,25 +123,15 @@ impl Tool for GlobTool {
                 continue;
             }
 
-            let path = entry.path();
-            let relative = path
+            let abs_path = entry.path().to_path_buf();
+            let relative = abs_path
                 .strip_prefix(root)
-                .unwrap_or(path)
+                .unwrap_or(&abs_path)
                 .to_string_lossy()
                 .into_owned();
 
-            // Skip ignored dirs
-            if let Some(parent) = path.parent() {
-                if parent
-                    .file_name()
-                    .map_or(false, |n| is_skip_dir(&n.to_string_lossy()))
-                {
-                    continue;
-                }
-            }
-
             if re.is_match(&relative) {
-                matches.push(relative);
+                matches.push((relative, abs_path));
             }
 
             if matches.len() >= MAX_FIND_RESULTS {
@@ -150,23 +140,24 @@ impl Tool for GlobTool {
         }
 
         // Sort by modification time (newest first), fall back to alphabetical
-        matches.sort_by(|a, b| {
-            let ma = std::fs::metadata(a)
+        matches.sort_by(|(_, abs_a), (_, abs_b)| {
+            let ma = std::fs::metadata(abs_a)
                 .ok()
                 .and_then(|m| m.modified().ok());
-            let mb = std::fs::metadata(b)
+            let mb = std::fs::metadata(abs_b)
                 .ok()
                 .and_then(|m| m.modified().ok());
             match (ma, mb) {
                 (Some(a), Some(b)) => b.cmp(&a),
-                _ => a.cmp(b),
+                _ => abs_a.cmp(abs_b),
             }
         });
 
-        if matches.is_empty() {
-            Ok("no files matched".to_string())
+        let results: Vec<String> = matches.into_iter().map(|(rel, _)| rel).collect();
+        if results.is_empty() {
+            Ok(String::new())
         } else {
-            Ok(matches.join("\n"))
+            Ok(results.join("\n"))
         }
     }
 }
