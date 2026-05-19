@@ -199,35 +199,28 @@ mod tests {
         assert_eq!(def.name, "task_status");
     }
 
-    // Regression: BackgroundStore::get() evicts on read. Once task_status
-    // returns a completed task to the agent, asking again must return
-    // "not found" rather than re-serving the same payload (which would let
-    // a bad agent loop on the same result and keep it in the store).
+    // task_status is read-only: repeated lookups return the same payload.
+    // Completed tasks are evicted by the store's LRU cap, not by reads, so
+    // an agent can re-fetch its own results idempotently. Notification
+    // delivery (Phase 3) happens out-of-band via drain_notifications().
     #[tokio::test]
-    async fn regression_completed_task_evicts_after_first_status_read() {
+    async fn status_lookup_is_idempotent() {
         let store = BackgroundStore::new();
         store.insert("t1".into());
-        store.update("t1", TaskState::Completed("payload".into()));
+        store.notify("t1", TaskState::Completed("payload".into()));
 
         let tool = TaskStatusTool::new(store);
-        let first = tool
-            .call(TaskStatusArgs {
-                task_id: "t1".into(),
-                wait: None,
-            })
-            .await
-            .unwrap();
-        assert!(first.contains("state: completed"));
-        assert!(first.contains("payload"));
-
-        let second = tool
-            .call(TaskStatusArgs {
-                task_id: "t1".into(),
-                wait: None,
-            })
-            .await;
-        assert!(second.is_err());
-        assert!(second.unwrap_err().to_string().contains("not found"));
+        for _ in 0..3 {
+            let result = tool
+                .call(TaskStatusArgs {
+                    task_id: "t1".into(),
+                    wait: None,
+                })
+                .await
+                .unwrap();
+            assert!(result.contains("state: completed"));
+            assert!(result.contains("payload"));
+        }
     }
 
     // wait=true must also return on failure (not just on completion), and the
