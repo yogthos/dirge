@@ -121,9 +121,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     .unwrap_or_else(|_| ".".into())
                     .join("PLAN.md");
                 if plan_path.exists() {
-                    preamble.push_str(&format!(
+                    preamble.push_str(
                         "\n\n---\n\nA plan file exists at PLAN.md. Execute the plan step by step. Write and test code following the plan. Report progress after each step. The plan is your guide — follow it closely."
-                    ));
+                    );
                 }
             }
             _ => {}
