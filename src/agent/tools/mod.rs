@@ -1,3 +1,4 @@
+pub(crate) mod apply_patch;
 pub(crate) mod background;
 mod bash;
 pub(crate) mod cache;
@@ -19,6 +20,7 @@ mod webfetch;
 mod websearch;
 mod write;
 
+pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
 pub use cache::ToolCache;
 pub use edit::EditTool;

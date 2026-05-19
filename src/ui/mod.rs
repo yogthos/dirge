@@ -77,6 +77,7 @@ fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         "bash" => &["command"],
         "question" => &["questions"],
         "task" | "task_status" => &["prompt", "task_id"],
+        "apply_patch" => &["operations"],
         _ => &[],
     };
 

@@ -174,6 +174,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 ask_tx.clone(),
             )),
             Box::new(tools::MemoryTool::new(permission.clone(), ask_tx.clone())),
+            Box::new(tools::ApplyPatchTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+            )),
         ];
 
         let question_tool = question_tx
