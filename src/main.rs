@@ -23,6 +23,7 @@ use clap::Parser;
 use compact_str::CompactString;
 use session::MessageRole;
 
+use crate::agent::tools::plan::{PlanSwitchReceiver, PlanSwitchSender};
 use crate::agent::tools::question::{QuestionReceiver, QuestionSender};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
@@ -56,10 +57,12 @@ fn build_channels(
     Option<tokio::sync::mpsc::Receiver<crate::permission::ask::AskRequest>>,
     Option<QuestionSender>,
     Option<QuestionReceiver>,
+    Option<PlanSwitchSender>,
+    Option<PlanSwitchReceiver>,
 ) {
     let no_tools = cli.resolve_no_tools(cfg);
     if no_tools {
-        return (None, None, None, None, None);
+        return (None, None, None, None, None, None, None);
     }
 
     let perm_config: PermissionConfig = cfg
@@ -74,12 +77,15 @@ fn build_channels(
 
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
     let (question_tx, question_rx) = tokio::sync::mpsc::channel(64);
+    let (plan_tx, plan_rx) = tokio::sync::mpsc::channel(64);
     (
         Some(perm),
         Some(ask_tx),
         Some(ask_rx),
         Some(question_tx),
         Some(question_rx),
+        Some(plan_tx),
+        Some(plan_rx),
     )
 }
 
@@ -251,7 +257,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
-    let (permission, ask_tx, ask_rx, question_tx, question_rx) = build_channels(&cli, &cfg);
+    let (permission, ask_tx, ask_rx, question_tx, question_rx, plan_tx, plan_rx) =
+        build_channels(&cli, &cfg);
 
     if let Some(perm) = &permission {
         let allowlist: Vec<(String, String)> = session
@@ -275,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
             permission,
             ask_tx,
             question_tx.clone(),
+            plan_tx.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
@@ -303,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
                 permission,
                 ask_tx,
                 question_tx.clone(),
+            plan_tx.clone(),
                 sandbox.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
@@ -321,6 +330,7 @@ async fn main() -> anyhow::Result<()> {
             permission.clone(),
             ask_tx.clone(),
             question_tx.clone(),
+            plan_tx.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
@@ -374,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
             ask_tx,
             ask_rx,
             question_rx,
+            plan_rx,
             sandbox,
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),

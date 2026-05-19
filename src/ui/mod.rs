@@ -13,6 +13,9 @@ use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
+use crate::agent::tools::plan::{
+    PlanAction, PlanSwitchReceiver, PlanSwitchResponse,
+};
 use crate::agent::tools::question::{QuestionReceiver, QuestionResponse};
 use crate::cli::Cli;
 use crate::config::Config;
@@ -117,6 +120,7 @@ pub async fn run_interactive(
     ask_tx: Option<AskSender>,
     mut ask_rx: Option<AskReceiver>,
     mut question_rx: Option<QuestionReceiver>,
+    mut plan_rx: Option<PlanSwitchReceiver>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -760,6 +764,7 @@ pub async fn run_interactive(
                                                 permission.clone(),
                                                 ask_tx.clone(),
                                                 None,
+                                                None,
                                                 sandbox.clone(),
                                                 #[cfg(feature = "mcp")] mcp_manager,
                                                 #[cfg(feature = "semantic")] semantic_manager,
@@ -1225,6 +1230,7 @@ pub async fn run_interactive(
                                         permission.clone(),
                                         ask_tx.clone(),
                                         None,
+                                        None,
                                         sandbox.clone(),
                                         #[cfg(feature = "mcp")] mcp_manager,
                                         #[cfg(feature = "semantic")] semantic_manager,
@@ -1577,6 +1583,98 @@ pub async fn run_interactive(
                 }
 
                 renderer.write_line("", Color::White)?;
+                renderer.render_viewport()?;
+                renderer.draw_bottom(
+                    &input,
+                    &StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()),
+                    is_running,
+                )?;
+                if let Some(ref picker) = input.picker {
+                    picker.draw(renderer.input_top_row())?;
+                }
+            }
+            Some(plan_req) = async {
+                if let Some(rx) = &mut plan_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                was_reasoning = false;
+                if agent_line_started {
+                    renderer.write_line("", Color::White)?;
+                    agent_line_started = false;
+                }
+
+                let (label, prompt_name) = match plan_req.action {
+                    PlanAction::Enter => ("plan mode", "plan"),
+                    PlanAction::Exit => ("implementation mode", "code"),
+                };
+
+                renderer.write_line(
+                    &format!("[plan] switch to {}? (y/n)", label),
+                    C_PERM,
+                )?;
+
+                let accepted = loop {
+                    tokio::select! {
+                        Some(ev) = user_rx.recv() => {
+                            if let UserEvent::Key(key) = ev {
+                                match key.code {
+                                    KeyCode::Char('y') | KeyCode::Enter => break true,
+                                    KeyCode::Char('n') | KeyCode::Esc => break false,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                };
+
+                if accepted {
+                    // Update context with the new prompt
+                    if let Some(content) = context.prompts.get(prompt_name) {
+                        context.current_prompt = Some(content.clone());
+                        context.current_prompt_name = Some(prompt_name.to_string());
+                    }
+
+                    // Rebuild agent with new prompt mode
+                    let model = client.completion_model(session.model.to_string());
+                    agent = crate::provider::build_agent(
+                        model,
+                        cli,
+                        cfg,
+                        context,
+                        permission.clone(),
+                        ask_tx.clone(),
+                        None, // question_tx not available
+                        None, // plan_tx not available
+                        sandbox.clone(),
+                        #[cfg(feature = "mcp")]
+                        mcp_manager,
+                        #[cfg(feature = "semantic")]
+                        semantic_manager,
+                    )
+                    .await;
+
+                    let _ = plan_req.reply.send(PlanSwitchResponse::Accepted);
+                    renderer.write_line(
+                        &format!("  switched to {}", label),
+                        Color::Green,
+                    )?;
+
+                    // Re-render the session to show new prompt mode
+                    if !cli.print {
+                        if let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
+                            renderer.write_line(
+                                &format!("render error: {}", e),
+                                resolve_color(C_ERROR, cli.no_color),
+                            )?;
+                        }
+                    }
+                } else {
+                    let _ = plan_req.reply.send(PlanSwitchResponse::Rejected);
+                }
+
                 renderer.render_viewport()?;
                 renderer.draw_bottom(
                     &input,

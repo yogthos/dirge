@@ -124,6 +124,7 @@ pub async fn handle_compress(
         permission.clone(),
         ask_tx.clone(),
         None,
+        None,
         sandbox.clone(),
         #[cfg(feature = "mcp")]
         mcp_manager,
@@ -181,6 +182,7 @@ pub async fn handle_slash(
                     context,
                     permission.clone(),
                     ask_tx.clone(),
+                    None,
                     None,
                     sandbox.clone(),
                     #[cfg(feature = "mcp")]
@@ -498,6 +500,7 @@ pub async fn handle_slash(
                         permission.clone(),
                         ask_tx.clone(),
                         None,
+                        None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -606,6 +609,7 @@ pub async fn handle_slash(
                         permission.clone(),
                         ask_tx.clone(),
                         None,
+                        None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -627,6 +631,7 @@ pub async fn handle_slash(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
+                        None,
                         None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
@@ -676,6 +681,7 @@ pub async fn handle_slash(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
+                        None,
                         None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
@@ -826,6 +832,7 @@ pub async fn handle_slash(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
+                        None,
                         None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]

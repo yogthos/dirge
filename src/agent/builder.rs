@@ -9,6 +9,7 @@ use crate::agent::prompt::{SYSTEM_PROMPT, TODO_TOOLS_PROMPT};
 use crate::agent::tools;
 use crate::agent::tools::ToolCache;
 use crate::agent::tools::background::BackgroundStore;
+use crate::agent::tools::plan::PlanSwitchSender;
 use crate::agent::tools::question::QuestionSender;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -34,6 +35,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     question_tx: Option<QuestionSender>,
+    plan_tx: Option<PlanSwitchSender>,
     sandbox: Sandbox,
     parent_model: Option<AnyModel>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
@@ -177,6 +179,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let question_tool = question_tx
             .map(|tx| Box::new(tools::QuestionTool::new(tx)) as Box<dyn rig::tool::ToolDyn>);
 
+        let plan_tools = plan_tx.map(|tx| {
+            let enter = Box::new(tools::PlanEnterTool::new(tx.clone()))
+                as Box<dyn rig::tool::ToolDyn>;
+            let exit = Box::new(tools::PlanExitTool::new(tx))
+                as Box<dyn rig::tool::ToolDyn>;
+            vec![enter, exit]
+        });
+
         // Web tools: gated on config + env var
         let websearch_enabled = cfg
             .tools
@@ -208,6 +218,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 
         if let Some(qt) = question_tool {
             builder = builder.tools(vec![qt]);
+        }
+
+        if let Some(pt) = plan_tools {
+            builder = builder.tools(pt);
         }
 
         if let Some(ws) = websearch_tool {
