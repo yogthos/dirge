@@ -438,6 +438,7 @@ pub async fn build_agent(
     ask_tx: Option<AskSender>,
     question_tx: Option<QuestionSender>,
     plan_tx: Option<PlanSwitchSender>,
+    bg_store: Option<crate::agent::tools::background::BackgroundStore>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -455,6 +456,7 @@ pub async fn build_agent(
                 ask_tx,
                 question_tx.clone(),
                 plan_tx.clone(),
+                bg_store.clone(),
                 sandbox.clone(),
                 Some(parent_model.clone()),
                 #[cfg(feature = "mcp")]

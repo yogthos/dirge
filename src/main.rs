@@ -23,6 +23,7 @@ use clap::Parser;
 use compact_str::CompactString;
 use session::MessageRole;
 
+use crate::agent::tools::background::BackgroundStore;
 use crate::agent::tools::plan::{PlanSwitchReceiver, PlanSwitchSender};
 use crate::agent::tools::question::{QuestionReceiver, QuestionSender};
 use crate::permission::ask::AskSender;
@@ -59,10 +60,11 @@ fn build_channels(
     Option<QuestionReceiver>,
     Option<PlanSwitchSender>,
     Option<PlanSwitchReceiver>,
+    Option<BackgroundStore>,
 ) {
     let no_tools = cli.resolve_no_tools(cfg);
     if no_tools {
-        return (None, None, None, None, None, None, None);
+        return (None, None, None, None, None, None, None, None);
     }
 
     let perm_config: PermissionConfig = cfg
@@ -78,6 +80,7 @@ fn build_channels(
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
     let (question_tx, question_rx) = tokio::sync::mpsc::channel(64);
     let (plan_tx, plan_rx) = tokio::sync::mpsc::channel(64);
+    let bg_store = BackgroundStore::new();
     (
         Some(perm),
         Some(ask_tx),
@@ -86,6 +89,7 @@ fn build_channels(
         Some(question_rx),
         Some(plan_tx),
         Some(plan_rx),
+        Some(bg_store),
     )
 }
 
@@ -257,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
-    let (permission, ask_tx, ask_rx, question_tx, question_rx, plan_tx, plan_rx) =
+    let (permission, ask_tx, ask_rx, question_tx, question_rx, plan_tx, plan_rx, bg_store) =
         build_channels(&cli, &cfg);
 
     if let Some(perm) = &permission {
@@ -283,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
             ask_tx,
             question_tx.clone(),
             plan_tx.clone(),
+            bg_store.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
@@ -312,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
                 ask_tx,
                 question_tx.clone(),
                 plan_tx.clone(),
+                bg_store.clone(),
                 sandbox.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
@@ -331,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
             ask_tx.clone(),
             question_tx.clone(),
             plan_tx.clone(),
+            bg_store.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
@@ -387,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
             plan_rx,
             question_tx,
             plan_tx,
+            bg_store,
             sandbox,
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),

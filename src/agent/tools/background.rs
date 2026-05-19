@@ -48,7 +48,6 @@ pub struct BackgroundTask {
 
 /// A completion event ready to be surfaced to the parent agent at its next
 /// turn boundary.
-#[allow(dead_code)] // wired up to the UI in Phase 3
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskNotification {
     pub id: String,
@@ -107,7 +106,6 @@ impl BackgroundStore {
     /// Take all queued notifications and clear the queue. Each notification is
     /// delivered exactly once; subsequent calls return only notifications
     /// arriving after the previous drain.
-    #[allow(dead_code)] // wired up to the UI in Phase 3
     pub fn drain_notifications(&self) -> Vec<TaskNotification> {
         let mut inner = self.lock();
         let ids: Vec<String> = inner.pending.drain(..).collect();
@@ -136,6 +134,46 @@ impl BackgroundStore {
     fn pending_len(&self) -> usize {
         self.lock().pending.len()
     }
+}
+
+/// Format pending notifications as a `<system-reminder>` block prepended to
+/// the next user prompt. Returns the prompt unchanged when there's nothing
+/// pending or no store is provided.
+///
+/// Drains the queue so each notification is delivered exactly once. The
+/// underlying tasks remain in the store and remain looked-up-able by
+/// `task_status` until LRU eviction.
+pub fn prepend_pending_notifications(prompt: &str, store: Option<&BackgroundStore>) -> String {
+    let Some(store) = store else {
+        return prompt.to_string();
+    };
+    let drained = store.drain_notifications();
+    if drained.is_empty() {
+        return prompt.to_string();
+    }
+
+    let mut out = String::with_capacity(prompt.len() + 256);
+    out.push_str("<system-reminder>\n");
+    out.push_str("The following background tasks finished since your last turn:\n\n");
+    for (i, n) in drained.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match &n.state {
+            TaskState::Completed(text) => {
+                out.push_str(&format!("Task {} (completed):\n{}\n", n.id, text));
+            }
+            TaskState::Failed(err) => {
+                out.push_str(&format!("Task {} (failed):\n{}\n", n.id, err));
+            }
+            // Running is never queued for notification (notify() rejects it),
+            // but treat defensively as "no terminal info to report".
+            TaskState::Running => {}
+        }
+    }
+    out.push_str("</system-reminder>\n\n");
+    out.push_str(prompt);
+    out
 }
 
 fn truncate_state(state: TaskState) -> TaskState {
@@ -360,6 +398,78 @@ mod tests {
         let drained = a.drain_notifications();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].id, "t1");
+    }
+
+    // ---- prepend_pending_notifications ----
+
+    #[test]
+    fn prepend_passthrough_when_store_is_none() {
+        let out = prepend_pending_notifications("hello", None);
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn prepend_passthrough_when_nothing_pending() {
+        let store = BackgroundStore::new();
+        store.insert("t1".into()); // running, not pending
+        let out = prepend_pending_notifications("hello", Some(&store));
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn prepend_formats_system_reminder() {
+        let store = BackgroundStore::new();
+        store.insert("t1".into());
+        store.notify("t1", TaskState::Completed("the result".into()));
+
+        let out = prepend_pending_notifications("user msg", Some(&store));
+        assert!(out.starts_with("<system-reminder>\n"));
+        assert!(out.contains("Task t1 (completed):"));
+        assert!(out.contains("the result"));
+        assert!(out.contains("</system-reminder>\n\n"));
+        assert!(out.ends_with("user msg"));
+    }
+
+    #[test]
+    fn prepend_includes_failed_tasks() {
+        let store = BackgroundStore::new();
+        store.insert("t1".into());
+        store.notify("t1", TaskState::Failed("kaboom".into()));
+
+        let out = prepend_pending_notifications("user msg", Some(&store));
+        assert!(out.contains("Task t1 (failed):"));
+        assert!(out.contains("kaboom"));
+    }
+
+    // Regression: prepend MUST consume the queue. Calling it twice in
+    // succession must not re-deliver the same notifications, otherwise the
+    // agent would see the same completion on every turn.
+    #[test]
+    fn regression_prepend_drains_queue_once() {
+        let store = BackgroundStore::new();
+        store.insert("t1".into());
+        store.notify("t1", TaskState::Completed("once".into()));
+
+        let first = prepend_pending_notifications("msg", Some(&store));
+        assert!(first.contains("once"));
+
+        let second = prepend_pending_notifications("msg", Some(&store));
+        assert_eq!(second, "msg");
+    }
+
+    #[test]
+    fn prepend_includes_all_pending_tasks_in_order() {
+        let store = BackgroundStore::new();
+        for i in 0..3 {
+            store.insert(format!("t{i}"));
+            store.notify(&format!("t{i}"), TaskState::Completed(format!("r{i}")));
+        }
+        let out = prepend_pending_notifications("msg", Some(&store));
+        // FIFO order preserved.
+        let i0 = out.find("Task t0").unwrap();
+        let i1 = out.find("Task t1").unwrap();
+        let i2 = out.find("Task t2").unwrap();
+        assert!(i0 < i1 && i1 < i2);
     }
 
     // Concurrency smoke: many threads inserting + notifying must not lose

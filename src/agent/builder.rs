@@ -36,6 +36,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     ask_tx: Option<AskSender>,
     question_tx: Option<QuestionSender>,
     plan_tx: Option<PlanSwitchSender>,
+    bg_store: Option<BackgroundStore>,
     sandbox: Sandbox,
     parent_model: Option<AnyModel>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
@@ -245,16 +246,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             builder = builder.tools(vec![wf]);
         }
 
-        if let Some(pm) = parent_model {
-            let bg_store = BackgroundStore::new();
+        if let (Some(pm), Some(store)) = (parent_model, bg_store) {
             let task_tool = Box::new(tools::TaskTool::new(
                 permission.clone(),
                 ask_tx.clone(),
                 pm,
-                bg_store.clone(),
+                store.clone(),
             ));
             let status_tool =
-                Box::new(tools::TaskStatusTool::new(bg_store)) as Box<dyn rig::tool::ToolDyn>;
+                Box::new(tools::TaskStatusTool::new(store)) as Box<dyn rig::tool::ToolDyn>;
             builder = builder.tools(vec![task_tool, status_tool]);
         }
 

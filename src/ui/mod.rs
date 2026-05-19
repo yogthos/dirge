@@ -124,6 +124,7 @@ pub async fn run_interactive(
     mut plan_rx: Option<PlanSwitchReceiver>,
     question_tx: Option<QuestionSender>,
     plan_tx: Option<PlanSwitchSender>,
+    bg_store: Option<crate::agent::tools::background::BackgroundStore>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -651,7 +652,10 @@ pub async fn run_interactive(
                                                 let msg = format!("I ran: $ {}\n\nOutput:\n{}", cmd, output);
                                                 let history = crate::agent::runner::convert_history(session);
                                                 session.add_message(MessageRole::User, &msg);
-                                                let runner = agent.clone().spawn_runner(msg, history);
+                                                let runner = agent.clone().spawn_runner(
+                                                    crate::agent::tools::background::prepend_pending_notifications(&msg, bg_store.as_ref()),
+                                                    history,
+                                                );
                                                 agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                                 is_running = true;
@@ -741,7 +745,10 @@ pub async fn run_interactive(
                                             );
                                             let history = crate::agent::runner::convert_history(session);
                                             session.add_message(MessageRole::User, &prompt);
-                                            let runner = agent.clone().spawn_runner(prompt, history);
+                                            let runner = agent.clone().spawn_runner(
+                                                crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
+                                                history,
+                                            );
                                             agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                             is_running = true;
@@ -766,6 +773,7 @@ pub async fn run_interactive(
                                                 context,
                                                 permission.clone(),
                                                 ask_tx.clone(),
+                                                None,
                                                 None,
                                                 None,
                                                 sandbox.clone(),
@@ -800,7 +808,10 @@ pub async fn run_interactive(
                                         {
                                             ls.iteration = 1;
                                             let prompt = ls.build_prompt();
-                                            let runner = agent.clone().spawn_runner(prompt, Vec::new());
+                                            let runner = agent.clone().spawn_runner(
+                                                crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
+                                                Vec::new(),
+                                            );
                                             agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                             is_running = true;
@@ -867,7 +878,10 @@ pub async fn run_interactive(
                                     text.to_string()
                                 };
 
-                                let runner = agent.clone().spawn_runner(prompt, history);
+                                let runner = agent.clone().spawn_runner(
+                                    crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
+                                    history,
+                                );
                                 agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                 is_running = true;
@@ -1176,7 +1190,7 @@ pub async fn run_interactive(
                             crate::plugin::PostDoneAction::Followup(text) => {
                                 let followup_prompt = text + "\n\nContinue.";
                                 let runner = agent.clone().spawn_runner(
-                                    followup_prompt,
+                                    crate::agent::tools::background::prepend_pending_notifications(&followup_prompt, bg_store.as_ref()),
                                     crate::agent::runner::convert_history(session),
                                 );
                                 agent_rx = Some(runner.event_rx);
@@ -1204,7 +1218,10 @@ pub async fn run_interactive(
                                     ls.last_summary = Some(summary);
                                     ls.iteration += 1;
                                     let prompt = ls.build_prompt();
-                                    let runner = agent.clone().spawn_runner(prompt, Vec::new());
+                                    let runner = agent.clone().spawn_runner(
+                                        crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
+                                        Vec::new(),
+                                    );
                                     agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                     is_running = true;
@@ -1232,6 +1249,7 @@ pub async fn run_interactive(
                                         context,
                                         permission.clone(),
                                         ask_tx.clone(),
+                                        None,
                                         None,
                                         None,
                                         sandbox.clone(),
@@ -1648,6 +1666,7 @@ pub async fn run_interactive(
                         ask_tx.clone(),
                         question_tx.clone(),
                         plan_tx.clone(),
+                        bg_store.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
