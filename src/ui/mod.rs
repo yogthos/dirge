@@ -14,9 +14,9 @@ use crossterm::style::Color;
 use tokio::sync::mpsc;
 
 use crate::agent::tools::plan::{
-    PlanAction, PlanSwitchReceiver, PlanSwitchResponse,
+    PlanAction, PlanSwitchReceiver, PlanSwitchResponse, PlanSwitchSender,
 };
-use crate::agent::tools::question::{QuestionReceiver, QuestionResponse};
+use crate::agent::tools::question::{QuestionReceiver, QuestionResponse, QuestionSender};
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::context::ContextFiles;
@@ -121,6 +121,8 @@ pub async fn run_interactive(
     mut ask_rx: Option<AskReceiver>,
     mut question_rx: Option<QuestionReceiver>,
     mut plan_rx: Option<PlanSwitchReceiver>,
+    question_tx: Option<QuestionSender>,
+    plan_tx: Option<PlanSwitchSender>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -1646,8 +1648,8 @@ pub async fn run_interactive(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
-                        None, // question_tx not available
-                        None, // plan_tx not available
+                        question_tx.clone(),
+                        plan_tx.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,

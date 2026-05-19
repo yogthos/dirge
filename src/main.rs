@@ -385,6 +385,8 @@ async fn main() -> anyhow::Result<()> {
             ask_rx,
             question_rx,
             plan_rx,
+            question_tx,
+            plan_tx,
             sandbox,
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
