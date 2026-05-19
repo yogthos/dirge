@@ -2,6 +2,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use tokio::time::{Duration, timeout};
 
+use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError, check_perm};
 
 use crate::sandbox::Sandbox;
@@ -12,14 +13,31 @@ pub struct BashTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub sandbox: Sandbox,
+    cache: Option<ToolCache>,
 }
 
 impl BashTool {
+    #[allow(dead_code)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>, sandbox: Sandbox) -> Self {
         BashTool {
             permission,
             ask_tx,
             sandbox,
+            cache: None,
+        }
+    }
+
+    pub fn with_cache(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        sandbox: Sandbox,
+        cache: ToolCache,
+    ) -> Self {
+        BashTool {
+            permission,
+            ask_tx,
+            sandbox,
+            cache: Some(cache),
         }
     }
 }
@@ -84,6 +102,11 @@ impl Tool for BashTool {
         }
         if exit_code != 0 {
             result.push_str(&format!("\nExit code: {}", exit_code));
+        }
+        // Bash may have mutated the filesystem; conservatively invalidate the
+        // per-turn read/grep/list cache.
+        if let Some(ref cache) = self.cache {
+            cache.clear();
         }
         Ok(result)
     }

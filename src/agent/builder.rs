@@ -95,20 +95,23 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 ask_tx.clone(),
                 cache.clone(),
             )),
-            Box::new(tools::WriteTool::new(
+            Box::new(tools::WriteTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
                 plan_file.clone(),
+                cache.clone(),
             )),
-            Box::new(tools::EditTool::new(
+            Box::new(tools::EditTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
                 plan_file.clone(),
+                cache.clone(),
             )),
-            Box::new(tools::BashTool::new(
+            Box::new(tools::BashTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
                 sandbox.clone(),
+                cache.clone(),
             )),
             Box::new(tools::GrepTool::with_cache(
                 permission.clone(),

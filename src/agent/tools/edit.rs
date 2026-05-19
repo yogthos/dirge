@@ -3,15 +3,18 @@ use std::path::PathBuf;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
+use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, check_perm_path};
 
 pub struct EditTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     plan_file: Option<PathBuf>,
+    cache: Option<ToolCache>,
 }
 
 impl EditTool {
+    #[allow(dead_code)]
     pub fn new(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
@@ -21,6 +24,21 @@ impl EditTool {
             permission,
             ask_tx,
             plan_file,
+            cache: None,
+        }
+    }
+
+    pub fn with_cache(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        plan_file: Option<PathBuf>,
+        cache: ToolCache,
+    ) -> Self {
+        EditTool {
+            permission,
+            ask_tx,
+            plan_file,
+            cache: Some(cache),
         }
     }
 
@@ -186,6 +204,10 @@ impl Tool for EditTool {
         };
 
         tokio::fs::write(&args.path, &output).await?;
+        // File mutated → invalidate cached reads/greps/listings for this turn.
+        if let Some(ref cache) = self.cache {
+            cache.clear();
+        }
 
         let mut result = format!("Applied edit to {}", args.path);
         if do_replace_all {
