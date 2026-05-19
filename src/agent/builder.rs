@@ -224,7 +224,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 permission.clone(),
                 ask_tx.clone(),
                 pm,
-                Some(bg_store.clone()),
+                bg_store.clone(),
             ));
             let status_tool =
                 Box::new(tools::TaskStatusTool::new(bg_store))

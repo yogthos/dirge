@@ -11,7 +11,7 @@ pub struct TaskTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     model: AnyModel,
-    bg_store: Option<BackgroundStore>,
+    bg_store: BackgroundStore,
 }
 
 impl TaskTool {
@@ -19,7 +19,7 @@ impl TaskTool {
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
         model: AnyModel,
-        bg_store: Option<BackgroundStore>,
+        bg_store: BackgroundStore,
     ) -> Self {
         Self {
             permission,
@@ -45,37 +45,23 @@ impl Tool for TaskTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let mut description = "Spawn a subagent to handle a specific subtask. The subagent runs as a one-shot query (no tools) and returns its result inline. Use for research, analysis, or planning subtasks that don't require file access."
+        let description = "Spawn a subagent to handle a specific subtask. The subagent runs as a one-shot query (no tools) and returns its result inline. Use for research, analysis, or planning subtasks that don't require file access. Set background=true to run asynchronously — use task_status to poll for the result."
             .to_string();
 
-        if self.bg_store.is_some() {
-            description.push_str(
-                " Set background=true to run asynchronously — use task_status to poll for the result.",
-            );
-        }
-
-        let mut properties = serde_json::json!({
+        let properties = serde_json::json!({
             "type": "object",
             "properties": {
                 "prompt": {
                     "type": "string",
                     "description": "Task description for the subagent"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run asynchronously (default: false). When true, returns a task_id immediately for use with task_status."
                 }
             },
             "required": ["prompt"]
         });
-
-        if self.bg_store.is_some() {
-            if let serde_json::Value::Object(ref mut props) = properties {
-                props.insert(
-                    "background".to_string(),
-                    serde_json::json!({
-                        "type": "boolean",
-                        "description": "Run asynchronously (default: false). When true, returns a task_id immediately for use with task_status."
-                    }),
-                );
-            }
-        }
 
         ToolDefinition {
             name: "task".to_string(),
@@ -90,18 +76,12 @@ impl Tool for TaskTool {
         let background = args.background.unwrap_or(false);
 
         if background {
-            let Some(ref store) = self.bg_store else {
-                return Err(ToolError::Msg(
-                    "background tasks not available".to_string(),
-                ));
-            };
-
             let task_id = Uuid::new_v4().to_string();
-            store.insert(task_id.clone());
+            self.bg_store.insert(task_id.clone());
 
             let model = self.model.clone();
             let prompt = args.prompt;
-            let store = store.clone();
+            let store = self.bg_store.clone();
             let tid = task_id.clone();
 
             tokio::spawn(async move {
