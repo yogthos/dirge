@@ -33,7 +33,7 @@ impl Tool for TaskStatusTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "task_status".to_string(),
-            description: "Check the status of a background task. Returns the task state (running/completed/failed) and, if completed, the result. Set wait=true to block until the task finishes.".to_string(),
+            description: "Look up the state of a background task by id. You usually do NOT need this — completion notifications arrive automatically as a <system-reminder> on your next turn. Use task_status only when you need to re-check a task's status mid-turn or look up a task whose notification you've already consumed. Returns running / completed / failed plus the result text. Set wait=true to block until the task transitions out of running (rarely useful — prefer letting the notification arrive).".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -197,6 +197,28 @@ mod tests {
         let tool = TaskStatusTool::new(store);
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "task_status");
+    }
+
+    // Regression: the description must steer the agent away from polling
+    // (notifications now arrive automatically). A future "improvement" that
+    // re-introduces "poll until completion" language would silently regress
+    // the push-notification UX.
+    #[tokio::test]
+    async fn definition_discourages_polling() {
+        let store = BackgroundStore::new();
+        let tool = TaskStatusTool::new(store);
+        let def = tool.definition(String::new()).await;
+        let desc = def.description.to_lowercase();
+        assert!(
+            desc.contains("system-reminder") || desc.contains("automatically"),
+            "task_status description must reference automatic notification: {}",
+            def.description
+        );
+        assert!(
+            desc.contains("do not") || desc.contains("usually") || desc.contains("rarely"),
+            "task_status description must discourage routine polling: {}",
+            def.description
+        );
     }
 
     // task_status is read-only: repeated lookups return the same payload.
