@@ -84,15 +84,27 @@ pub const TODO_TOOLS_PROMPT: &str = "\
 - write_todo_list: Create or update a structured task list to track progress in the current coding session. Use this for complex multi-step tasks. Replaces any existing todo list.";
 
 pub const COMPACTION_PROMPT: &str = "\
-You are a conversation summarizer for a coding session. Distill the following conversation into a concise summary.
+You are a conversation summarizer for a coding session. Distill the following conversation into these structured sections:
 
-Focus on:
-- The user's goal and what they are trying to accomplish
-- Key decisions that were made and why
-- What work has been completed
-- What is currently in progress or blocked
-- Files that were read or modified
-- Important context needed to continue working seamlessly
+## Goal
+The user's explicit objective. One concise sentence.
+
+## Progress
+- **Done:** concrete items completed, with file paths where applicable
+- **In Progress:** what was being actively worked on when the conversation was cut
+- **Blocked:** what's preventing further progress and why
+
+## Key Decisions
+Decisions made, alternatives considered and rejected, and the rationale for the chosen approach.
+
+## Next Steps
+Ordered list of what to do next to continue the work. Include exact commands, file paths, and tool suggestions where possible.
+
+## Relevant Files
+List each relevant file with a one-line description of its role in the task. Include both files already modified and files that need changes.
+
+## Critical Context
+Facts, constraints, error messages, environment details, or user preferences essential to resuming the work seamlessly. Include any assumptions verified or falsified.
 
 Previous summary (for iterative context):
 {previous_summary}
@@ -102,6 +114,28 @@ Additional instructions: {instructions}
 Conversation to summarize:
 ---
 {conversation}
----
+---";
 
-Format the summary as structured text covering: Goal, Progress, Key Decisions, Next Steps, and Critical Context. Be concise but include all essential details.";
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compaction_prompt_has_required_sections() {
+        let prompt = COMPACTION_PROMPT;
+        assert!(prompt.contains("## Goal"));
+        assert!(prompt.contains("## Progress"));
+        assert!(prompt.contains("## Key Decisions"));
+        assert!(prompt.contains("## Next Steps"));
+        assert!(prompt.contains("## Relevant Files"));
+        assert!(prompt.contains("## Critical Context"));
+    }
+
+    #[test]
+    fn test_compaction_prompt_has_template_variables() {
+        let prompt = COMPACTION_PROMPT;
+        assert!(prompt.contains("{conversation}"));
+        assert!(prompt.contains("{previous_summary}"));
+        assert!(prompt.contains("{instructions}"));
+    }
+}
