@@ -2,7 +2,6 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
 
 use crate::agent::tools::ToolError;
 
@@ -11,8 +10,6 @@ pub type QuestionReceiver = mpsc::Receiver<QuestionRequest>;
 
 #[derive(Debug)]
 pub struct QuestionRequest {
-    #[allow(dead_code)]
-    pub id: String,
     pub questions: Vec<QuestionItem>,
     pub reply: oneshot::Sender<QuestionResponse>,
 }
@@ -119,12 +116,10 @@ impl Tool for QuestionTool {
     }
 
     async fn call(&self, args: QuestionArgs) -> Result<String, ToolError> {
-        let id = Uuid::new_v4().to_string();
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.question_tx
             .send(QuestionRequest {
-                id,
                 questions: args.questions.clone(),
                 reply: reply_tx,
             })
