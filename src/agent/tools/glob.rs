@@ -4,8 +4,8 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 use crate::agent::tools::MAX_FIND_RESULTS;
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
 pub struct GlobTool {
     pub permission: Option<PermCheck>,
@@ -14,10 +14,7 @@ pub struct GlobTool {
 
 impl GlobTool {
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self {
-            permission,
-            ask_tx,
-        }
+        Self { permission, ask_tx }
     }
 }
 
@@ -98,8 +95,7 @@ impl Tool for GlobTool {
         )
         .await?;
 
-        let re = glob_to_regex(&args.pattern)
-            .map_err(|e| ToolError::Msg(e))?;
+        let re = glob_to_regex(&args.pattern).map_err(|e| ToolError::Msg(e))?;
 
         let root = args
             .path
