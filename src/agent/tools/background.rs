@@ -1,6 +1,7 @@
 use indexmap::IndexMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 /// Maximum chars retained per Completed/Failed payload. Prevents a single
 /// subagent answer from blowing the parent context.
@@ -12,6 +13,13 @@ const MAX_TASK_OUTPUT_CHARS: usize = 3000;
 /// reasonable session; agents only see ids they themselves spawned.
 const STORE_CAPACITY: usize = 32;
 
+/// Sender half of the UI lifecycle channel. `notify()` pushes here when set,
+/// letting the UI render a `[task <id> completed/failed]` line in the human's
+/// scrollback as soon as the subagent finishes — independent of the
+/// agent-prompt drain at turn boundaries.
+pub type LifecycleSender = mpsc::UnboundedSender<TaskNotification>;
+pub type LifecycleReceiver = mpsc::UnboundedReceiver<TaskNotification>;
+
 /// Thread-safe store for background subagent tasks.
 ///
 /// Tasks persist after completion so the parent agent can look them up by id
@@ -21,6 +29,9 @@ const STORE_CAPACITY: usize = 32;
 #[derive(Debug, Clone, Default)]
 pub struct BackgroundStore {
     inner: Arc<Mutex<Inner>>,
+    /// Optional UI lifecycle sink. Cloned from the constructor; notify() will
+    /// best-effort send into it. Drops silently if the receiver is gone.
+    ui_sink: Option<LifecycleSender>,
 }
 
 #[derive(Debug, Default)]
@@ -55,8 +66,21 @@ pub struct TaskNotification {
 }
 
 impl BackgroundStore {
+    /// Construct a store with no UI sink. Mostly used by tests; production
+    /// code goes through [`with_ui_sink`] so the UI gets lifecycle events.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a store wired to a UI lifecycle sink. Each notify() call
+    /// also pushes the resulting TaskNotification into `ui_sink` so the UI
+    /// can render the completion line immediately.
+    pub fn with_ui_sink(ui_sink: LifecycleSender) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            ui_sink: Some(ui_sink),
+        }
     }
 
     /// Insert a new task in Running state. If the store is at capacity, the
@@ -92,14 +116,25 @@ impl BackgroundStore {
         if matches!(state, TaskState::Running) {
             return;
         }
+        let truncated = truncate_state(state);
         let mut inner = self.lock();
         let Some(task) = inner.tasks.get_mut(id) else {
             return;
         };
-        task.state = truncate_state(state);
+        task.state = truncated.clone();
         // Guard against double-notifies enqueuing the same id twice.
         if !inner.pending.iter().any(|existing| existing == id) {
             inner.pending.push_back(id.to_string());
+        }
+        // Drop the lock before signalling the UI to avoid holding it across
+        // an await/send and to keep the receiver's wake free of contention.
+        drop(inner);
+        if let Some(sink) = &self.ui_sink {
+            // Best-effort: receiver may already be gone (UI shut down).
+            let _ = sink.send(TaskNotification {
+                id: id.to_string(),
+                state: truncated,
+            });
         }
     }
 
@@ -470,6 +505,88 @@ mod tests {
         let i1 = out.find("Task t1").unwrap();
         let i2 = out.find("Task t2").unwrap();
         assert!(i0 < i1 && i1 < i2);
+    }
+
+    // ---- UI lifecycle sink ----
+
+    #[tokio::test]
+    async fn ui_sink_receives_completion_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = BackgroundStore::with_ui_sink(tx);
+        store.insert("t1".into());
+        store.notify("t1", TaskState::Completed("done".into()));
+
+        let evt = rx.recv().await.expect("event delivered");
+        assert_eq!(evt.id, "t1");
+        assert_eq!(evt.state, TaskState::Completed("done".into()));
+    }
+
+    #[tokio::test]
+    async fn ui_sink_receives_failure_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = BackgroundStore::with_ui_sink(tx);
+        store.insert("t1".into());
+        store.notify("t1", TaskState::Failed("boom".into()));
+
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.state, TaskState::Failed("boom".into()));
+    }
+
+    // Regression: lifecycle events must carry the truncated payload, not the
+    // original — otherwise the UI could render an unbounded blob from the
+    // subagent into the user's scrollback.
+    #[tokio::test]
+    async fn ui_sink_event_carries_truncated_payload() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = BackgroundStore::with_ui_sink(tx);
+        store.insert("t1".into());
+        let huge = "x".repeat(MAX_TASK_OUTPUT_CHARS * 2);
+        store.notify("t1", TaskState::Completed(huge));
+
+        let evt = rx.recv().await.unwrap();
+        let TaskState::Completed(text) = evt.state else {
+            panic!("expected Completed");
+        };
+        assert_eq!(text.chars().count(), MAX_TASK_OUTPUT_CHARS);
+    }
+
+    // Regression: notify on a running state must NOT emit a lifecycle event
+    // (Running isn't a terminal transition; no UI line wanted).
+    #[tokio::test]
+    async fn ui_sink_does_not_receive_running_state() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = BackgroundStore::with_ui_sink(tx);
+        store.insert("t1".into());
+        store.notify("t1", TaskState::Running);
+
+        // Drain non-blockingly: nothing should be queued.
+        assert!(rx.try_recv().is_err());
+    }
+
+    // Regression: notify on an evicted id is a no-op for both the pending
+    // queue AND the UI sink — no phantom events.
+    #[tokio::test]
+    async fn ui_sink_no_event_for_evicted_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = BackgroundStore::with_ui_sink(tx);
+        store.notify("ghost", TaskState::Completed("late".into()));
+        assert!(rx.try_recv().is_err());
+    }
+
+    // Regression: dropping the UI receiver must not break notify() — the
+    // store is best-effort with the sink. Used when the UI exits before
+    // long-running subagents finish.
+    #[tokio::test]
+    async fn ui_sink_send_after_receiver_dropped_is_silent() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let store = BackgroundStore::with_ui_sink(tx);
+        store.insert("t1".into());
+        drop(rx);
+        // Must not panic.
+        store.notify("t1", TaskState::Completed("payload".into()));
+        // Drain queue still works for the LLM side.
+        let drained = store.drain_notifications();
+        assert_eq!(drained.len(), 1);
     }
 
     // Concurrency smoke: many threads inserting + notifying must not lose

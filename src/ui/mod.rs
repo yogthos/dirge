@@ -125,6 +125,7 @@ pub async fn run_interactive(
     question_tx: Option<QuestionSender>,
     plan_tx: Option<PlanSwitchSender>,
     bg_store: Option<crate::agent::tools::background::BackgroundStore>,
+    mut lifecycle_rx: Option<crate::agent::tools::background::LifecycleReceiver>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -1389,6 +1390,39 @@ pub async fn run_interactive(
                 if let Some(ref picker) = input.picker {
                     picker.draw(renderer.input_top_row())?;
                 }
+            }
+            Some(lifecycle_evt) = async {
+                if let Some(rx) = &mut lifecycle_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                // Human-visible lifecycle line for a finished background task.
+                // The LLM-side notification is still queued separately and
+                // drained at the next turn boundary.
+                use crate::agent::tools::background::TaskState as TS;
+                let short_id: String = lifecycle_evt.id.chars().take(8).collect();
+                let (label, color) = match &lifecycle_evt.state {
+                    TS::Completed(_) => (format!("[task {} completed]", short_id), Color::Green),
+                    TS::Failed(err) => {
+                        let head: String = err.chars().take(80).collect();
+                        (format!("[task {} failed: {}]", short_id, head), C_ERROR)
+                    }
+                    TS::Running => continue, // shouldn't happen — notify rejects Running
+                };
+                // Make sure we land on a fresh line if a streamed response was in progress.
+                if agent_line_started {
+                    renderer.write_line("", Color::White)?;
+                    agent_line_started = false;
+                }
+                renderer.write_line(&label, resolve_color(color, cli.no_color))?;
+                renderer.render_viewport()?;
+                renderer.draw_bottom(
+                    &input,
+                    &StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()),
+                    is_running,
+                )?;
             }
             Some(question_req) = async {
                 if let Some(rx) = &mut question_rx {

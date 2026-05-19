@@ -23,7 +23,7 @@ use clap::Parser;
 use compact_str::CompactString;
 use session::MessageRole;
 
-use crate::agent::tools::background::BackgroundStore;
+use crate::agent::tools::background::{BackgroundStore, LifecycleReceiver};
 use crate::agent::tools::plan::{PlanSwitchReceiver, PlanSwitchSender};
 use crate::agent::tools::question::{QuestionReceiver, QuestionSender};
 use crate::permission::ask::AskSender;
@@ -61,10 +61,11 @@ fn build_channels(
     Option<PlanSwitchSender>,
     Option<PlanSwitchReceiver>,
     Option<BackgroundStore>,
+    Option<LifecycleReceiver>,
 ) {
     let no_tools = cli.resolve_no_tools(cfg);
     if no_tools {
-        return (None, None, None, None, None, None, None, None);
+        return (None, None, None, None, None, None, None, None, None);
     }
 
     let perm_config: PermissionConfig = cfg
@@ -80,7 +81,8 @@ fn build_channels(
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
     let (question_tx, question_rx) = tokio::sync::mpsc::channel(64);
     let (plan_tx, plan_rx) = tokio::sync::mpsc::channel(64);
-    let bg_store = BackgroundStore::new();
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bg_store = BackgroundStore::with_ui_sink(lifecycle_tx);
     (
         Some(perm),
         Some(ask_tx),
@@ -90,6 +92,7 @@ fn build_channels(
         Some(plan_tx),
         Some(plan_rx),
         Some(bg_store),
+        Some(lifecycle_rx),
     )
 }
 
@@ -261,8 +264,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
-    let (permission, ask_tx, ask_rx, question_tx, question_rx, plan_tx, plan_rx, bg_store) =
-        build_channels(&cli, &cfg);
+    let (
+        permission,
+        ask_tx,
+        ask_rx,
+        question_tx,
+        question_rx,
+        plan_tx,
+        plan_rx,
+        bg_store,
+        lifecycle_rx,
+    ) = build_channels(&cli, &cfg);
 
     if let Some(perm) = &permission {
         let allowlist: Vec<(String, String)> = session
@@ -395,6 +407,7 @@ async fn main() -> anyhow::Result<()> {
             question_tx,
             plan_tx,
             bg_store,
+            lifecycle_rx,
             sandbox,
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
