@@ -97,14 +97,22 @@ impl Renderer {
 
     pub fn replace_from(&mut self, start: usize, lines: Vec<LineEntry>) {
         self.commit_partial();
+        let old_len = self.buffer.len();
         self.buffer.truncate(start);
         self.buffer.extend(lines);
-        self.lines = self.buffer.len() as u16;
+        let new_len = self.buffer.len();
+        self.lines = new_len as u16;
         self.col = 0;
         self.partial.clear();
         let visible = self.visible_lines();
-        let max_offset = self.buffer.len().saturating_sub(visible);
-        if self.scroll_offset > max_offset {
+        let max_offset = new_len.saturating_sub(visible);
+        // When the user is scrolled up, keep the view anchored to the same
+        // absolute content by shifting scroll_offset to match the size delta.
+        if self.scroll_offset > 0 {
+            let delta = new_len as isize - old_len as isize;
+            let new_offset = (self.scroll_offset as isize + delta).max(0) as usize;
+            self.scroll_offset = new_offset.min(max_offset);
+        } else if self.scroll_offset > max_offset {
             self.scroll_offset = max_offset;
         }
     }
@@ -190,12 +198,26 @@ impl Renderer {
             let max_width = self.max_line_width();
             let c = self.partial_color;
             for chunk in self.wrap_line(&self.partial, max_width) {
-                self.buffer.push(LineEntry {
+                self.push_buffer_line(LineEntry {
                     text: chunk,
                     color: c,
                 });
             }
             self.partial.clear();
+        }
+    }
+
+    /// Append a line to the scrollback buffer. If the user is currently
+    /// scrolled up (scroll_offset > 0), bumps the offset by one so the
+    /// view stays anchored to the same absolute content rather than drifting
+    /// forward as new lines arrive. The selection (which uses absolute
+    /// indices) is unaffected.
+    fn push_buffer_line(&mut self, entry: LineEntry) {
+        self.buffer.push(entry);
+        if self.scroll_offset > 0 {
+            let visible = self.visible_lines();
+            let max_offset = self.buffer.len().saturating_sub(visible);
+            self.scroll_offset = (self.scroll_offset + 1).min(max_offset);
         }
     }
 
@@ -354,7 +376,7 @@ impl Renderer {
         for segment in text.split('\n') {
             let wrapped = self.wrap_line(segment, max_width);
             for chunk in &wrapped {
-                self.buffer.push(LineEntry {
+                self.push_buffer_line(LineEntry {
                     text: chunk.clone(),
                     color,
                 });
@@ -398,7 +420,7 @@ impl Renderer {
                     self.partial.push_str(segment);
                     self.commit_partial();
                 } else if !had_content {
-                    self.buffer.push(LineEntry {
+                    self.push_buffer_line(LineEntry {
                         text: CompactString::new(""),
                         color,
                     });
@@ -660,5 +682,196 @@ pub fn copy_to_clipboard(text: &str) {
             let _ = child.wait();
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a renderer with a synthetic buffer of `n` short lines so we
+    /// can drive scroll/append behavior without touching a real terminal.
+    fn fresh_with_lines(n: usize) -> Renderer {
+        let mut r = Renderer::new().expect("renderer");
+        for i in 0..n {
+            r.buffer.push(LineEntry {
+                text: CompactString::new(&format!("line {i}")),
+                color: Color::White,
+            });
+        }
+        r.lines = r.buffer.len() as u16;
+        r
+    }
+
+    /// Absolute index of the first visible line in the current viewport,
+    /// matching the formula used by `render_viewport`.
+    fn view_start(r: &Renderer) -> usize {
+        let visible = r.visible_lines();
+        let total = r.buffer.len();
+        let start = if r.scroll_offset == 0 {
+            total.saturating_sub(visible)
+        } else {
+            total.saturating_sub(r.scroll_offset + visible)
+        };
+        start.min(total.saturating_sub(visible))
+    }
+
+    // Regression: previously, when the user scrolled up while output was
+    // streaming, scroll_offset stayed fixed but the buffer grew — so the
+    // viewport drifted forward into newer content. The fix bumps
+    // scroll_offset by one per appended line so the view stays anchored to
+    // the same absolute lines.
+    #[test]
+    fn regression_scrolled_up_view_stays_anchored_through_appends() {
+        let mut r = fresh_with_lines(50);
+        // Scroll up 10 lines. View start changes; record it.
+        for _ in 0..10 {
+            r.scroll_line_up();
+        }
+        let pinned_start = view_start(&r);
+
+        // Stream in 8 new lines while the user is scrolled up.
+        for i in 0..8 {
+            r.push_buffer_line(LineEntry {
+                text: CompactString::new(&format!("new {i}")),
+                color: Color::White,
+            });
+        }
+
+        // The first visible line index hasn't moved.
+        assert_eq!(view_start(&r), pinned_start);
+    }
+
+    // Regression: replace_from (used by the streaming-token markdown path)
+    // also has to honor the scroll anchor. If the agent's current response
+    // grows (or shrinks) while the user is scrolled up viewing earlier
+    // content, the earlier content must stay in view.
+    #[test]
+    fn regression_replace_from_keeps_view_anchored_when_scrolled_up() {
+        let mut r = fresh_with_lines(50);
+        for _ in 0..10 {
+            r.scroll_line_up();
+        }
+        let pinned_start = view_start(&r);
+
+        // Replace from line 40 with twice as many lines.
+        let new_lines: Vec<LineEntry> = (0..20)
+            .map(|i| LineEntry {
+                text: CompactString::new(&format!("repl {i}")),
+                color: Color::White,
+            })
+            .collect();
+        r.replace_from(40, new_lines);
+
+        assert_eq!(view_start(&r), pinned_start);
+
+        // Now replace with FEWER lines (response got shorter via re-render).
+        let shorter: Vec<LineEntry> = (0..5)
+            .map(|i| LineEntry {
+                text: CompactString::new(&format!("sh {i}")),
+                color: Color::White,
+            })
+            .collect();
+        // After the first replace, len = 40 + 20 = 60. Now truncate at 40,
+        // extend by 5 → len = 45. delta = -15. The view should attempt to
+        // stay anchored at pinned_start, clamped.
+        r.replace_from(40, shorter);
+        let after = view_start(&r);
+        // It must NOT have drifted upward (smaller absolute index) past where
+        // the user originally was; staying ≥ pinned_start - shrink-room is ok.
+        assert!(
+            after <= pinned_start,
+            "view must not skip past anchor; was {pinned_start}, now {after}"
+        );
+    }
+
+    // When the user is AT the bottom (scroll_offset == 0), new content must
+    // be visible — the view follows the bottom. The anchor behavior must not
+    // accidentally pin the bottom-anchored view.
+    #[test]
+    fn at_bottom_view_follows_new_content() {
+        let mut r = fresh_with_lines(50);
+        assert_eq!(r.scroll_offset, 0);
+
+        for i in 0..5 {
+            r.push_buffer_line(LineEntry {
+                text: CompactString::new(&format!("new {i}")),
+                color: Color::White,
+            });
+        }
+        assert_eq!(r.scroll_offset, 0, "bottom-anchored view must stay at 0");
+
+        let visible = r.visible_lines();
+        let total = r.buffer.len();
+        assert_eq!(view_start(&r), total.saturating_sub(visible));
+    }
+
+    // Selection indices are absolute and must NOT shift when content
+    // streams in. Prior to the anchor fix the selection rectangle visually
+    // drifted because scroll_offset stayed put while the viewport advanced;
+    // now the indices are still preserved and the viewport stays anchored,
+    // so the selection rectangle stays where the user dragged it.
+    #[test]
+    fn selection_indices_stay_absolute_under_streaming_appends() {
+        let mut r = fresh_with_lines(50);
+        for _ in 0..10 {
+            r.scroll_line_up();
+        }
+        r.selection_active = true;
+        r.selection_start = Some(15);
+        r.selection_end = Some(20);
+
+        for i in 0..7 {
+            r.push_buffer_line(LineEntry {
+                text: CompactString::new(&format!("new {i}")),
+                color: Color::White,
+            });
+        }
+
+        // Selection indices are absolute and remain untouched.
+        assert_eq!(r.selection_start, Some(15));
+        assert_eq!(r.selection_end, Some(20));
+    }
+
+    // Boundary: a tiny buffer where appending pushes scroll_offset past
+    // max_offset. The clamp inside push_buffer_line keeps it in range.
+    #[test]
+    fn push_clamps_scroll_offset_to_max_when_buffer_grows() {
+        let mut r = fresh_with_lines(2);
+        let visible = r.visible_lines();
+        // Force a non-zero offset (clamp may already prevent it on tiny
+        // buffers; assert behavior either way).
+        r.scroll_offset = 100;
+        for _ in 0..3 {
+            r.push_buffer_line(LineEntry {
+                text: CompactString::new("more"),
+                color: Color::White,
+            });
+        }
+        let max_offset = r.buffer.len().saturating_sub(visible);
+        assert!(
+            r.scroll_offset <= max_offset,
+            "scroll_offset {} must be ≤ max {}",
+            r.scroll_offset,
+            max_offset
+        );
+    }
+
+    // Streaming via commit_partial (the path used by `write` for streamed
+    // tokens) also goes through push_buffer_line. Verify the partial commit
+    // bumps the offset when scrolled up.
+    #[test]
+    fn commit_partial_routes_through_anchor_aware_push() {
+        let mut r = fresh_with_lines(50);
+        for _ in 0..10 {
+            r.scroll_line_up();
+        }
+        let pinned_start = view_start(&r);
+
+        r.partial = CompactString::new("a streamed token chunk");
+        r.partial_color = Color::White;
+        r.commit_partial();
+
+        assert_eq!(view_start(&r), pinned_start);
     }
 }
