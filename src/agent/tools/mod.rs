@@ -1,5 +1,5 @@
-mod bash;
 pub(crate) mod background;
+mod bash;
 pub(crate) mod cache;
 pub(crate) mod edit;
 mod find_files;

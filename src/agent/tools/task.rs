@@ -100,7 +100,10 @@ impl Tool for TaskTool {
                 );
             });
 
-            Ok(format!("background task started\n\ntask_id: {}\nstate: running\n\nUse task_status to check progress.", task_id))
+            Ok(format!(
+                "background task started\n\ntask_id: {}\nstate: running\n\nUse task_status to check progress.",
+                task_id
+            ))
         } else {
             let result = self
                 .model

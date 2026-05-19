@@ -3,8 +3,8 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use std::time::Duration;
 
-use crate::agent::tools::background::{BackgroundStore, TaskState};
 use crate::agent::tools::ToolError;
+use crate::agent::tools::background::{BackgroundStore, TaskState};
 
 pub struct TaskStatusTool {
     bg_store: BackgroundStore,
@@ -77,20 +77,14 @@ impl Tool for TaskStatusTool {
                         }
                     },
                     None => {
-                        return Err(ToolError::Msg(format!(
-                            "task not found: {}",
-                            args.task_id
-                        )));
+                        return Err(ToolError::Msg(format!("task not found: {}", args.task_id)));
                     }
                 }
             }
         } else {
             match self.bg_store.get(&args.task_id) {
                 Some(task) => match &task.state {
-                    TaskState::Running => Ok(format!(
-                        "task_id: {}\nstate: running",
-                        args.task_id
-                    )),
+                    TaskState::Running => Ok(format!("task_id: {}\nstate: running", args.task_id)),
                     TaskState::Completed(text) => Ok(format!(
                         "task_id: {}\nstate: completed\n\n{}",
                         args.task_id, text
@@ -100,10 +94,7 @@ impl Tool for TaskStatusTool {
                         args.task_id, err
                     )),
                 },
-                None => Err(ToolError::Msg(format!(
-                    "task not found: {}",
-                    args.task_id
-                ))),
+                None => Err(ToolError::Msg(format!("task not found: {}", args.task_id))),
             }
         }
     }

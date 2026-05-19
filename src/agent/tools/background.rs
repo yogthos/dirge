@@ -26,10 +26,12 @@ impl BackgroundStore {
     }
 
     pub fn insert(&self, id: String) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, BackgroundTask { state: TaskState::Running });
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            BackgroundTask {
+                state: TaskState::Running,
+            },
+        );
     }
 
     /// Get current task state. Completed/failed tasks are removed on read
@@ -49,12 +51,7 @@ impl BackgroundStore {
     /// Update task state (called by the spawned subagent).
     /// Truncates output to MAX_TASK_OUTPUT_CHARS to avoid context bloat.
     pub fn update(&self, id: &str, state: TaskState) {
-        if let Some(task) = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(id)
-        {
+        if let Some(task) = self.0.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id) {
             let truncated = match state {
                 TaskState::Completed(text) => {
                     let t: String = text.chars().take(MAX_TASK_OUTPUT_CHARS).collect();

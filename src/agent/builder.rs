@@ -227,8 +227,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 bg_store.clone(),
             ));
             let status_tool =
-                Box::new(tools::TaskStatusTool::new(bg_store))
-                    as Box<dyn rig::tool::ToolDyn>;
+                Box::new(tools::TaskStatusTool::new(bg_store)) as Box<dyn rig::tool::ToolDyn>;
             builder = builder.tools(vec![task_tool, status_tool]);
         }
 
