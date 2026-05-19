@@ -913,3 +913,27 @@ fn ctrl_j_during_picker_is_noop() {
     assert!(result.is_none());
     assert_eq!(editor.buffer.as_str(), buf_before);
 }
+
+#[test]
+fn paste_with_crlf_line_endings_collapses() {
+    // Regression: a paste from a clipboard/source that uses \r\n line
+    // endings used to be treated as a single line because matches('\n')
+    // only counts LF. The threshold check failed, the raw text (including
+    // \r) got inserted, and the terminal rendered carriage returns as
+    // overstrikes — garbling the input.
+    let mut editor = InputEditor::new();
+    editor.handle_paste("a\r\nb\r\nc\r\nd\r\ne");
+    // After normalization the paste is 5 lines, >= 4, so collapses.
+    assert!(editor.buffer.contains('\u{0001}'));
+    assert_eq!(editor.expanded().as_str(), "a\nb\nc\nd\ne");
+}
+
+#[test]
+fn paste_with_cr_only_line_endings_collapses() {
+    // Some sources (e.g., legacy macOS clipboards) deliver `\r` alone.
+    // Same normalization should apply.
+    let mut editor = InputEditor::new();
+    editor.handle_paste("a\rb\rc\rd\re");
+    assert!(editor.buffer.contains('\u{0001}'));
+    assert_eq!(editor.expanded().as_str(), "a\nb\nc\nd\ne");
+}

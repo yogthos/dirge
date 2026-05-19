@@ -332,9 +332,15 @@ impl InputEditor {
         if self.picker.as_ref().is_some_and(|p| p.active) {
             return;
         }
+        // Normalize line endings to `\n`. macOS-era clipboards and some
+        // terminal paste streams deliver `\r` or `\r\n`. Without this the
+        // line count comes out as 1, the collapse threshold isn't reached,
+        // and the raw text gets inserted — with embedded `\r` chars that
+        // the terminal then renders as carriage-returns, garbling the line.
+        let normalized: String = text.replace("\r\n", "\n").replace('\r', "\n");
         // Strip PASTE_MARK so it can never appear in paste content and confuse
         // the marker parser.
-        let cleaned: String = text.chars().filter(|&c| c != PASTE_MARK).collect();
+        let cleaned: String = normalized.chars().filter(|&c| c != PASTE_MARK).collect();
         if cleaned.is_empty() {
             return;
         }
