@@ -137,7 +137,7 @@ mod tests {
     async fn test_task_status_completed() {
         let store = BackgroundStore::new();
         store.insert("test-task".to_string());
-        store.update("test-task", TaskState::Completed("result text".to_string()));
+        store.notify("test-task", TaskState::Completed("result text".to_string()));
         let tool = TaskStatusTool::new(store);
         let result = tool
             .call(TaskStatusArgs {
@@ -154,7 +154,7 @@ mod tests {
     async fn test_task_status_failed() {
         let store = BackgroundStore::new();
         store.insert("test-task".to_string());
-        store.update("test-task", TaskState::Failed("error message".to_string()));
+        store.notify("test-task", TaskState::Failed("error message".to_string()));
         let tool = TaskStatusTool::new(store);
         let result = tool
             .call(TaskStatusArgs {
@@ -176,7 +176,7 @@ mod tests {
         let store_clone = store.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            store_clone.update("test-task", TaskState::Completed("done".to_string()));
+            store_clone.notify("test-task", TaskState::Completed("done".to_string()));
         });
 
         let tool = TaskStatusTool::new(store);
@@ -233,7 +233,7 @@ mod tests {
         let store_clone = store.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            store_clone.update("t1", TaskState::Failed("kaboom".into()));
+            store_clone.notify("t1", TaskState::Failed("kaboom".into()));
         });
 
         let tool = TaskStatusTool::new(store);

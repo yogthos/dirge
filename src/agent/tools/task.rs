@@ -91,7 +91,7 @@ impl Tool for TaskTool {
                         prompt
                     ))
                     .await;
-                store.update(
+                store.notify(
                     &tid,
                     match result {
                         Ok(text) => TaskState::Completed(text),

@@ -123,12 +123,6 @@ impl BackgroundStore {
         out
     }
 
-    /// Phase-1 shim kept for callers that haven't been migrated to [`notify`].
-    /// Removed in Phase 2 once `TaskTool` switches over.
-    pub fn update(&self, id: &str, state: TaskState) {
-        self.notify(id, state);
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
