@@ -33,7 +33,7 @@ use crate::shell;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
 use crate::ui::picker::ListPicker;
-use crate::ui::renderer::{Renderer, copy_to_clipboard};
+use crate::ui::renderer::{LineEntry, Renderer, copy_to_clipboard};
 use crate::ui::slash::{handle_compress, handle_slash};
 use crate::ui::status::StatusLine;
 use crate::ui::terminal::TerminalGuard;
@@ -1397,9 +1397,14 @@ pub async fn run_interactive(
                     let mut selected: Vec<bool> = vec![false; num_options];
                     let mut custom_text: Option<String> = None;
 
-                    // First question gets an initial render of options
+                    // Anchor point — options rendered below will be replaced on each keystroke
+                    let anchor = renderer.buffer_len();
+
                     loop {
-                        // Render options
+                        // Build option lines as Vec<LineEntry>
+                        let mut lines: Vec<LineEntry> = Vec::with_capacity(
+                            num_options + if custom { 2 } else { 1 },
+                        );
                         for (i, opt) in question.options.iter().enumerate() {
                             let marker = if i == cursor {
                                 if multi {
@@ -1414,10 +1419,12 @@ pub async fn run_interactive(
                                     "  "
                                 }
                             };
-                            renderer.write_line(
-                                &format!("  {} {} — {}", marker, opt.label, opt.description),
-                                C_PERM,
-                            )?;
+                            lines.push(LineEntry {
+                                text: compact_str::CompactString::new(
+                                    &format!("  {} {} — {}", marker, opt.label, opt.description),
+                                ),
+                                color: C_PERM,
+                            });
                         }
                         if custom {
                             let custom_marker = if cursor == num_options { "▶" } else { "  " };
@@ -1426,17 +1433,22 @@ pub async fn run_interactive(
                             } else {
                                 format!("{} (custom) type your own answer...", custom_marker)
                             };
-                            renderer.write_line(&custom_label, C_PERM)?;
+                            lines.push(LineEntry {
+                                text: compact_str::CompactString::new(&custom_label),
+                                color: C_PERM,
+                            });
                         }
-                        renderer.write_line(
-                            if multi {
+                        lines.push(LineEntry {
+                            text: compact_str::CompactString::new(if multi {
                                 "  ↑↓ navigate  Space toggle  Enter confirm  Esc reject all"
                             } else {
                                 "  ↑↓ navigate  Enter select  Esc reject all"
-                            },
-                            C_PERM,
-                        )?;
+                            }),
+                            color: C_PERM,
+                        });
 
+                        // Replace previous render with updated options
+                        renderer.replace_from(anchor, lines);
                         renderer.render_viewport()?;
                         renderer.draw_bottom(
                             &input,
@@ -1463,11 +1475,17 @@ pub async fn run_interactive(
                                     // Custom text input (works for both single and multi)
                                     let mut buf = String::new();
                                     renderer.write_line("  enter your answer:", C_PERM)?;
+                                    let input_anchor = renderer.buffer_len();
                                     loop {
-                                        renderer.write_line(
-                                            &format!("  > {}", buf),
-                                            C_PERM,
-                                        )?;
+                                        renderer.replace_from(
+                                            input_anchor,
+                                            vec![LineEntry {
+                                                text: compact_str::CompactString::new(
+                                                    &format!("  > {}", buf),
+                                                ),
+                                                color: C_PERM,
+                                            }],
+                                        );
                                         renderer.render_viewport()?;
                                         renderer.draw_bottom(
                                             &input,
