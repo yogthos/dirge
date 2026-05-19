@@ -16,3 +16,4 @@ pub mod jsonrpc;
 pub mod language;
 pub mod rpc;
 pub mod server;
+pub mod uri;

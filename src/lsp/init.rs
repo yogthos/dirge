@@ -16,11 +16,12 @@ use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DidChangeWatchedFilesClientCapabilities,
     GeneralClientCapabilities, InitializeParams, InitializeResult,
     PublishDiagnosticsClientCapabilities, TextDocumentClientCapabilities,
-    TextDocumentSyncClientCapabilities, Uri, WindowClientCapabilities, WorkspaceClientCapabilities,
+    TextDocumentSyncClientCapabilities, WindowClientCapabilities, WorkspaceClientCapabilities,
     WorkspaceFolder,
 };
 
 use crate::lsp::rpc::{RpcClient, RpcError};
+use crate::lsp::uri::path_to_file_uri;
 
 /// Time we'll wait for the server to answer `initialize`. Matches opencode's
 /// 45s ceiling — rust-analyzer in particular can take a moment when first
@@ -40,7 +41,7 @@ pub async fn initialize(
     process_id: Option<u32>,
     initialization_options: serde_json::Value,
 ) -> Result<InitializeResult, RpcError> {
-    let root_uri = path_to_file_uri(root)?;
+    let root_uri = path_to_file_uri(root).map_err(RpcError::Io)?;
 
     let params = InitializeParams {
         process_id,
@@ -68,46 +69,6 @@ pub async fn initialize(
     client.notify("initialized", serde_json::json!({})).await?;
 
     Ok(result)
-}
-
-fn path_to_file_uri(path: &Path) -> Result<Uri, RpcError> {
-    // `file://` URI from a filesystem path. We don't try to handle Windows
-    // drive letters specially — dirge isn't tested on Windows.
-    let canonical = path.to_string_lossy();
-    let encoded = percent_encode_path(&canonical);
-    let uri_str = if canonical.starts_with('/') {
-        format!("file://{encoded}")
-    } else {
-        format!("file:///{encoded}")
-    };
-    uri_str.parse::<Uri>().map_err(|e| {
-        RpcError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid path for file URI: {e}"),
-        ))
-    })
-}
-
-/// Percent-encode characters that would otherwise be interpreted as URI
-/// structural delimiters. Slashes are preserved (path separators). Conforms
-/// to RFC 3986's `unreserved` set + `/` for path segments. Pure ASCII only —
-/// non-ASCII bytes pass through and the Uri parser does its own escaping or
-/// rejection.
-fn percent_encode_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        let safe =
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~' | b':');
-        if safe {
-            out.push(byte as char);
-        } else if byte < 0x80 {
-            out.push_str(&format!("%{byte:02X}"));
-        } else {
-            // Non-ASCII — emit as UTF-8 percent-encoded bytes.
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 /// The client capabilities we advertise. Conservative and stable — matches
@@ -367,30 +328,6 @@ mod tests {
         assert!(
             opts.is_none() || opts.unwrap().is_null(),
             "expected omitted or explicit null; got: {opts:?}"
-        );
-    }
-
-    // Regression: paths containing URI-significant characters must be
-    // percent-encoded. A `#` would otherwise terminate the path early and
-    // produce a fragment.
-    #[test]
-    fn path_to_file_uri_percent_encodes_special_chars() {
-        let p = Path::new("/tmp/proj #1/src/main.rs");
-        let uri = path_to_file_uri(p).unwrap();
-        let s = uri.as_str();
-        assert!(s.starts_with("file:///"), "got: {s}");
-        assert!(s.contains("%23"), "must encode '#' as %23, got: {s}");
-        assert!(s.contains("%20"), "must encode space as %20, got: {s}");
-    }
-
-    #[test]
-    fn path_to_file_uri_preserves_slashes_and_safe_chars() {
-        let p = Path::new("/tmp/proj_v1.0-rc/main.rs");
-        let uri = path_to_file_uri(p).unwrap();
-        let s = uri.as_str();
-        assert!(
-            s.starts_with("file:///tmp/proj_v1.0-rc/main.rs"),
-            "got: {s}"
         );
     }
 

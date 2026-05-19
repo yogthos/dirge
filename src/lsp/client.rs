@@ -24,6 +24,7 @@ use tokio::sync::watch;
 
 use crate::lsp::language;
 use crate::lsp::rpc::{RpcClient, RpcError};
+use crate::lsp::uri::{path_to_file_uri_string, uri_to_path};
 
 #[derive(Debug, Default)]
 struct FileState {
@@ -112,15 +113,15 @@ impl LspClient {
     /// `textDocument/didChange` thereafter (with a bumped version).
     /// Returns the version sent.
     ///
-    /// Uses synchronous `std::fs::canonicalize` + `std::fs::read_to_string`.
-    /// Acceptable for now since callers invoke this once per write boundary,
-    /// not on a hot loop. Phase 4 should switch to `tokio::fs` if hot paths
-    /// emerge (e.g. touching many files in parallel on agent startup).
+    /// File I/O goes through `tokio::fs` so the orchestrator can fan
+    /// `touch_file` out across multiple clients without blocking the runtime
+    /// thread.
     pub async fn notify_open(&self, path: &Path) -> Result<i32, LspError> {
-        let abs = path
-            .canonicalize()
-            .or_else(|_| Ok::<_, std::io::Error>(path.to_path_buf()))?;
-        let text = std::fs::read_to_string(&abs)?;
+        let abs = match tokio::fs::canonicalize(path).await {
+            Ok(p) => p,
+            Err(_) => path.to_path_buf(),
+        };
+        let text = tokio::fs::read_to_string(&abs).await?;
         let uri = path_to_file_uri_string(&abs);
 
         let is_first_open;
@@ -252,70 +253,6 @@ impl LspClient {
     pub fn rpc(&self) -> &RpcClient {
         &self.rpc
     }
-}
-
-fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    // Strip `file://` and percent-decode the body. We're intentionally
-    // permissive: the spec allows file:///path on unix and file://host/path
-    // on remote (which we don't support). Anything else returns None.
-    let trimmed = uri
-        .strip_prefix("file://")
-        .or_else(|| uri.strip_prefix("file:"))?;
-    let decoded = percent_decode(trimmed);
-    Some(PathBuf::from(decoded))
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = hex_value(bytes[i + 1]);
-            let lo = hex_value(bytes[i + 2]);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn path_to_file_uri_string(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    let encoded = percent_encode_path(&s);
-    if s.starts_with('/') {
-        format!("file://{encoded}")
-    } else {
-        format!("file:///{encoded}")
-    }
-}
-
-fn percent_encode_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        let safe =
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~' | b':');
-        if safe {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 fn dedupe<I: IntoIterator<Item = Diagnostic>>(items: I) -> Vec<Diagnostic> {
@@ -668,28 +605,5 @@ mod tests {
             .wait_for_push(&path, after, Duration::from_millis(80))
             .await;
         assert!(matches!(res, Err(LspError::DiagnosticsTimeout { .. })));
-    }
-
-    // URI ↔ path round-trips, exercising percent-encoding.
-    #[test]
-    fn uri_to_path_roundtrips_safe_paths() {
-        let p = PathBuf::from("/tmp/proj/main.rs");
-        let uri = path_to_file_uri_string(&p);
-        let decoded = uri_to_path(&uri).unwrap();
-        assert_eq!(decoded, p);
-    }
-
-    #[test]
-    fn uri_to_path_decodes_percent_encoded_special_chars() {
-        let p = PathBuf::from("/tmp/proj #1/main.rs");
-        let uri = path_to_file_uri_string(&p);
-        assert!(uri.contains("%23"));
-        let decoded = uri_to_path(&uri).unwrap();
-        assert_eq!(decoded, p);
-    }
-
-    #[test]
-    fn uri_to_path_returns_none_for_non_file_uri() {
-        assert!(uri_to_path("https://example.com").is_none());
     }
 }
