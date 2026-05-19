@@ -74,7 +74,13 @@ fn build_channels(
 
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
     let (question_tx, question_rx) = tokio::sync::mpsc::channel(64);
-    (Some(perm), Some(ask_tx), Some(ask_rx), Some(question_tx), Some(question_rx))
+    (
+        Some(perm),
+        Some(ask_tx),
+        Some(ask_rx),
+        Some(question_tx),
+        Some(question_rx),
+    )
 }
 
 #[tokio::main(flavor = "current_thread")]

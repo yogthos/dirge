@@ -151,7 +151,9 @@ impl Tool for QuestionTool {
             Ok(QuestionResponse::Rejected) => {
                 Err(ToolError::Msg("question rejected by user".to_string()))
             }
-            Err(_) => Err(ToolError::Msg("question channel closed unexpectedly".to_string())),
+            Err(_) => Err(ToolError::Msg(
+                "question channel closed unexpectedly".to_string(),
+            )),
         }
     }
 }

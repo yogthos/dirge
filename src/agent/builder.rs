@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::agent::prompt::{SYSTEM_PROMPT, TODO_TOOLS_PROMPT};
 use crate::agent::tools;
-use crate::agent::tools::question::QuestionSender;
 use crate::agent::tools::ToolCache;
+use crate::agent::tools::question::QuestionSender;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::context::ContextFiles;
@@ -173,9 +173,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::MemoryTool::new(permission.clone(), ask_tx.clone())),
         ];
 
-        let question_tool = question_tx.map(|tx| {
-            Box::new(tools::QuestionTool::new(tx)) as Box<dyn rig::tool::ToolDyn>
-        });
+        let question_tool = question_tx
+            .map(|tx| Box::new(tools::QuestionTool::new(tx)) as Box<dyn rig::tool::ToolDyn>);
 
         #[allow(unused_mut)]
         let mut builder = builder.tools(base_tools);
