@@ -198,4 +198,82 @@ mod tests {
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "task_status");
     }
+
+    // Regression: BackgroundStore::get() evicts on read. Once task_status
+    // returns a completed task to the agent, asking again must return
+    // "not found" rather than re-serving the same payload (which would let
+    // a bad agent loop on the same result and keep it in the store).
+    #[tokio::test]
+    async fn regression_completed_task_evicts_after_first_status_read() {
+        let store = BackgroundStore::new();
+        store.insert("t1".into());
+        store.update("t1", TaskState::Completed("payload".into()));
+
+        let tool = TaskStatusTool::new(store);
+        let first = tool
+            .call(TaskStatusArgs {
+                task_id: "t1".into(),
+                wait: None,
+            })
+            .await
+            .unwrap();
+        assert!(first.contains("state: completed"));
+        assert!(first.contains("payload"));
+
+        let second = tool
+            .call(TaskStatusArgs {
+                task_id: "t1".into(),
+                wait: None,
+            })
+            .await;
+        assert!(second.is_err());
+        assert!(second.unwrap_err().to_string().contains("not found"));
+    }
+
+    // wait=true must also return on failure (not just on completion), and the
+    // error text must be surfaced.
+    #[tokio::test]
+    async fn wait_returns_on_failure() {
+        let store = BackgroundStore::new();
+        store.insert("t1".into());
+
+        let store_clone = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            store_clone.update("t1", TaskState::Failed("kaboom".into()));
+        });
+
+        let tool = TaskStatusTool::new(store);
+        let result = tool
+            .call(TaskStatusArgs {
+                task_id: "t1".into(),
+                wait: Some(true),
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("state: failed"));
+        assert!(result.contains("kaboom"));
+    }
+
+    // wait=true must surface a not-found error promptly rather than loop on
+    // an absent task.
+    #[tokio::test]
+    async fn wait_on_missing_task_errors_promptly() {
+        let store = BackgroundStore::new();
+        let tool = TaskStatusTool::new(store);
+
+        // Bound the call so a regression to infinite-loop fails the test.
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tool.call(TaskStatusArgs {
+                task_id: "never-existed".into(),
+                wait: Some(true),
+            }),
+        )
+        .await
+        .expect("must not loop on missing task");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
 }

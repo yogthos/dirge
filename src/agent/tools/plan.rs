@@ -217,4 +217,65 @@ mod tests {
         let exit = PlanExitTool::new(tx2).definition(String::new()).await;
         assert_eq!(exit.name, "plan_exit");
     }
+
+    // Regression: a prior version of plan_exit wrote a "Implementation Plan"
+    // placeholder to PLAN.md in CWD whenever the user accepted the mode
+    // switch. That side-effect bypassed the file-write permission system and
+    // surprised users whose CWD already contained an unrelated PLAN.md. The
+    // fix removed the write entirely — this test guards against
+    // re-introducing it by inspecting the source.
+    #[test]
+    fn regression_plan_exit_has_no_filesystem_side_effects() {
+        let src = include_str!("plan.rs");
+        // The impl block for PlanExitTool. We don't want fs::write or PLAN.md
+        // string literals anywhere in the call() path.
+        let impl_start = src
+            .find("impl Tool for PlanExitTool")
+            .expect("PlanExitTool impl present");
+        let impl_end = src[impl_start..]
+            .find("\n}\n")
+            .map(|i| impl_start + i)
+            .unwrap_or(src.len());
+        let body = &src[impl_start..impl_end];
+        assert!(
+            !body.contains("PLAN.md"),
+            "plan_exit must not reference PLAN.md (side-effect regression)"
+        );
+        assert!(
+            !body.contains("fs::write"),
+            "plan_exit must not write files (side-effect regression)"
+        );
+    }
+
+    // Regression: dropping the receiver (UI not subscribed) must surface a
+    // clean error rather than panic or hang.
+    #[tokio::test]
+    async fn plan_enter_channel_unavailable() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let tool = PlanEnterTool::new(tx);
+        let result = tool.call(PlanEnterArgs {}).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unavailable"),
+            "expected 'unavailable' error",
+        );
+    }
+
+    // Regression: if the UI accepts the request handle but drops the oneshot
+    // before replying, the tool must error cleanly (channel closed) rather
+    // than block forever.
+    #[tokio::test]
+    async fn plan_enter_reply_dropped() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = PlanEnterTool::new(tx);
+        let handle = tokio::spawn(async move { tool.call(PlanEnterArgs {}).await });
+
+        let req = rx.recv().await.unwrap();
+        drop(req.reply);
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("channel closed"));
+    }
 }

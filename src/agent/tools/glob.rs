@@ -204,4 +204,159 @@ mod tests {
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "glob");
     }
+
+    // ---- Integration tests against a real temp directory ----
+
+    struct TempTree {
+        root: std::path::PathBuf,
+    }
+
+    impl TempTree {
+        fn new(suffix: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dirge-glob-test-{}-{}",
+                std::process::id(),
+                suffix
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn write(&self, rel: &str, content: &str) -> std::path::PathBuf {
+            let p = self.root.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, content).unwrap();
+            p
+        }
+
+        fn root_str(&self) -> String {
+            self.root.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_walks_files_under_path() {
+        let tree = TempTree::new("walks");
+        tree.write("a.rs", "");
+        tree.write("b.rs", "");
+        tree.write("c.py", "");
+        tree.write("sub/d.rs", "");
+
+        let tool = GlobTool::new(None, None);
+        let out = tool
+            .call(GlobArgs {
+                pattern: "**/*.rs".into(),
+                path: Some(tree.root_str()),
+            })
+            .await
+            .unwrap();
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "got: {out}");
+        for f in ["a.rs", "b.rs", "sub/d.rs"] {
+            assert!(lines.contains(&f), "expected {f} in: {out}");
+        }
+        // .py file should be excluded.
+        assert!(!out.contains("c.py"));
+    }
+
+    // Regression: previously returned the literal string "no files matched",
+    // which the agent had to special-case. Now returns "" so the response is
+    // cleanly empty.
+    #[tokio::test]
+    async fn regression_empty_result_returns_empty_string() {
+        let tree = TempTree::new("empty");
+        tree.write("a.txt", "");
+
+        let tool = GlobTool::new(None, None);
+        let out = tool
+            .call(GlobArgs {
+                pattern: "**/*.nonexistent".into(),
+                path: Some(tree.root_str()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out, "");
+    }
+
+    // Regression: mtime sort previously called metadata() on the relative path,
+    // looked up against CWD instead of the explicit root. When `path` was not
+    // CWD, all metadata calls failed silently and sort degraded to alphabetical.
+    // Now we keep absolute paths for metadata lookups.
+    #[tokio::test]
+    async fn regression_mtime_sort_with_explicit_path() {
+        let tree = TempTree::new("mtime");
+        tree.write("oldest.rs", "");
+        // Walk-clock-time is sufficient on every platform we run.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        tree.write("middle.rs", "");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        tree.write("newest.rs", "");
+
+        let tool = GlobTool::new(None, None);
+        let out = tool
+            .call(GlobArgs {
+                pattern: "*.rs".into(),
+                path: Some(tree.root_str()),
+            })
+            .await
+            .unwrap();
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines, vec!["newest.rs", "middle.rs", "oldest.rs"]);
+    }
+
+    // Regression: `ignore::WalkBuilder` is configured with `git_ignore(true)`
+    // so .gitignore'd files are skipped without needing an explicit deny list.
+    #[tokio::test]
+    async fn regression_respects_gitignore() {
+        let tree = TempTree::new("gitignore");
+        // .gitignore is only honored inside a git repo, so we make one.
+        std::fs::create_dir_all(tree.root.join(".git")).unwrap();
+        tree.write(".gitignore", "ignored.rs\n");
+        tree.write("kept.rs", "");
+        tree.write("ignored.rs", "");
+
+        let tool = GlobTool::new(None, None);
+        let out = tool
+            .call(GlobArgs {
+                pattern: "*.rs".into(),
+                path: Some(tree.root_str()),
+            })
+            .await
+            .unwrap();
+
+        assert!(out.contains("kept.rs"));
+        assert!(!out.contains("ignored.rs"), "got: {out}");
+    }
+
+    // The glob→regex conversion escapes regex metachars so they can't be
+    // interpreted as regex. Without this, an agent passing `file.rs` would
+    // unexpectedly match `fileXrs` because `.` is regex metasyntax.
+    #[test]
+    fn glob_escapes_regex_metacharacters() {
+        let re = glob_to_regex("file.rs").unwrap();
+        assert!(re.is_match("file.rs"));
+        assert!(!re.is_match("fileXrs"));
+        assert!(!re.is_match("filers"));
+    }
+
+    // `*` is intentionally bounded to a single path segment — `*` does NOT
+    // descend into subdirs (only `**` does). Regression-guard against
+    // accidentally swapping `[^/]*` for `.*`.
+    #[test]
+    fn star_does_not_cross_directory_boundary() {
+        let re = glob_to_regex("*.rs").unwrap();
+        assert!(re.is_match("main.rs"));
+        assert!(!re.is_match("src/main.rs"));
+    }
 }

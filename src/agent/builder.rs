@@ -109,25 +109,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 
     // Inject mode-specific reminders
     if let Some(prompt_name) = &context.current_prompt_name {
-        match prompt_name.as_str() {
-            "plan" => {
-                preamble.push_str("\n\n---\n\nYou are now in PLAN mode. Create a detailed implementation plan. Save it to PLAN.md in the current directory. Analyze the task, break it into concrete steps, consider edge cases and trade-offs. Do NOT write any code or run any commands until the user reviews and approves the plan.");
-            }
-            "review" | "review-security" => {
-                preamble.push_str("\n\n---\n\nYou are now in REVIEW mode. Review the code or plan carefully. Identify bugs, security issues, performance problems, and design flaws. Be thorough and specific. Provide actionable feedback.");
-            }
-            "code" => {
-                let plan_path = std::env::current_dir()
-                    .unwrap_or_else(|_| ".".into())
-                    .join("PLAN.md");
-                if plan_path.exists() {
-                    preamble.push_str(
-                        "\n\n---\n\nA plan file exists at PLAN.md. Execute the plan step by step. Write and test code following the plan. Report progress after each step. The plan is your guide — follow it closely."
-                    );
-                }
-            }
-            _ => {}
-        }
+        let plan_exists = std::env::current_dir()
+            .unwrap_or_else(|_| ".".into())
+            .join("PLAN.md")
+            .exists();
+        append_mode_reminder(&mut preamble, prompt_name, plan_exists);
     }
 
     let mut builder = AgentBuilder::new(model).preamble(&preamble);
@@ -313,4 +299,81 @@ pub fn create_client(api_key: Option<&str>) -> anyhow::Result<openrouter::Client
             )
         })?;
     Ok(openrouter::Client::new(String::from(key))?)
+}
+
+/// Append a mode-specific reminder to `preamble` based on the active prompt
+/// name. `plan_exists` reports whether `PLAN.md` is present in CWD — only
+/// consulted for the `code` mode reminder. Unknown prompt names produce no
+/// reminder so custom prompts don't accidentally pick up plan/review semantics.
+pub(crate) fn append_mode_reminder(preamble: &mut String, prompt_name: &str, plan_exists: bool) {
+    match prompt_name {
+        "plan" => {
+            preamble.push_str("\n\n---\n\nYou are now in PLAN mode. Create a detailed implementation plan. Save it to PLAN.md in the current directory. Analyze the task, break it into concrete steps, consider edge cases and trade-offs. Do NOT write any code or run any commands until the user reviews and approves the plan.");
+        }
+        "review" | "review-security" => {
+            preamble.push_str("\n\n---\n\nYou are now in REVIEW mode. Review the code or plan carefully. Identify bugs, security issues, performance problems, and design flaws. Be thorough and specific. Provide actionable feedback.");
+        }
+        "code" if plan_exists => {
+            preamble.push_str(
+                "\n\n---\n\nA plan file exists at PLAN.md. Execute the plan step by step. Write and test code following the plan. Report progress after each step. The plan is your guide — follow it closely.",
+            );
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod reminder_tests {
+    use super::append_mode_reminder;
+
+    #[test]
+    fn plan_mode_injects_plan_reminder() {
+        let mut p = String::from("base");
+        append_mode_reminder(&mut p, "plan", false);
+        assert!(p.contains("PLAN mode"));
+        assert!(p.contains("PLAN.md"));
+        assert!(p.contains("Do NOT write any code"));
+    }
+
+    #[test]
+    fn review_modes_inject_review_reminder() {
+        for mode in &["review", "review-security"] {
+            let mut p = String::from("base");
+            append_mode_reminder(&mut p, mode, false);
+            assert!(p.contains("REVIEW mode"), "mode={mode}");
+            assert!(p.contains("Identify bugs"), "mode={mode}");
+        }
+    }
+
+    // Regression: the `code` reminder must only appear when PLAN.md exists.
+    // Without that guard every code-mode session would have a stale "execute
+    // the plan" instruction even with no plan written.
+    #[test]
+    fn regression_code_mode_reminder_requires_plan_md() {
+        let mut p_with = String::from("base");
+        append_mode_reminder(&mut p_with, "code", true);
+        assert!(p_with.contains("plan file exists"));
+
+        let mut p_without = String::from("base");
+        append_mode_reminder(&mut p_without, "code", false);
+        assert_eq!(p_without, "base", "no reminder must be added");
+    }
+
+    // Unknown prompts (custom user prompts) must produce no reminder so the
+    // plan/review semantics don't bleed into other modes.
+    #[test]
+    fn unknown_prompt_name_appends_nothing() {
+        let mut p = String::from("base");
+        append_mode_reminder(&mut p, "my-custom-prompt", true);
+        assert_eq!(p, "base");
+    }
+
+    // Each reminder is prefixed by the section separator so it visually
+    // detaches from the prior prompt — regression-guards the leading "\n\n---".
+    #[test]
+    fn reminders_use_section_separator() {
+        let mut p = String::new();
+        append_mode_reminder(&mut p, "plan", false);
+        assert!(p.starts_with("\n\n---\n\n"), "got: {p:?}");
+    }
 }

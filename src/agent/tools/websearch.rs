@@ -202,4 +202,58 @@ mod tests {
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "websearch");
     }
+
+    // Each ExaResult field is optional from the API's perspective. Missing
+    // pieces should be skipped silently rather than rendering "**None**" or
+    // panicking — guards format_search_results against partial responses.
+    #[test]
+    fn format_handles_missing_fields() {
+        let results = vec![
+            ExaResult {
+                title: None,
+                url: Some("https://no-title.example".into()),
+                text: Some("body".into()),
+            },
+            ExaResult {
+                title: Some("No URL".into()),
+                url: None,
+                text: Some("body".into()),
+            },
+            ExaResult {
+                title: Some("No text".into()),
+                url: Some("https://no-text.example".into()),
+                text: None,
+            },
+        ];
+        let out = format_search_results(&results);
+        assert!(out.contains("https://no-title.example"));
+        assert!(out.contains("**No URL**"));
+        assert!(out.contains("**No text**"));
+        assert!(!out.contains("None"), "got: {out}");
+    }
+
+    // Regression: WebSearchArgs default for num_results must be 10 to match
+    // the documented schema default.
+    #[test]
+    fn websearch_args_default_num_results_is_10() {
+        let parsed: WebSearchArgs =
+            serde_json::from_value(serde_json::json!({"query": "rust async"})).unwrap();
+        assert_eq!(parsed.num_results, 10);
+    }
+
+    // Text snippets in results are capped at 500 chars to prevent context
+    // blowout — long Exa results have been observed past 5K chars per item.
+    #[test]
+    fn format_truncates_long_text() {
+        let huge = "Z".repeat(2000);
+        let results = vec![ExaResult {
+            title: Some("t".into()),
+            url: Some("https://site.org".into()),
+            text: Some(huge),
+        }];
+        let out = format_search_results(&results);
+        // Cap is 500 chars on the snippet; nothing else contributes 'Z' here.
+        let z_count = out.chars().filter(|c| *c == 'Z').count();
+        assert_eq!(z_count, 500);
+    }
 }

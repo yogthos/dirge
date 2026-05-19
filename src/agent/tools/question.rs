@@ -319,4 +319,136 @@ mod tests {
         assert!(result.contains("A1"));
         assert!(result.contains("A2"));
     }
+
+    // Header text must be emitted as a markdown `## …` heading so the agent
+    // sees structured output rather than a flat blob.
+    #[tokio::test]
+    async fn output_includes_header_as_markdown_heading() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = QuestionTool::new(tx);
+        let args = QuestionArgs {
+            questions: vec![QuestionItem {
+                question: "Which?".into(),
+                header: Some("Choice".into()),
+                options: vec![QuestionOption {
+                    label: "A".into(),
+                    description: "".into(),
+                }],
+                multi_select: None,
+                custom: false,
+            }],
+        };
+        let handle = tokio::spawn(async move { tool.call(args).await });
+        let req = rx.recv().await.unwrap();
+        let _ = req
+            .reply
+            .send(QuestionResponse::Answered(vec![vec!["A".into()]]));
+        let out = handle.await.unwrap().unwrap();
+        assert!(out.contains("## Choice"), "got: {out}");
+        assert!(out.contains("**Q1:** Which?"));
+        assert!(out.contains("**A:** A"));
+    }
+
+    // Regression: dropping the receiver (channel closed before tool call)
+    // must error cleanly. Don't panic, don't hang.
+    #[tokio::test]
+    async fn errors_when_channel_unavailable() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let tool = QuestionTool::new(tx);
+        let result = tool
+            .call(QuestionArgs {
+                questions: vec![QuestionItem {
+                    question: "Q?".into(),
+                    header: None,
+                    options: vec![QuestionOption {
+                        label: "A".into(),
+                        description: "".into(),
+                    }],
+                    multi_select: None,
+                    custom: false,
+                }],
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unavailable"));
+    }
+
+    // Reply oneshot dropped without sending → tool surfaces channel-closed
+    // error rather than hanging.
+    #[tokio::test]
+    async fn errors_when_reply_dropped() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = QuestionTool::new(tx);
+        let handle = tokio::spawn(async move {
+            tool.call(QuestionArgs {
+                questions: vec![QuestionItem {
+                    question: "Q?".into(),
+                    header: None,
+                    options: vec![QuestionOption {
+                        label: "A".into(),
+                        description: "".into(),
+                    }],
+                    multi_select: None,
+                    custom: false,
+                }],
+            })
+            .await
+        });
+        let req = rx.recv().await.unwrap();
+        drop(req.reply);
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("channel closed"));
+    }
+
+    // Default for `custom` is true. Without serde reading the schema default
+    // an agent that omits the field would get `false`, which silently changes
+    // the picker UX.
+    #[test]
+    fn args_default_custom_is_true() {
+        let parsed: QuestionItem = serde_json::from_value(serde_json::json!({
+            "question": "Q?",
+            "options": [{"label": "A", "description": ""}],
+        }))
+        .unwrap();
+        assert!(parsed.custom);
+    }
+
+    // Multi-select with multiple answers must comma-join.
+    #[tokio::test]
+    async fn multi_select_joins_answers_with_comma() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = QuestionTool::new(tx);
+        let args = QuestionArgs {
+            questions: vec![QuestionItem {
+                question: "Pick".into(),
+                header: None,
+                options: vec![
+                    QuestionOption {
+                        label: "A".into(),
+                        description: "".into(),
+                    },
+                    QuestionOption {
+                        label: "B".into(),
+                        description: "".into(),
+                    },
+                    QuestionOption {
+                        label: "C".into(),
+                        description: "".into(),
+                    },
+                ],
+                multi_select: Some(true),
+                custom: false,
+            }],
+        };
+        let handle = tokio::spawn(async move { tool.call(args).await });
+        let req = rx.recv().await.unwrap();
+        let _ = req.reply.send(QuestionResponse::Answered(vec![vec![
+            "A".into(),
+            "C".into(),
+        ]]));
+        let out = handle.await.unwrap().unwrap();
+        assert!(out.contains("**A:** A, C"), "got: {out}");
+    }
 }

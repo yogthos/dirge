@@ -294,4 +294,221 @@ mod tests {
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "apply_patch");
     }
+
+    // Regression: update is documented as text-find-and-replace and must reject
+    // ambiguous matches rather than silently replacing the first one. Without
+    // this guard the agent could clobber wrong code in a file with repeated
+    // boilerplate (use statements, similar function bodies, etc.).
+    #[test]
+    fn regression_update_rejects_multiple_matches() {
+        let tf = TestFile::new("update-ambiguous.txt");
+        std::fs::write(&tf.path, "foo bar foo baz foo").unwrap();
+        let result = apply_update(&tf.path, "foo", "qux");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("3 locations"), "got: {msg}");
+        // File should be untouched.
+        assert_eq!(
+            std::fs::read_to_string(&tf.path).unwrap(),
+            "foo bar foo baz foo"
+        );
+    }
+
+    // Regression: prior to the fix, multi-op patches were documented as
+    // "atomic" but in fact left earlier successful ops applied when a later op
+    // failed. We now stop on first failure AND the prior ops MUST stay applied
+    // (no rollback). The error report must explicitly call out which op failed
+    // and ops after the failure must NOT execute.
+    #[tokio::test]
+    async fn regression_multi_op_stops_on_failure_prior_ops_remain() {
+        let a = TestFile::new("multi-op-a.txt");
+        let b_existing = TestFile::new("multi-op-b.txt");
+        let c_should_not_exist = TestFile::new("multi-op-c.txt");
+
+        // Pre-create B so the second op (create B) fails.
+        std::fs::write(&b_existing.path, "already here").unwrap();
+
+        let tool = ApplyPatchTool::new(None, None);
+        let result = tool
+            .call(ApplyPatchArgs {
+                operations: vec![
+                    PatchOp::Create {
+                        path: a.path.clone(),
+                        content: "A content".into(),
+                    },
+                    PatchOp::Create {
+                        path: b_existing.path.clone(),
+                        content: "B content".into(),
+                    },
+                    PatchOp::Create {
+                        path: c_should_not_exist.path.clone(),
+                        content: "C content".into(),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        // A was created.
+        assert!(Path::new(&a.path).exists(), "A must remain applied");
+        assert_eq!(std::fs::read_to_string(&a.path).unwrap(), "A content");
+        // B was not overwritten.
+        assert_eq!(
+            std::fs::read_to_string(&b_existing.path).unwrap(),
+            "already here"
+        );
+        // C was never attempted.
+        assert!(
+            !Path::new(&c_should_not_exist.path).exists(),
+            "C must not run after failure"
+        );
+        // Report names both the success and the failure.
+        assert!(result.contains("created"), "got: {result}");
+        assert!(result.contains("FAILED"), "got: {result}");
+    }
+
+    // Regression: create previously had no size cap; the agent could write
+    // multi-GB files by accident. 1MB limit must be enforced before touching
+    // the filesystem, and the operation must not produce a partial write.
+    #[tokio::test]
+    async fn regression_create_rejects_oversized_content() {
+        let tf = TestFile::new("oversize.txt");
+        let too_big = "x".repeat(1_048_577); // 1MB + 1 byte
+
+        let tool = ApplyPatchTool::new(None, None);
+        let result = tool
+            .call(ApplyPatchArgs {
+                operations: vec![PatchOp::Create {
+                    path: tf.path.clone(),
+                    content: too_big,
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert!(result.contains("FAILED"), "got: {result}");
+        assert!(result.contains("exceeds"), "got: {result}");
+        assert!(
+            !Path::new(&tf.path).exists(),
+            "no file should exist after size-limit rejection"
+        );
+    }
+
+    // Right at the limit must succeed; off-by-one boundary check.
+    #[tokio::test]
+    async fn create_accepts_content_at_size_limit() {
+        let tf = TestFile::new("at-limit.txt");
+        let at_limit = "x".repeat(1_048_576); // exactly 1MB
+
+        let tool = ApplyPatchTool::new(None, None);
+        let result = tool
+            .call(ApplyPatchArgs {
+                operations: vec![PatchOp::Create {
+                    path: tf.path.clone(),
+                    content: at_limit,
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert!(!result.contains("FAILED"), "got: {result}");
+        assert!(Path::new(&tf.path).exists());
+        assert_eq!(std::fs::metadata(&tf.path).unwrap().len(), 1_048_576);
+    }
+
+    // create_dir_all is called on the parent — confirms nested-path creates work.
+    #[test]
+    fn create_creates_parent_dirs() {
+        let dir = std::env::temp_dir().join(format!("dirge-test-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("a/b/c/file.txt");
+        let path_str = nested.to_str().unwrap();
+
+        let result = apply_create(path_str, "deep content");
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read_to_string(&nested).unwrap(), "deep content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_missing_file_returns_err() {
+        let path = format!("/tmp/dirge-test-delete-ghost-{}.txt", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let result = apply_delete(&path);
+        assert!(result.is_err());
+    }
+
+    // Multi-op happy path: create + update + rename + delete in sequence,
+    // touching different files. Regression-tests that the loop applies each op
+    // in declaration order and the report lists each.
+    #[tokio::test]
+    async fn multi_op_happy_path_executes_in_order() {
+        let a = TestFile::new("multi-happy-a.txt");
+        let b = TestFile::new("multi-happy-b.txt");
+        let renamed = format!(
+            "/tmp/dirge-test-multi-happy-renamed-{}.txt",
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&renamed);
+
+        let tool = ApplyPatchTool::new(None, None);
+        let result = tool
+            .call(ApplyPatchArgs {
+                operations: vec![
+                    PatchOp::Create {
+                        path: a.path.clone(),
+                        content: "hello".into(),
+                    },
+                    PatchOp::Update {
+                        path: a.path.clone(),
+                        old_text: "hello".into(),
+                        new_text: "HELLO".into(),
+                    },
+                    PatchOp::Create {
+                        path: b.path.clone(),
+                        content: "scratch".into(),
+                    },
+                    PatchOp::Rename {
+                        path: a.path.clone(),
+                        new_path: renamed.clone(),
+                    },
+                    PatchOp::Delete {
+                        path: b.path.clone(),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        assert!(!result.contains("FAILED"), "got: {result}");
+        assert!(!Path::new(&a.path).exists()); // renamed away
+        assert!(!Path::new(&b.path).exists()); // deleted
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "HELLO");
+        let _ = std::fs::remove_file(&renamed);
+
+        // Each successful op contributes a line to the report.
+        assert_eq!(
+            result.lines().filter(|l| !l.is_empty()).count(),
+            5,
+            "report: {result}"
+        );
+    }
+
+    // Regression: PatchOp deserializes via internally-tagged `action` enum.
+    // Schema mismatch (e.g. missing `content` for create) must fail at deserialize.
+    #[test]
+    fn patch_op_deserializes_each_variant() {
+        let json = serde_json::json!([
+            {"action": "create", "path": "/tmp/x", "content": "hi"},
+            {"action": "update", "path": "/tmp/x", "old_text": "a", "new_text": "b"},
+            {"action": "delete", "path": "/tmp/x"},
+            {"action": "rename", "path": "/tmp/x", "new_path": "/tmp/y"},
+        ]);
+        let ops: Vec<PatchOp> = serde_json::from_value(json).unwrap();
+        assert!(matches!(ops[0], PatchOp::Create { .. }));
+        assert!(matches!(ops[1], PatchOp::Update { .. }));
+        assert!(matches!(ops[2], PatchOp::Delete { .. }));
+        assert!(matches!(ops[3], PatchOp::Rename { .. }));
+    }
 }

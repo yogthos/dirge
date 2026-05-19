@@ -199,4 +199,87 @@ mod tests {
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "webfetch");
     }
+
+    // Regression: prior bug passed `html.len()` as the second argument to
+    // html2text — that parameter is the *line-wrap width*, not buffer size.
+    // The result was effectively no wrapping at all. We now pass 100, which
+    // produces wrapped output for paragraphs that exceed that width.
+    #[test]
+    fn regression_html_to_markdown_wraps_at_reasonable_width() {
+        let long_word_count = 200;
+        // Build a paragraph that, without wrapping, would be ~one extremely
+        // long line.
+        let paragraph: String = std::iter::repeat("lorem")
+            .take(long_word_count)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let html = format!("<p>{}</p>", paragraph);
+        let md = html_to_markdown(&html);
+
+        // The output must be split across multiple lines (wrap width=100).
+        let lines: Vec<&str> = md.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            lines.len() > 1,
+            "expected wrapped output, got single line of {} chars",
+            md.len()
+        );
+        // No single line should be wildly wider than the wrap width.
+        for line in &lines {
+            assert!(
+                line.chars().count() < 200,
+                "line too long ({}): {line}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_urls() {
+        let tool = WebFetchTool::new(None, None);
+        let result = tool
+            .call(WebFetchArgs {
+                urls: vec![],
+                max_chars: 3000,
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no URLs"));
+    }
+
+    #[tokio::test]
+    async fn rejects_more_than_ten_urls() {
+        let tool = WebFetchTool::new(None, None);
+        let urls: Vec<String> = (0..11)
+            .map(|i| format!("https://example.com/{i}"))
+            .collect();
+        let result = tool
+            .call(WebFetchArgs {
+                urls,
+                max_chars: 3000,
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("maximum 10"));
+    }
+
+    // Regression: the WebFetchArgs default for max_chars must be 3000 — agents
+    // that omit the field should not get an unbounded fetch.
+    #[test]
+    fn webfetch_args_default_max_chars_is_3000() {
+        let parsed: WebFetchArgs =
+            serde_json::from_value(serde_json::json!({"urls": ["https://example.com"]})).unwrap();
+        assert_eq!(parsed.max_chars, 3000);
+    }
+
+    // html2text drops markup but keeps text content — guards against a
+    // dependency upgrade changing default behavior.
+    #[test]
+    fn html_to_markdown_strips_tags_but_keeps_text() {
+        let html = "<div><strong>bold</strong> and <em>emph</em></div>";
+        let md = html_to_markdown(html);
+        assert!(md.contains("bold"));
+        assert!(md.contains("emph"));
+        assert!(!md.contains("<strong>"));
+        assert!(!md.contains("<em>"));
+    }
 }
