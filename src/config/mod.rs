@@ -25,6 +25,57 @@ pub struct ToolsConfig {
     pub webfetch: Option<bool>,
 }
 
+/// Per-server LSP configuration. All fields optional — unspecified fields
+/// fall back to the built-in defaults for the given `server_id`.
+///
+/// Two forms are accepted:
+/// - `{ "disabled": true }` to turn off a built-in server entirely.
+/// - any subset of `{ command, extensions, env, initialization, disabled }`
+///   to override pieces of the default.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct LspServerConfig {
+    pub command: Option<Vec<String>>,
+    pub extensions: Option<Vec<String>>,
+    pub env: Option<HashMap<String, String>>,
+    pub initialization: Option<serde_json::Value>,
+    pub disabled: Option<bool>,
+}
+
+/// `lsp = true`  → enable built-in servers with default commands.
+/// `lsp = false` → disable LSP entirely.
+/// `lsp = { server-id = { … } }` → enable defaults, overriding the named
+///   servers with the provided config.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum LspConfig {
+    Enabled(bool),
+    Servers(HashMap<String, LspServerConfig>),
+}
+
+impl LspConfig {
+    /// `true` when LSP should be on. Defaults to enabled.
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            LspConfig::Enabled(b) => *b,
+            LspConfig::Servers(_) => true,
+        }
+    }
+
+    /// Per-server overrides keyed by server id. Empty when LSP is a bool.
+    pub fn server_overrides(&self) -> &HashMap<String, LspServerConfig> {
+        match self {
+            LspConfig::Enabled(_) => {
+                // Empty borrow without allocating per-call.
+                static EMPTY: std::sync::OnceLock<HashMap<String, LspServerConfig>> =
+                    std::sync::OnceLock::new();
+                EMPTY.get_or_init(HashMap::new)
+            }
+            LspConfig::Servers(map) => map,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -51,6 +102,7 @@ pub struct Config {
     pub tool_result_max_chars: Option<usize>,
     pub default_prompt: Option<String>,
     pub tools: Option<ToolsConfig>,
+    pub lsp: Option<LspConfig>,
     #[cfg(feature = "mcp")]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
@@ -140,4 +192,70 @@ pub fn load() -> Config {
     }
 
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lsp_config_parses_as_bool() {
+        let cfg: Config = serde_json::from_str(r#"{"lsp": true}"#).unwrap();
+        assert!(cfg.lsp.unwrap().is_enabled());
+
+        let cfg: Config = serde_json::from_str(r#"{"lsp": false}"#).unwrap();
+        assert!(!cfg.lsp.unwrap().is_enabled());
+    }
+
+    #[test]
+    fn lsp_config_parses_as_per_server_map() {
+        let raw = r#"{
+            "lsp": {
+                "rust": { "command": ["my-rust-analyzer", "--my-arg"] },
+                "typescript": { "disabled": true }
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        let overrides = cfg.lsp.as_ref().unwrap().server_overrides();
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(
+            overrides["rust"].command.as_ref().unwrap(),
+            &vec!["my-rust-analyzer".to_string(), "--my-arg".to_string()]
+        );
+        assert_eq!(overrides["typescript"].disabled, Some(true));
+    }
+
+    // Regression: when lsp is omitted entirely, default is "enabled with
+    // built-in commands" — the CLI's resolve_lsp_enabled handles that.
+    // Config-side, an absent value parses to `None`.
+    #[test]
+    fn absent_lsp_config_is_none() {
+        let cfg: Config = serde_json::from_str(r#"{"model": "foo"}"#).unwrap();
+        assert!(cfg.lsp.is_none());
+    }
+
+    // Regression: a config that mixes overrides for valid server ids
+    // (rust) with disabled-only entries (typescript) must parse cleanly.
+    #[test]
+    fn lsp_config_mixes_command_and_disabled_entries() {
+        let raw = r#"{
+            "lsp": {
+                "rust": { "command": ["rust-analyzer"], "env": {"RUST_LOG": "info"} },
+                "typescript": { "disabled": true }
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        let overrides = cfg.lsp.as_ref().unwrap().server_overrides();
+        assert!(overrides["rust"].command.is_some());
+        assert_eq!(
+            overrides["rust"]
+                .env
+                .as_ref()
+                .unwrap()
+                .get("RUST_LOG")
+                .unwrap(),
+            "info"
+        );
+        assert_eq!(overrides["typescript"].disabled, Some(true));
+    }
 }

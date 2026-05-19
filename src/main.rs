@@ -27,6 +27,8 @@ use session::MessageRole;
 use crate::agent::tools::background::{BackgroundStore, LifecycleReceiver};
 use crate::agent::tools::plan::{PlanSwitchReceiver, PlanSwitchSender};
 use crate::agent::tools::question::{QuestionReceiver, QuestionSender};
+use crate::lsp::manager::LspManager;
+use crate::lsp::spawn::{ProcessCommand, ProcessSpawner};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, SecurityMode};
@@ -63,10 +65,11 @@ fn build_channels(
     Option<PlanSwitchReceiver>,
     Option<BackgroundStore>,
     Option<LifecycleReceiver>,
+    Option<std::sync::Arc<LspManager>>,
 ) {
     let no_tools = cli.resolve_no_tools(cfg);
     if no_tools {
-        return (None, None, None, None, None, None, None, None, None);
+        return (None, None, None, None, None, None, None, None, None, None);
     }
 
     let perm_config: PermissionConfig = cfg
@@ -84,6 +87,16 @@ fn build_channels(
     let (plan_tx, plan_rx) = tokio::sync::mpsc::channel(64);
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
     let bg_store = BackgroundStore::with_ui_sink(lifecycle_tx);
+
+    let lsp_manager = if cli.resolve_lsp_enabled(cfg) {
+        let worktree = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let commands = compile_lsp_commands(cfg);
+        let spawner = std::sync::Arc::new(ProcessSpawner::new(commands));
+        Some(std::sync::Arc::new(LspManager::new(spawner, worktree)))
+    } else {
+        None
+    };
+
     (
         Some(perm),
         Some(ask_tx),
@@ -94,7 +107,63 @@ fn build_channels(
         Some(plan_rx),
         Some(bg_store),
         Some(lifecycle_rx),
+        lsp_manager,
     )
+}
+
+/// Compile the spawn commands by starting from `ProcessSpawner::default_commands`
+/// and applying per-server overrides from user config. A `disabled = true`
+/// override removes the entry; any non-empty `command` replaces the default.
+fn compile_lsp_commands(cfg: &config::Config) -> std::collections::HashMap<String, ProcessCommand> {
+    let mut commands = ProcessSpawner::default_commands();
+    let Some(lsp_cfg) = &cfg.lsp else {
+        return commands;
+    };
+    for (id, override_cfg) in lsp_cfg.server_overrides() {
+        if override_cfg.disabled.unwrap_or(false) {
+            commands.remove(id);
+            continue;
+        }
+        let existing = commands.remove(id);
+        let (program, args) = if let Some(cmd) = &override_cfg.command {
+            if cmd.is_empty() {
+                // User passed an empty command — fall back to the default.
+                match &existing {
+                    Some(e) => (e.program.clone(), e.args.clone()),
+                    None => continue,
+                }
+            } else {
+                (
+                    std::path::PathBuf::from(&cmd[0]),
+                    cmd.iter().skip(1).cloned().collect(),
+                )
+            }
+        } else {
+            match &existing {
+                Some(e) => (e.program.clone(), e.args.clone()),
+                None => continue, // unknown server, no default, no command
+            }
+        };
+        let env = override_cfg
+            .env
+            .as_ref()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        let init_options = override_cfg
+            .initialization
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        commands.insert(
+            id.clone(),
+            ProcessCommand {
+                program,
+                args,
+                env,
+                init_options,
+            },
+        );
+    }
+    commands
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -275,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
         plan_rx,
         bg_store,
         lifecycle_rx,
+        lsp_manager,
     ) = build_channels(&cli, &cfg);
 
     if let Some(perm) = &permission {
@@ -301,6 +371,7 @@ async fn main() -> anyhow::Result<()> {
             question_tx.clone(),
             plan_tx.clone(),
             bg_store.clone(),
+            lsp_manager.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
@@ -331,6 +402,7 @@ async fn main() -> anyhow::Result<()> {
                 question_tx.clone(),
                 plan_tx.clone(),
                 bg_store.clone(),
+                lsp_manager.clone(),
                 sandbox.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
@@ -351,6 +423,7 @@ async fn main() -> anyhow::Result<()> {
             question_tx.clone(),
             plan_tx.clone(),
             bg_store.clone(),
+            lsp_manager.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
@@ -409,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
             plan_tx,
             bg_store,
             lifecycle_rx,
+            lsp_manager,
             sandbox,
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),

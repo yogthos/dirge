@@ -4,14 +4,6 @@
 //! tool, one `operation` parameter; the agent picks which LSP capability to
 //! invoke. Mirrors opencode's `tool/lsp.ts` surface so the agent's mental
 //! model carries between the two.
-//!
-//! Phase 5 lands the tool + its tests. The builder.rs wiring that actually
-//! attaches it to a running agent comes in Phase 7 (config + CLI plumbing).
-//! Until then the symbols here are unused outside the test module — the
-//! crate-wide `#[allow(dead_code)]` in `lsp/mod.rs` doesn't extend here, so
-//! the tool's items carry their own `#[allow(dead_code)]` to keep the
-//! warning surface clean.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

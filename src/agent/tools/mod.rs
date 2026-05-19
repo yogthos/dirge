@@ -30,8 +30,6 @@ pub use find_files::FindFilesTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list_dir::ListDirTool;
-// Phase 5 lands the tool; builder.rs wiring is Phase 7.
-#[allow(unused_imports)]
 pub use lsp::LspTool;
 pub use memory::MemoryTool;
 pub use plan::{PlanEnterTool, PlanExitTool};

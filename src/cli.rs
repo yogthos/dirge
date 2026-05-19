@@ -48,6 +48,12 @@ pub struct Cli {
     #[arg(long = "no-tools", help = "Disable all tools")]
     pub no_tools: bool,
 
+    #[arg(
+        long = "no-lsp",
+        help = "Disable LSP integration (no diagnostics on edit/write, no `lsp` agent tool)"
+    )]
+    pub no_lsp: bool,
+
     #[arg(long = "no-color", help = "Disable colored TUI output")]
     pub no_color: bool,
 
@@ -159,6 +165,16 @@ impl Cli {
 
     pub fn resolve_no_tools(&self, cfg: &config::Config) -> bool {
         self.no_tools || cfg.no_tools.unwrap_or(false)
+    }
+
+    pub fn resolve_lsp_enabled(&self, cfg: &config::Config) -> bool {
+        if self.no_lsp || self.no_tools {
+            return false;
+        }
+        match &cfg.lsp {
+            Some(c) => c.is_enabled(),
+            None => true, // default-on
+        }
     }
 
     pub fn resolve_sandbox(&self, cfg: &config::Config) -> bool {

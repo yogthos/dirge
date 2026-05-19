@@ -170,6 +170,7 @@ async fn run_prompt(
         None,
         None,
         None,
+        None,
         sandbox,
         #[cfg(feature = "mcp")]
         None::<&crate::extras::mcp::McpClientManager>,

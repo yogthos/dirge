@@ -62,6 +62,50 @@ impl ProcessSpawner {
     pub fn new(commands: std::collections::HashMap<String, ProcessCommand>) -> Self {
         Self { commands }
     }
+
+    /// Built-in command defaults for the v1 server set. Each entry is the
+    /// program name + argv to launch. The actual `tokio::process::Command`
+    /// resolves `program` via PATH at spawn time.
+    pub fn default_commands() -> std::collections::HashMap<String, ProcessCommand> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "rust".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("rust-analyzer"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
+        m.insert(
+            "typescript".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("typescript-language-server"),
+                args: vec!["--stdio".to_string()],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
+        m.insert(
+            "pyright".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("pyright-langserver"),
+                args: vec!["--stdio".to_string()],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
+        m.insert(
+            "clojure-lsp".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("clojure-lsp"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
+        m
+    }
 }
 
 impl Spawner for ProcessSpawner {

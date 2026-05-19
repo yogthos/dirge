@@ -127,6 +127,7 @@ pub async fn handle_compress(
         None,
         None,
         bg_store.clone(),
+        None,
         sandbox.clone(),
         #[cfg(feature = "mcp")]
         mcp_manager,
@@ -188,6 +189,7 @@ pub async fn handle_slash(
                     None,
                     None,
                     bg_store.clone(),
+                    None,
                     sandbox.clone(),
                     #[cfg(feature = "mcp")]
                     mcp_manager,
@@ -506,6 +508,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -616,6 +619,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -640,6 +644,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -691,6 +696,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -843,6 +849,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
