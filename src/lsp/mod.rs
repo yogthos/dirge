@@ -10,6 +10,7 @@
 // dead-code warnings would clutter every build — silenced module-wide.
 #![allow(dead_code)]
 
+pub mod client;
 pub mod init;
 pub mod jsonrpc;
 pub mod language;
