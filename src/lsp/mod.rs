@@ -14,6 +14,8 @@ pub mod client;
 pub mod init;
 pub mod jsonrpc;
 pub mod language;
+pub mod manager;
 pub mod rpc;
 pub mod server;
+pub mod spawn;
 pub mod uri;
