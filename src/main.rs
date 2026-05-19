@@ -5,6 +5,7 @@ mod context;
 mod event;
 mod extras;
 mod image_util;
+mod lsp;
 mod permission;
 mod plugin;
 mod provider;
