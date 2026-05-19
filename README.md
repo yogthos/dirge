@@ -138,6 +138,7 @@ dirge --provider glm       # defaults to glm-4
 | Shift+Enter / Meta+Enter | Insert newline (multi-line input) |
 | Tab | Insert 2 spaces |
 | `@<query>` | File picker (Tab/Enter select, Esc cancel) |
+| Paste (≥4 lines) | Collapses to `[N lines pasted]`; re-paste same content to expand inline |
 
 **Agent control**
 

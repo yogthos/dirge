@@ -39,4 +39,5 @@ pub enum UserEvent {
         row: u16,
         col: u16,
     },
+    Paste(String),
 }

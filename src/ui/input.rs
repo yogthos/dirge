@@ -139,6 +139,18 @@ fn next_line_start(s: &str, cursor: usize) -> Option<usize> {
     after.find('\n').map(|p| cursor + p + 1)
 }
 
+/// Threshold for collapsing pastes: anything with >= this many newlines becomes a
+/// `[N lines pasted]` placeholder. Single-line and short pastes go in raw so a
+/// quick paste-of-a-command isn't surprising.
+const PASTE_COLLAPSE_LINES: usize = 4;
+
+/// Sentinel character bracketing a paste placeholder in the buffer. The buffer
+/// stores `\x01<index>\x01`, where `<index>` is the decimal index into
+/// `pastes`. Because `\x01` is filtered out of bracketed-paste content (see
+/// `handle_paste`) and ignored as a typeable key, it can't appear in normal
+/// input — so its presence reliably marks a placeholder block.
+const PASTE_MARK: char = '\x01';
+
 pub struct InputEditor {
     pub buffer: CompactString,
     pub cursor: usize,
@@ -149,6 +161,132 @@ pub struct InputEditor {
     kill_ring: Vec<CompactString>,
     last_action_was_kill: bool,
     yank_state: Option<YankState>,
+    /// Pasted text bodies indexed by the digits appearing between `\x01` marks
+    /// in the buffer. `None` entries are tombstones for expanded pastes (so
+    /// existing indices remain valid).
+    pastes: Vec<Option<CompactString>>,
+}
+
+/// Find the marker block `\x01<digits>\x01` containing or starting at
+/// `cursor`. Returns `(start_of_opening_mark, byte_after_closing_mark, index)`.
+fn marker_containing(s: &str, cursor: usize) -> Option<(usize, usize, usize)> {
+    let bytes = s.as_bytes();
+    // Walk back from cursor to find an opening PASTE_MARK.
+    let mut i = cursor.min(bytes.len());
+    while i > 0 && bytes[i - 1] != PASTE_MARK as u8 {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    // i is just after a PASTE_MARK; the opening mark is at i-1.
+    let open = i - 1;
+    let rest = &bytes[i..];
+    let close_rel = rest.iter().position(|&b| b == PASTE_MARK as u8)?;
+    let close = i + close_rel;
+    if cursor > close {
+        return None;
+    }
+    let digits = std::str::from_utf8(&bytes[i..close]).ok()?;
+    let idx = digits.parse::<usize>().ok()?;
+    Some((open, close + 1, idx))
+}
+
+/// If `pos` falls strictly inside a marker block `(start, end)`, return
+/// `start` (so cursor motion moves *before* the block). Otherwise return
+/// `pos` unchanged.
+fn skip_left_over_marker(s: &str, pos: usize) -> usize {
+    for (start, end, _) in marker_blocks(s) {
+        if pos > start && pos < end {
+            return start;
+        }
+    }
+    pos
+}
+
+/// If `pos` falls strictly inside a marker block `(start, end)`, return
+/// `end` (so cursor motion moves *after* the block). Otherwise return
+/// `pos` unchanged.
+fn skip_right_over_marker(s: &str, pos: usize) -> usize {
+    for (start, end, _) in marker_blocks(s) {
+        if pos > start && pos < end {
+            return end;
+        }
+    }
+    pos
+}
+
+/// Move one cursor step left, treating any marker block as a single unit.
+fn prev_pos(s: &str, cursor: usize) -> usize {
+    skip_left_over_marker(s, prev_char_boundary(s, cursor))
+}
+
+/// Move one cursor step right, treating any marker block as a single unit.
+fn next_pos(s: &str, cursor: usize) -> usize {
+    skip_right_over_marker(s, next_char_boundary(s, cursor))
+}
+
+/// What range a backspace at `cursor` should remove. If the character to the
+/// left is the closing mark of a placeholder, return the whole block;
+/// otherwise return a single char.
+fn backspace_range(s: &str, cursor: usize) -> Option<(usize, usize)> {
+    if cursor == 0 {
+        return None;
+    }
+    if let Some((start, end, _)) = marker_containing(s, cursor.saturating_sub(1)) {
+        if cursor == end {
+            return Some((start, end));
+        }
+    }
+    Some((prev_char_boundary(s, cursor), cursor))
+}
+
+/// What range a delete at `cursor` should remove. If the cursor sits at the
+/// opening of a placeholder, return the whole block; otherwise a single char.
+fn delete_range(s: &str, cursor: usize) -> Option<(usize, usize)> {
+    if cursor >= s.len() {
+        return None;
+    }
+    if let Some((start, end, _)) = marker_containing(s, cursor + 1) {
+        if cursor == start {
+            return Some((start, end));
+        }
+    }
+    Some((cursor, next_char_boundary(s, cursor)))
+}
+
+/// Scan `s` and return each marker block as `(start, end, index)` in order.
+fn marker_blocks(s: &str) -> Vec<(usize, usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == PASTE_MARK as u8 {
+            let start = i;
+            let body_start = i + 1;
+            if let Some(rel) = bytes[body_start..]
+                .iter()
+                .position(|&b| b == PASTE_MARK as u8)
+            {
+                let close = body_start + rel;
+                if let Ok(digits) = std::str::from_utf8(&bytes[body_start..close]) {
+                    if let Ok(idx) = digits.parse::<usize>() {
+                        out.push((start, close + 1, idx));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Compute the placeholder display string for a paste body.
+fn placeholder_display(text: &str) -> String {
+    let lines = text.matches('\n').count() + 1;
+    format!("[{} lines pasted]", lines)
 }
 
 impl InputEditor {
@@ -163,7 +301,137 @@ impl InputEditor {
             kill_ring: Vec::new(),
             last_action_was_kill: false,
             yank_state: None,
+            pastes: Vec::new(),
         }
+    }
+
+    /// Insert pasted text. If it spans `PASTE_COLLAPSE_LINES` or more lines,
+    /// store it and insert a `[N lines pasted]` placeholder; otherwise insert
+    /// raw. If the same content was already pasted and is still represented
+    /// by a placeholder, expand that placeholder inline instead (so a second
+    /// paste of the same content reveals the body).
+    pub fn handle_paste(&mut self, text: &str) {
+        // Strip PASTE_MARK so it can never appear in paste content and confuse
+        // the marker parser.
+        let cleaned: String = text.chars().filter(|&c| c != PASTE_MARK).collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        let line_count = cleaned.matches('\n').count() + 1;
+        if line_count < PASTE_COLLAPSE_LINES {
+            self.insert_str(&cleaned);
+            return;
+        }
+        // Auto-expand on repeat: if this body matches an existing placeholder
+        // in the buffer, expand it inline rather than inserting another
+        // placeholder.
+        if let Some((start, end, idx)) =
+            marker_blocks(&self.buffer).into_iter().find(|(_, _, idx)| {
+                self.pastes
+                    .get(*idx)
+                    .and_then(|opt| opt.as_ref())
+                    .map(|s| s.as_str() == cleaned.as_str())
+                    .unwrap_or(false)
+            })
+        {
+            let body = self.pastes[idx].take().unwrap();
+            self.buffer.replace_range(start..end, body.as_str());
+            // Place cursor at end of expanded text.
+            self.cursor = start + body.len();
+            self.history_pos = None;
+            self.reset_kill_accumulation();
+            return;
+        }
+        let idx = self.pastes.len();
+        self.pastes.push(Some(CompactString::from(cleaned)));
+        let marker = format!("{}{}{}", PASTE_MARK, idx, PASTE_MARK);
+        self.insert_str(&marker);
+    }
+
+    fn insert_str(&mut self, s: &str) {
+        self.buffer.insert_str(self.cursor, s);
+        self.cursor += s.len();
+        self.history_pos = None;
+        self.reset_kill_accumulation();
+    }
+
+    /// Remove a byte range from the buffer and place the cursor at `start`.
+    /// If the range fully contains a placeholder marker block, the
+    /// corresponding `pastes` slot is tombstoned so its body can be GC'd
+    /// (idempotent — repeat removes are fine).
+    fn remove_range(&mut self, start: usize, end: usize) {
+        // Detect any marker block fully contained in the removed range and
+        // free its stored body.
+        for (mstart, mend, idx) in marker_blocks(&self.buffer) {
+            if mstart >= start && mend <= end {
+                if let Some(slot) = self.pastes.get_mut(idx) {
+                    *slot = None;
+                }
+            }
+        }
+        self.buffer.replace_range(start..end, "");
+        self.cursor = start;
+    }
+
+    /// Return the buffer with all placeholder markers expanded to their
+    /// original paste bodies. Used at submit time so the agent receives the
+    /// real text.
+    pub fn expanded(&self) -> CompactString {
+        let blocks = marker_blocks(&self.buffer);
+        if blocks.is_empty() {
+            return self.buffer.clone();
+        }
+        let mut out = String::with_capacity(self.buffer.len());
+        let mut cur = 0;
+        for (start, end, idx) in blocks {
+            out.push_str(&self.buffer[cur..start]);
+            if let Some(Some(body)) = self.pastes.get(idx) {
+                out.push_str(body);
+            }
+            cur = end;
+        }
+        out.push_str(&self.buffer[cur..]);
+        out.into()
+    }
+
+    /// Return (display_text, display_cursor_col) for a logical line of the
+    /// buffer with placeholders rendered as `[N lines pasted]`. Used by the
+    /// renderer so the input bar shows a compact representation.
+    pub fn render_line(&self, line: &str, cursor_in_line: usize) -> (String, usize) {
+        let blocks = marker_blocks(line);
+        if blocks.is_empty() {
+            return (line.to_string(), cursor_in_line);
+        }
+        let mut out = String::with_capacity(line.len());
+        let mut display_cursor = cursor_in_line;
+        let mut cur = 0;
+        for (start, end, idx) in blocks {
+            // Carry plain text before the block.
+            if cur < start {
+                out.push_str(&line[cur..start]);
+            }
+            let placeholder = self
+                .pastes
+                .get(idx)
+                .and_then(|o| o.as_ref())
+                .map(|s| placeholder_display(s))
+                .unwrap_or_else(|| "[expanded]".to_string());
+            // Adjust the displayed cursor position if it lies after this block.
+            if cursor_in_line >= end {
+                let block_len = end - start;
+                display_cursor = display_cursor - block_len + placeholder.len();
+            } else if cursor_in_line > start && cursor_in_line < end {
+                // Cursor logically inside a marker — pin it to the placeholder
+                // boundary so it never appears mid-marker.
+                display_cursor = out.len() + placeholder.len();
+            }
+            out.push_str(&placeholder);
+            cur = end;
+        }
+        if cur < line.len() {
+            out.push_str(&line[cur..]);
+        }
+        (out, display_cursor)
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
@@ -330,16 +598,24 @@ impl InputEditor {
                     self.history_pos = None;
                     return None;
                 }
-                // Plain Enter → submit
-                let text = self.buffer.clone();
-                if !text.is_empty() {
-                    self.history.push(text.clone());
+                // Plain Enter → submit. Expand any paste placeholders so the
+                // agent receives the original text. Store the expanded form in
+                // history too — history navigation can't rely on paste-index
+                // continuity across turns.
+                let submitted = self.expanded();
+                if !submitted.is_empty() {
+                    self.history.push(submitted.clone());
                 }
                 self.history_pos = None;
                 self.buffer.clear();
                 self.cursor = 0;
+                self.pastes.clear();
                 self.reset_kill_accumulation();
-                if text.is_empty() { None } else { Some(text) }
+                if submitted.is_empty() {
+                    None
+                } else {
+                    Some(submitted)
+                }
             }
 
             // Ctrl+A → start of line
@@ -359,7 +635,7 @@ impl InputEditor {
             // Ctrl+B → left one char
             KeyCode::Char('b') if ctrl => {
                 if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
+                    self.cursor = prev_pos(&self.buffer, self.cursor);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -368,7 +644,7 @@ impl InputEditor {
             // Ctrl+F → right one char
             KeyCode::Char('f') if ctrl => {
                 if self.cursor < self.buffer.len() {
-                    self.cursor = next_char_boundary(&self.buffer, self.cursor);
+                    self.cursor = next_pos(&self.buffer, self.cursor);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -409,9 +685,8 @@ impl InputEditor {
 
             // Ctrl+H or Backspace (plain)
             KeyCode::Char('h') if ctrl => {
-                if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
-                    self.buffer.remove(self.cursor);
+                if let Some((start, end)) = backspace_range(&self.buffer, self.cursor) {
+                    self.remove_range(start, end);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -548,17 +823,16 @@ impl InputEditor {
             }
 
             KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
-                    self.buffer.remove(self.cursor);
+                if let Some((start, end)) = backspace_range(&self.buffer, self.cursor) {
+                    self.remove_range(start, end);
                 }
                 self.reset_kill_accumulation();
                 None
             }
 
             KeyCode::Delete => {
-                if self.cursor < self.buffer.len() {
-                    self.buffer.remove(self.cursor);
+                if let Some((start, end)) = delete_range(&self.buffer, self.cursor) {
+                    self.remove_range(start, end);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -566,7 +840,7 @@ impl InputEditor {
 
             KeyCode::Left => {
                 if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
+                    self.cursor = prev_pos(&self.buffer, self.cursor);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -574,7 +848,7 @@ impl InputEditor {
 
             KeyCode::Right => {
                 if self.cursor < self.buffer.len() {
-                    self.cursor = next_char_boundary(&self.buffer, self.cursor);
+                    self.cursor = next_pos(&self.buffer, self.cursor);
                 }
                 self.reset_kill_accumulation();
                 None

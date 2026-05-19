@@ -456,13 +456,15 @@ impl Renderer {
 
     pub fn draw_bottom(
         &mut self,
-        full_input: &str,
-        full_cursor: usize,
+        editor: &crate::ui::input::InputEditor,
         status: &str,
         is_running: bool,
     ) -> io::Result<()> {
         let (cols, rows) = crossterm::terminal::size()?;
         let mut stdout = io::stdout();
+
+        let full_input: &str = editor.buffer.as_str();
+        let full_cursor: usize = editor.cursor;
 
         let input_row = rows.saturating_sub(2);
         let status_row = rows.saturating_sub(1);
@@ -473,7 +475,8 @@ impl Renderer {
             "> "
         };
 
-        // Extract the current logical line for display
+        // Extract the current logical line, then render with paste
+        // placeholders substituted so the input bar stays compact.
         let line_start = full_input[..full_cursor]
             .rfind('\n')
             .map(|p| p + 1)
@@ -482,10 +485,12 @@ impl Renderer {
             .find('\n')
             .map(|p| full_cursor + p)
             .unwrap_or(full_input.len());
-        let visible_line = &full_input[line_start..line_end];
-        let col_in_line = full_cursor - line_start;
+        let raw_line = &full_input[line_start..line_end];
+        let raw_col = full_cursor - line_start;
+        let (visible_line_owned, col_in_line) = editor.render_line(raw_line, raw_col);
+        let visible_line: &str = visible_line_owned.as_str();
 
-        // Count lines for status display
+        // Count lines for status display (buffer-logical, not paste-expanded).
         let line_count = if full_input.is_empty() {
             1
         } else {
@@ -516,7 +521,9 @@ impl Renderer {
             .collect();
         write!(stdout, "{}", visible)?;
 
-        let token_est = full_input.len() as u64 / 4;
+        // Token estimate counts the expanded text, since that's what the agent
+        // actually receives.
+        let token_est = editor.expanded().len() as u64 / 4;
         if token_est > 0 {
             write!(
                 stdout,
