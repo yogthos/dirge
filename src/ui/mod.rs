@@ -1619,16 +1619,13 @@ pub async fn run_interactive(
                 )?;
 
                 let accepted = loop {
-                    tokio::select! {
-                        Some(ev) = user_rx.recv() => {
-                            if let UserEvent::Key(key) = ev {
-                                match key.code {
-                                    KeyCode::Char('y') | KeyCode::Enter => break true,
-                                    KeyCode::Char('n') | KeyCode::Esc => break false,
-                                    _ => {}
-                                }
-                            }
-                        }
+                    let Some(UserEvent::Key(key)) = user_rx.recv().await else {
+                        continue;
+                    };
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => break true,
+                        KeyCode::Char('n') | KeyCode::Esc => break false,
+                        _ => {}
                     }
                 };
 
