@@ -5,6 +5,9 @@ use std::path::Path;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
 
+/// Max content size for a single create operation (1MB).
+const MAX_CREATE_SIZE: usize = 1_048_576;
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "action")]
 pub enum PatchOp {
@@ -100,7 +103,7 @@ impl Tool for ApplyPatchTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "apply_patch".to_string(),
-            description: "Apply multiple file operations atomically in a single call. Supports create, update (by exact text match), delete, and rename. Operations execute in order and stop on first failure."
+            description: "Apply multiple file operations in a single call. Supports create, update (by exact text match), delete, and rename. Operations execute in order and stop on first failure — prior operations that succeeded remain applied."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -154,7 +157,7 @@ impl Tool for ApplyPatchTool {
         let mut results = Vec::new();
 
         for op in &args.operations {
-            // Permission check for the path
+            // Permission check for the target path
             match op {
                 PatchOp::Create { path, .. }
                 | PatchOp::Update { path, .. }
@@ -162,6 +165,18 @@ impl Tool for ApplyPatchTool {
                 | PatchOp::Rename { path, .. } => {
                     check_perm_path(&self.permission, &self.ask_tx, "apply_patch", path)
                         .await?;
+                }
+            }
+            // Rename also requires permission on the new path
+            if let PatchOp::Rename { new_path, .. } = op {
+                check_perm_path(&self.permission, &self.ask_tx, "apply_patch", new_path)
+                    .await?;
+            }
+            // Validate create content size
+            if let PatchOp::Create { content, .. } = op {
+                if content.len() > MAX_CREATE_SIZE {
+                    results.push(format!("FAILED: create content exceeds {} bytes ({} bytes provided)", MAX_CREATE_SIZE, content.len()));
+                    break;
                 }
             }
 
