@@ -107,6 +107,29 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str(&format!("\nGit branch: {}", branch));
     }
 
+    // Inject mode-specific reminders
+    if let Some(prompt_name) = &context.current_prompt_name {
+        match prompt_name.as_str() {
+            "plan" => {
+                preamble.push_str("\n\n---\n\nYou are now in PLAN mode. Create a detailed implementation plan. Save it to PLAN.md in the current directory. Analyze the task, break it into concrete steps, consider edge cases and trade-offs. Do NOT write any code or run any commands until the user reviews and approves the plan.");
+            }
+            "review" | "review-security" => {
+                preamble.push_str("\n\n---\n\nYou are now in REVIEW mode. Review the code or plan carefully. Identify bugs, security issues, performance problems, and design flaws. Be thorough and specific. Provide actionable feedback.");
+            }
+            "code" => {
+                let plan_path = std::env::current_dir()
+                    .unwrap_or_else(|_| ".".into())
+                    .join("PLAN.md");
+                if plan_path.exists() {
+                    preamble.push_str(&format!(
+                        "\n\n---\n\nA plan file exists at PLAN.md. Execute the plan step by step. Write and test code following the plan. Report progress after each step. The plan is your guide — follow it closely."
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut builder = AgentBuilder::new(model).preamble(&preamble);
 
     let max_tokens = cli.resolve_max_tokens(cfg);
