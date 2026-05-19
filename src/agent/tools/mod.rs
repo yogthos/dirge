@@ -20,7 +20,7 @@ mod task_status;
 mod todo;
 mod webfetch;
 mod websearch;
-mod write;
+pub(crate) mod write;
 
 pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;

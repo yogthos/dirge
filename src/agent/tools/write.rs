@@ -1,16 +1,29 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path};
+use crate::lsp::diagnostic;
+use crate::lsp::manager::{LspManager, TouchMode};
+
+/// How long to wait for the LSP server to publish fresh diagnostics after
+/// a write. Matches opencode's `DIAGNOSTICS_FULL_WAIT_TIMEOUT_MS`. Bounded
+/// so a stuck server doesn't hold up the agent's turn.
+const DIAGNOSTIC_WAIT: Duration = Duration::from_secs(10);
 
 pub struct WriteTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     plan_file: Option<PathBuf>,
     cache: Option<ToolCache>,
+    /// When set, the tool touches the file on the LSP server after writing
+    /// and appends any resulting diagnostic block to its output. `None`
+    /// reproduces the pre-LSP behaviour exactly.
+    lsp_manager: Option<Arc<LspManager>>,
 }
 
 impl WriteTool {
@@ -25,6 +38,7 @@ impl WriteTool {
             ask_tx,
             plan_file,
             cache: None,
+            lsp_manager: None,
         }
     }
 
@@ -33,12 +47,14 @@ impl WriteTool {
         ask_tx: Option<AskSender>,
         plan_file: Option<PathBuf>,
         cache: ToolCache,
+        lsp_manager: Option<Arc<LspManager>>,
     ) -> Self {
         WriteTool {
             permission,
             ask_tx,
             plan_file,
             cache: Some(cache),
+            lsp_manager,
         }
     }
 }
@@ -90,11 +106,114 @@ impl Tool for WriteTool {
             tokio::fs::create_dir_all(parent).await?;
         }
         let bytes = args.content.len();
+        let write_at = Instant::now();
         tokio::fs::write(path, &args.content).await?;
         // File mutated → invalidate cached reads/greps/listings for this turn.
         if let Some(ref cache) = self.cache {
             cache.clear();
         }
-        Ok(format!("Written {} bytes to {}", bytes, args.path))
+
+        let mut output = format!("Written {} bytes to {}", bytes, args.path);
+        output.push_str(&append_lsp_block(self.lsp_manager.as_ref(), path, write_at).await);
+        Ok(output)
+    }
+}
+
+/// Run `touch_file` + diagnostic-report assembly. Returns the appendable
+/// block (empty string when there's nothing to surface or no manager).
+/// Errors during touch/wait are intentionally swallowed — diagnostic
+/// surfacing is a side-effect; the write tool's primary contract is
+/// "wrote the file".
+pub(crate) async fn append_lsp_block(
+    manager: Option<&Arc<LspManager>>,
+    path: &Path,
+    after: Instant,
+) -> String {
+    let Some(manager) = manager else {
+        return String::new();
+    };
+    manager
+        .touch_file(
+            path,
+            TouchMode::AwaitPush {
+                after,
+                timeout: DIAGNOSTIC_WAIT,
+            },
+        )
+        .await;
+    let diagnostics = manager.all_diagnostics();
+    diagnostic::build_report_block(path, &diagnostics)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::tools::cache::ToolCache;
+    use crate::lsp::manager::LspManager;
+    use crate::lsp::spawn::{Spawned, Spawner};
+    use futures::future::BoxFuture;
+
+    fn tempfile_in(dir: &Path, name: &str) -> PathBuf {
+        dir.join(name)
+    }
+
+    /// Synthetic spawner — never actually invoked because the write paths
+    /// we test don't have an extension the manager would claim.
+    struct NopSpawner;
+    impl Spawner for NopSpawner {
+        fn spawn<'a>(
+            &'a self,
+            _server_id: &'a str,
+            _root: &'a Path,
+        ) -> BoxFuture<'a, std::io::Result<Spawned>> {
+            Box::pin(async { Err(std::io::Error::other("not used")) })
+        }
+    }
+
+    // Regression: when no LSP manager is provided, the tool's output must
+    // be exactly what it was pre-LSP (just "Written N bytes to PATH").
+    // The diagnostic-append code path must not perturb the no-manager case.
+    #[tokio::test]
+    async fn regression_no_manager_preserves_existing_output() {
+        let dir = std::env::temp_dir().join(format!("dirge-write-no-mgr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = tempfile_in(&dir, "no-mgr.txt");
+
+        let tool = WriteTool::with_cache(None, None, None, ToolCache::new(), None);
+        let out = tool
+            .call(WriteArgs {
+                path: path.to_string_lossy().into_owned(),
+                content: "hello".into(),
+            })
+            .await
+            .unwrap();
+        assert!(out.starts_with("Written 5 bytes"), "got: {out}");
+        // No diagnostic block since manager is None.
+        assert!(!out.contains("LSP errors"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // When a manager IS provided but has no diagnostics (mock spawner that
+    // never gets called for the extension), the tool's output still starts
+    // with the write confirmation and contains no diagnostic block.
+    #[tokio::test]
+    async fn manager_with_no_diagnostics_appends_nothing() {
+        let dir = std::env::temp_dir().join(format!("dirge-write-with-mgr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = tempfile_in(&dir, "with-mgr.unknown_ext");
+
+        let manager = Arc::new(LspManager::new(Arc::new(NopSpawner), dir.clone()));
+        let tool = WriteTool::with_cache(None, None, None, ToolCache::new(), Some(manager));
+
+        let out = tool
+            .call(WriteArgs {
+                path: path.to_string_lossy().into_owned(),
+                content: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert!(out.starts_with("Written 2 bytes"));
+        assert!(!out.contains("LSP errors"), "got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

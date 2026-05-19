@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 pub mod client;
+pub mod diagnostic;
 pub mod init;
 pub mod jsonrpc;
 pub mod language;

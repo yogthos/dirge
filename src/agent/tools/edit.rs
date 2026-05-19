@@ -1,16 +1,22 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, check_perm_path};
+use crate::lsp::manager::LspManager;
 
 pub struct EditTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     plan_file: Option<PathBuf>,
     cache: Option<ToolCache>,
+    /// When set, the tool touches the edited file on the LSP server and
+    /// appends any diagnostic block to its output. `None` reproduces the
+    /// pre-LSP behaviour.
+    lsp_manager: Option<Arc<LspManager>>,
 }
 
 impl EditTool {
@@ -25,6 +31,7 @@ impl EditTool {
             ask_tx,
             plan_file,
             cache: None,
+            lsp_manager: None,
         }
     }
 
@@ -33,12 +40,14 @@ impl EditTool {
         ask_tx: Option<AskSender>,
         plan_file: Option<PathBuf>,
         cache: ToolCache,
+        lsp_manager: Option<Arc<LspManager>>,
     ) -> Self {
         EditTool {
             permission,
             ask_tx,
             plan_file,
             cache: Some(cache),
+            lsp_manager,
         }
     }
 
@@ -203,6 +212,7 @@ impl Tool for EditTool {
             new_content
         };
 
+        let write_at = std::time::Instant::now();
         tokio::fs::write(&args.path, &output).await?;
         // File mutated → invalidate cached reads/greps/listings for this turn.
         if let Some(ref cache) = self.cache {
@@ -225,6 +235,16 @@ impl Tool for EditTool {
                 &args.new_text,
             ));
         }
+
+        let path = std::path::Path::new(&args.path);
+        result.push_str(
+            &crate::agent::tools::write::append_lsp_block(
+                self.lsp_manager.as_ref(),
+                path,
+                write_at,
+            )
+            .await,
+        );
         Ok(result)
     }
 }
