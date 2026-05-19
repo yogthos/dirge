@@ -13,12 +13,21 @@ const MAX_TASK_OUTPUT_CHARS: usize = 3000;
 /// reasonable session; agents only see ids they themselves spawned.
 const STORE_CAPACITY: usize = 32;
 
-/// Sender half of the UI lifecycle channel. `notify()` pushes here when set,
-/// letting the UI render a `[task <id> completed/failed]` line in the human's
-/// scrollback as soon as the subagent finishes — independent of the
-/// agent-prompt drain at turn boundaries.
-pub type LifecycleSender = mpsc::UnboundedSender<TaskNotification>;
-pub type LifecycleReceiver = mpsc::UnboundedReceiver<TaskNotification>;
+/// Event surfaced on the UI lifecycle channel.
+///
+/// `Started` fires when the parent spawns a background task; `Finished` fires
+/// when the subagent terminates (with the same TaskNotification later drained
+/// for the LLM-side reminder). The UI renders these as colored lines in the
+/// human's scrollback so the user can follow background work as it happens.
+#[derive(Debug, Clone)]
+pub enum LifecycleEvent {
+    Started { id: String },
+    Finished(TaskNotification),
+}
+
+/// Sender half of the UI lifecycle channel.
+pub type LifecycleSender = mpsc::UnboundedSender<LifecycleEvent>;
+pub type LifecycleReceiver = mpsc::UnboundedReceiver<LifecycleEvent>;
 
 /// Thread-safe store for background subagent tasks.
 ///
@@ -40,9 +49,10 @@ struct Inner {
     /// be evicted when at capacity. Drain does not remove tasks from here;
     /// they remain looked-up-able by `task_status` until LRU eviction.
     tasks: IndexMap<String, BackgroundTask>,
-    /// Ids waiting to be delivered as notifications. FIFO. Drained items
-    /// disappear from the queue but remain in `tasks`.
-    pending: VecDeque<String>,
+    /// Pre-snapshotted notifications ready for delivery. FIFO. We carry the
+    /// full TaskNotification (not just the id) so eviction between notify
+    /// and drain can't lose the payload.
+    pending: VecDeque<TaskNotification>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,43 +127,48 @@ impl BackgroundStore {
             return;
         }
         let truncated = truncate_state(state);
+        let id_owned = id.to_string();
         let mut inner = self.lock();
         let Some(task) = inner.tasks.get_mut(id) else {
             return;
         };
         task.state = truncated.clone();
         // Guard against double-notifies enqueuing the same id twice.
-        if !inner.pending.iter().any(|existing| existing == id) {
-            inner.pending.push_back(id.to_string());
+        if !inner.pending.iter().any(|n| n.id == id_owned) {
+            inner.pending.push_back(TaskNotification {
+                id: id_owned.clone(),
+                state: truncated.clone(),
+            });
         }
         // Drop the lock before signalling the UI to avoid holding it across
         // an await/send and to keep the receiver's wake free of contention.
         drop(inner);
         if let Some(sink) = &self.ui_sink {
             // Best-effort: receiver may already be gone (UI shut down).
-            let _ = sink.send(TaskNotification {
-                id: id.to_string(),
+            let _ = sink.send(LifecycleEvent::Finished(TaskNotification {
+                id: id_owned,
                 state: truncated,
-            });
+            }));
+        }
+    }
+
+    /// Fire a Started lifecycle event for the UI. No effect on the LLM-side
+    /// pending queue — "task started" is conveyed via the tool result already.
+    /// Best-effort if the UI receiver is gone.
+    pub fn notify_started(&self, id: &str) {
+        if let Some(sink) = &self.ui_sink {
+            let _ = sink.send(LifecycleEvent::Started { id: id.to_string() });
         }
     }
 
     /// Take all queued notifications and clear the queue. Each notification is
     /// delivered exactly once; subsequent calls return only notifications
     /// arriving after the previous drain.
+    ///
+    /// The payload is the state captured at notify time, so subsequent task
+    /// eviction does not affect what the agent receives.
     pub fn drain_notifications(&self) -> Vec<TaskNotification> {
-        let mut inner = self.lock();
-        let ids: Vec<String> = inner.pending.drain(..).collect();
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(task) = inner.tasks.get(&id) {
-                out.push(TaskNotification {
-                    id,
-                    state: task.state.clone(),
-                });
-            }
-        }
-        out
+        self.lock().pending.drain(..).collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -178,7 +193,21 @@ impl BackgroundStore {
 /// Drains the queue so each notification is delivered exactly once. The
 /// underlying tasks remain in the store and remain looked-up-able by
 /// `task_status` until LRU eviction.
-pub fn prepend_pending_notifications(prompt: &str, store: Option<&BackgroundStore>) -> String {
+///
+/// # The `<system-reminder>` convention
+///
+/// This is dirge's canonical out-of-band injection format. Anthropic models
+/// and most modern frontier LLMs recognise the wrapping XML-ish tags as
+/// "out of the user's voice — harness instructions or environmental updates."
+/// Any future feature that needs to inject context into a user turn from the
+/// harness side (todo nudges, post-tool hooks, environment changes, etc.)
+/// should use the same `<system-reminder>...</system-reminder>` wrapper.
+/// Inventing variant tags (`<reminder>`, `<system-note>`, `[REMINDER]`, ...)
+/// would dilute the signal.
+pub(crate) fn prepend_pending_notifications(
+    prompt: &str,
+    store: Option<&BackgroundStore>,
+) -> String {
     let Some(store) = store else {
         return prompt.to_string();
     };
@@ -509,6 +538,13 @@ mod tests {
 
     // ---- UI lifecycle sink ----
 
+    fn unwrap_finished(evt: LifecycleEvent) -> TaskNotification {
+        match evt {
+            LifecycleEvent::Finished(n) => n,
+            other => panic!("expected Finished, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn ui_sink_receives_completion_event() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -516,9 +552,9 @@ mod tests {
         store.insert("t1".into());
         store.notify("t1", TaskState::Completed("done".into()));
 
-        let evt = rx.recv().await.expect("event delivered");
-        assert_eq!(evt.id, "t1");
-        assert_eq!(evt.state, TaskState::Completed("done".into()));
+        let notif = unwrap_finished(rx.recv().await.expect("event delivered"));
+        assert_eq!(notif.id, "t1");
+        assert_eq!(notif.state, TaskState::Completed("done".into()));
     }
 
     #[tokio::test]
@@ -528,8 +564,8 @@ mod tests {
         store.insert("t1".into());
         store.notify("t1", TaskState::Failed("boom".into()));
 
-        let evt = rx.recv().await.unwrap();
-        assert_eq!(evt.state, TaskState::Failed("boom".into()));
+        let notif = unwrap_finished(rx.recv().await.unwrap());
+        assert_eq!(notif.state, TaskState::Failed("boom".into()));
     }
 
     // Regression: lifecycle events must carry the truncated payload, not the
@@ -543,8 +579,8 @@ mod tests {
         let huge = "x".repeat(MAX_TASK_OUTPUT_CHARS * 2);
         store.notify("t1", TaskState::Completed(huge));
 
-        let evt = rx.recv().await.unwrap();
-        let TaskState::Completed(text) = evt.state else {
+        let notif = unwrap_finished(rx.recv().await.unwrap());
+        let TaskState::Completed(text) = notif.state else {
             panic!("expected Completed");
         };
         assert_eq!(text.chars().count(), MAX_TASK_OUTPUT_CHARS);
@@ -571,6 +607,57 @@ mod tests {
         let store = BackgroundStore::with_ui_sink(tx);
         store.notify("ghost", TaskState::Completed("late".into()));
         assert!(rx.try_recv().is_err());
+    }
+
+    // Regression M1: notification payload is snapshotted at notify time, so
+    // task eviction between notify and drain does not lose the result.
+    #[test]
+    fn regression_drain_returns_snapshotted_state_after_eviction() {
+        let store = BackgroundStore::new();
+        store.insert("victim".into());
+        store.notify("victim", TaskState::Completed("the result".into()));
+
+        // Push enough new inserts to evict "victim" from the task map.
+        for i in 0..STORE_CAPACITY {
+            store.insert(format!("filler{i}"));
+        }
+        assert!(store.get("victim").is_none(), "victim must be evicted");
+
+        // The pending queue still has the snapshot.
+        let drained = store.drain_notifications();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].id, "victim");
+        assert_eq!(drained[0].state, TaskState::Completed("the result".into()));
+    }
+
+    // Regression M5: notify_started fires a Started event on the UI sink and
+    // does NOT enqueue an LLM-side notification (started is conveyed via the
+    // tool result; only finished tasks get the <system-reminder>).
+    #[tokio::test]
+    async fn notify_started_fires_only_on_ui_sink() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = BackgroundStore::with_ui_sink(tx);
+        store.insert("t1".into());
+        store.notify_started("t1");
+
+        let evt = rx.recv().await.expect("Started event delivered");
+        match evt {
+            LifecycleEvent::Started { id } => assert_eq!(id, "t1"),
+            other => panic!("expected Started, got {other:?}"),
+        }
+        // No LLM-side notification queued.
+        assert!(store.drain_notifications().is_empty());
+    }
+
+    // notify_started before insert is allowed — the id may or may not be
+    // resolvable later. The event still fires (we just told the UI someone
+    // is starting work). This is defensive: in practice TaskTool always
+    // inserts first, then notify_started.
+    #[tokio::test]
+    async fn notify_started_with_no_ui_sink_is_noop() {
+        let store = BackgroundStore::new();
+        store.notify_started("t1");
+        assert_eq!(store.pending_len(), 0);
     }
 
     // Regression: dropping the UI receiver must not break notify() — the

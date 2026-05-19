@@ -67,6 +67,9 @@ janetrs = { version = "0.8", optional = true }
 html2text = "0.17"
 indexmap = "2"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 opt-level = "z"
 lto = true

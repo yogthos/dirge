@@ -78,6 +78,7 @@ impl Tool for TaskTool {
         if background {
             let task_id = Uuid::new_v4().to_string();
             self.bg_store.insert(task_id.clone());
+            self.bg_store.notify_started(&task_id);
 
             let model = self.model.clone();
             let prompt = args.prompt;

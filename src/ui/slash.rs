@@ -65,6 +65,7 @@ pub async fn handle_compress(
     context: &mut ContextFiles,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
+    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
     sandbox: &Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -125,7 +126,7 @@ pub async fn handle_compress(
         ask_tx.clone(),
         None,
         None,
-        None,
+        bg_store.clone(),
         sandbox.clone(),
         #[cfg(feature = "mcp")]
         mcp_manager,
@@ -163,6 +164,7 @@ pub async fn handle_slash(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     todo_tools_enabled: &mut bool,
+    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
     sandbox: &Sandbox,
     #[cfg(feature = "loop")] loop_state: &mut Option<crate::extras::r#loop::LoopState>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
@@ -185,7 +187,7 @@ pub async fn handle_slash(
                     ask_tx.clone(),
                     None,
                     None,
-                    None,
+                    bg_store.clone(),
                     sandbox.clone(),
                     #[cfg(feature = "mcp")]
                     mcp_manager,
@@ -503,7 +505,7 @@ pub async fn handle_slash(
                         ask_tx.clone(),
                         None,
                         None,
-                        None,
+                        bg_store.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -613,7 +615,7 @@ pub async fn handle_slash(
                         ask_tx.clone(),
                         None,
                         None,
-                        None,
+                        bg_store.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -637,7 +639,7 @@ pub async fn handle_slash(
                         ask_tx.clone(),
                         None,
                         None,
-                        None,
+                        bg_store.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -688,7 +690,7 @@ pub async fn handle_slash(
                         ask_tx.clone(),
                         None,
                         None,
-                        None,
+                        bg_store.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -840,7 +842,7 @@ pub async fn handle_slash(
                         ask_tx.clone(),
                         None,
                         None,
-                        None,
+                        bg_store.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,

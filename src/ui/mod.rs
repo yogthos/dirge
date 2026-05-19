@@ -56,6 +56,33 @@ pub(crate) fn resolve_color(color: Color, monochrome: bool) -> Color {
     }
 }
 
+/// Flatten a multi-line / control-char-bearing string into one safe line
+/// suitable for a single `write_line` call. Newlines, tabs, and ANSI escape
+/// sequences would otherwise corrupt the renderer's per-line buffering — the
+/// renderer splits on `\n` and writes raw bytes. Truncates to `max_chars`
+/// characters and appends `…` when truncated.
+fn sanitize_single_line(s: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max_chars));
+    let mut count = 0;
+    for c in s.chars() {
+        if count >= max_chars {
+            out.push('…');
+            return out;
+        }
+        let replacement = match c {
+            '\n' | '\r' | '\t' => ' ',
+            // ASCII control range; strip rather than render literally.
+            c if c.is_control() => continue,
+            // Skip ESC (0x1B) — start of ANSI sequences.
+            '\u{001B}' => continue,
+            c => c,
+        };
+        out.push(replacement);
+        count += 1;
+    }
+    out
+}
+
 /// Formats a tool call showing only the primary file/command parameter.
 /// - read/write/edit → path
 /// - grep → pattern (and path if both present)
@@ -702,7 +729,7 @@ pub async fn run_interactive(
                                     renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
                                 }
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager).await;
+                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -713,7 +740,7 @@ pub async fn run_interactive(
                                         let compress_result = handle_compress(
                                             instructions.as_deref(),
                                             &mut agent, &client, &mut renderer, session, cli, cfg, context,
-                                            &permission, &ask_tx, &sandbox,
+                                            &permission, &ask_tx, &bg_store, &sandbox,
                                             #[cfg(feature = "mcp")] mcp_manager,
                                             #[cfg(feature = "semantic")] semantic_manager,
                                         ).await;
@@ -776,7 +803,7 @@ pub async fn run_interactive(
                                                 ask_tx.clone(),
                                                 None,
                                                 None,
-                                                None,
+                                                bg_store.clone(),
                                                 sandbox.clone(),
                                                 #[cfg(feature = "mcp")] mcp_manager,
                                                 #[cfg(feature = "semantic")] semantic_manager,
@@ -1147,7 +1174,7 @@ pub async fn run_interactive(
                             let compress_result = handle_compress(
                                 None,
                                 &mut agent, &client, &mut renderer, session, cli, cfg, context,
-                                &permission, &ask_tx, &sandbox,
+                                &permission, &ask_tx, &bg_store, &sandbox,
                                 #[cfg(feature = "mcp")] mcp_manager,
                                 #[cfg(feature = "semantic")] semantic_manager,
                             ).await;
@@ -1252,7 +1279,7 @@ pub async fn run_interactive(
                                         ask_tx.clone(),
                                         None,
                                         None,
-                                        None,
+                                        bg_store.clone(),
                                         sandbox.clone(),
                                         #[cfg(feature = "mcp")] mcp_manager,
                                         #[cfg(feature = "semantic")] semantic_manager,
@@ -1398,18 +1425,32 @@ pub async fn run_interactive(
                     std::future::pending().await
                 }
             } => {
-                // Human-visible lifecycle line for a finished background task.
-                // The LLM-side notification is still queued separately and
-                // drained at the next turn boundary.
-                use crate::agent::tools::background::TaskState as TS;
-                let short_id: String = lifecycle_evt.id.chars().take(8).collect();
-                let (label, color) = match &lifecycle_evt.state {
-                    TS::Completed(_) => (format!("[task {} completed]", short_id), Color::Green),
-                    TS::Failed(err) => {
-                        let head: String = err.chars().take(80).collect();
-                        (format!("[task {} failed: {}]", short_id, head), C_ERROR)
+                // Human-visible lifecycle line for a background task. The
+                // LLM-side notification (Finished only) is still queued
+                // separately for prepend_pending_notifications at the next
+                // turn boundary.
+                use crate::agent::tools::background::{
+                    LifecycleEvent, TaskState as TS,
+                };
+                let (label, color) = match &lifecycle_evt {
+                    LifecycleEvent::Started { id } => {
+                        let short: String = id.chars().take(8).collect();
+                        (format!("[task {} started]", short), C_TOOL)
                     }
-                    TS::Running => continue, // shouldn't happen — notify rejects Running
+                    LifecycleEvent::Finished(notif) => {
+                        let short: String = notif.id.chars().take(8).collect();
+                        match &notif.state {
+                            TS::Completed(_) => {
+                                (format!("[task {} completed]", short), Color::Green)
+                            }
+                            TS::Failed(err) => {
+                                let head = sanitize_single_line(err, 80);
+                                (format!("[task {} failed: {}]", short, head), C_ERROR)
+                            }
+                            // Running is never queued for notification.
+                            TS::Running => continue,
+                        }
+                    }
                 };
                 // Make sure we land on a fresh line if a streamed response was in progress.
                 if agent_line_started {
@@ -1904,4 +1945,77 @@ async fn run_shell_command(cmd: &str, sandbox: &Sandbox) -> anyhow::Result<Strin
         result.push_str(&format!("\nExit code: {}", exit_code));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression H1: lifecycle line for a failed task previously embedded the
+    // raw error string. Renderer.write_line splits on '\n', so a multi-line
+    // error broke the line layout (color reset, closing ']' on its own row).
+    // sanitize_single_line must collapse newlines into spaces.
+    #[test]
+    fn sanitize_replaces_newlines_with_space() {
+        let s = sanitize_single_line("line one\nline two\nline three", 100);
+        assert_eq!(s, "line one line two line three");
+        assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn sanitize_replaces_carriage_return_and_tab() {
+        let s = sanitize_single_line("a\rb\tc", 100);
+        assert_eq!(s, "a b c");
+    }
+
+    // Regression: ANSI escape sequences (ESC = 0x1B) would otherwise be
+    // emitted verbatim and corrupt terminal state.
+    #[test]
+    fn sanitize_strips_ansi_escape() {
+        let s = sanitize_single_line("hello \x1b[31mred\x1b[0m world", 100);
+        assert!(!s.contains('\x1b'));
+        assert!(s.contains("hello"));
+        assert!(s.contains("world"));
+    }
+
+    // Other ASCII control chars (bell, backspace, etc.) are also stripped.
+    #[test]
+    fn sanitize_strips_other_controls() {
+        let s = sanitize_single_line("a\x07b\x08c\x00d", 100);
+        // Each control disappears; visible chars remain in order.
+        assert_eq!(s, "abcd");
+    }
+
+    #[test]
+    fn sanitize_truncates_at_char_limit() {
+        let s = sanitize_single_line(&"x".repeat(200), 50);
+        // 50 x's + ellipsis.
+        assert_eq!(s.chars().count(), 51);
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn sanitize_does_not_truncate_when_within_limit() {
+        let s = sanitize_single_line("hello", 100);
+        assert_eq!(s, "hello");
+        assert!(!s.ends_with('…'));
+    }
+
+    // Multibyte content counts by chars, not bytes, and remains intact.
+    #[test]
+    fn sanitize_handles_utf8_correctly() {
+        let s = sanitize_single_line("🦀🦀🦀\n🦀🦀", 100);
+        assert_eq!(s, "🦀🦀🦀 🦀🦀");
+    }
+
+    // Truncation at a multibyte boundary must produce valid UTF-8.
+    #[test]
+    fn sanitize_truncation_does_not_split_multibyte() {
+        let s = sanitize_single_line("🦀🦀🦀🦀🦀", 3);
+        // 3 emojis + ellipsis. No broken bytes.
+        assert_eq!(s.chars().count(), 4);
+        assert!(s.ends_with('…'));
+        // Round-trip as &str succeeds.
+        let _ = s.as_str();
+    }
 }

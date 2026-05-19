@@ -55,11 +55,26 @@ impl Tool for TaskStatusTool {
         let wait = args.wait.unwrap_or(false);
 
         if wait {
+            // Hard cap so a stuck subagent (e.g. LLM hang) can't hold the
+            // parent turn open forever. The agent should rely on the
+            // automatic <system-reminder> on the next turn instead of
+            // long waits.
+            const MAX_WAIT: Duration = Duration::from_secs(600);
+            // tokio::time::Instant respects paused timers in tests; using
+            // std::time::Instant here would hang under tokio::time::pause().
+            let started = tokio::time::Instant::now();
             loop {
                 let state = self.bg_store.get(&args.task_id);
                 match state {
                     Some(task) => match &task.state {
                         TaskState::Running => {
+                            if started.elapsed() >= MAX_WAIT {
+                                return Ok(format!(
+                                    "task_id: {}\nstate: running\n\nwait timeout reached ({}s) — the task is still running. The notification will arrive automatically when it finishes.",
+                                    args.task_id,
+                                    MAX_WAIT.as_secs()
+                                ));
+                            }
                             tokio::time::sleep(Duration::from_millis(300)).await;
                             continue;
                         }
@@ -290,5 +305,40 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    // Regression M6: wait=true used to loop forever on a never-completing
+    // task. The hard cap (MAX_WAIT, 600s) now bails with a "still running"
+    // message after the timeout elapses. We verify the behavior by running
+    // a contrived in-process test with tokio::time::pause + advance to fast-
+    // forward through the 600 seconds without actually waiting.
+    #[tokio::test(start_paused = true)]
+    async fn wait_returns_timeout_message_when_task_stays_running() {
+        let store = BackgroundStore::new();
+        store.insert("forever".into());
+        let tool = TaskStatusTool::new(store);
+
+        // Drive the future with a parallel timer that advances past the cap.
+        let task_call = tokio::spawn(async move {
+            tool.call(TaskStatusArgs {
+                task_id: "forever".into(),
+                wait: Some(true),
+            })
+            .await
+        });
+
+        // Advance virtual time past MAX_WAIT (600s). tokio's paused timer
+        // requires us to yield between sleeps for the loop to make progress.
+        for _ in 0..2100 {
+            tokio::time::advance(Duration::from_millis(300)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let result = task_call.await.unwrap().unwrap();
+        assert!(result.contains("state: running"), "got: {result}");
+        assert!(
+            result.contains("timeout") || result.contains("running"),
+            "got: {result}"
+        );
     }
 }
