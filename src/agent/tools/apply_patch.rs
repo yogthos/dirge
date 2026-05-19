@@ -32,10 +32,7 @@ pub struct ApplyPatchTool {
 
 impl ApplyPatchTool {
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self {
-            permission,
-            ask_tx,
-        }
+        Self { permission, ask_tx }
     }
 }
 
@@ -58,14 +55,10 @@ fn apply_create(path: &str, content: &str) -> Result<String, String> {
 }
 
 fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, String> {
-    let original = std::fs::read_to_string(path)
-        .map_err(|e| format!("read failed: {}", e))?;
+    let original = std::fs::read_to_string(path).map_err(|e| format!("read failed: {}", e))?;
 
     if !original.contains(old_text) {
-        return Err(format!(
-            "text not found in {}",
-            path
-        ));
+        return Err(format!("text not found in {}", path));
     }
 
     let matches: Vec<_> = original.match_indices(old_text).collect();
@@ -88,8 +81,7 @@ fn apply_delete(path: &str) -> Result<String, String> {
 }
 
 fn apply_rename(path: &str, new_path: &str) -> Result<String, String> {
-    std::fs::rename(path, new_path)
-        .map_err(|e| format!("rename failed: {}", e))?;
+    std::fs::rename(path, new_path).map_err(|e| format!("rename failed: {}", e))?;
     Ok(format!("renamed {} -> {}", path, new_path))
 }
 
@@ -163,19 +155,21 @@ impl Tool for ApplyPatchTool {
                 | PatchOp::Update { path, .. }
                 | PatchOp::Delete { path }
                 | PatchOp::Rename { path, .. } => {
-                    check_perm_path(&self.permission, &self.ask_tx, "apply_patch", path)
-                        .await?;
+                    check_perm_path(&self.permission, &self.ask_tx, "apply_patch", path).await?;
                 }
             }
             // Rename also requires permission on the new path
             if let PatchOp::Rename { new_path, .. } = op {
-                check_perm_path(&self.permission, &self.ask_tx, "apply_patch", new_path)
-                    .await?;
+                check_perm_path(&self.permission, &self.ask_tx, "apply_patch", new_path).await?;
             }
             // Validate create content size
             if let PatchOp::Create { content, .. } = op {
                 if content.len() > MAX_CREATE_SIZE {
-                    results.push(format!("FAILED: create content exceeds {} bytes ({} bytes provided)", MAX_CREATE_SIZE, content.len()));
+                    results.push(format!(
+                        "FAILED: create content exceeds {} bytes ({} bytes provided)",
+                        MAX_CREATE_SIZE,
+                        content.len()
+                    ));
                     break;
                 }
             }
@@ -289,11 +283,7 @@ mod tests {
     #[tokio::test]
     async fn test_rejects_empty_operations() {
         let tool = ApplyPatchTool::new(None, None);
-        let result = tool
-            .call(ApplyPatchArgs {
-                operations: vec![],
-            })
-            .await;
+        let result = tool.call(ApplyPatchArgs { operations: vec![] }).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no operations"));
     }
