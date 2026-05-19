@@ -176,11 +176,41 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let question_tool = question_tx
             .map(|tx| Box::new(tools::QuestionTool::new(tx)) as Box<dyn rig::tool::ToolDyn>);
 
+        // Web tools: gated on config + env var
+        let websearch_enabled = cfg
+            .tools
+            .as_ref()
+            .and_then(|t| t.websearch)
+            .unwrap_or(false)
+            || std::env::var("WEBSEARCH_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+        let webfetch_enabled = cfg
+            .tools
+            .as_ref()
+            .and_then(|t| t.webfetch)
+            .unwrap_or(false);
+
+        let websearch_tool = websearch_enabled
+            .then(|| std::env::var("EXA_API_KEY").ok())
+            .flatten()
+            .map(|key| Box::new(tools::WebSearchTool::new(key)) as Box<dyn rig::tool::ToolDyn>);
+        let webfetch_tool = webfetch_enabled
+            .then(|| Box::new(tools::WebFetchTool::new()) as Box<dyn rig::tool::ToolDyn>);
+
         #[allow(unused_mut)]
         let mut builder = builder.tools(base_tools);
 
         if let Some(qt) = question_tool {
             builder = builder.tools(vec![qt]);
+        }
+
+        if let Some(ws) = websearch_tool {
+            builder = builder.tools(vec![ws]);
+        }
+
+        if let Some(wf) = webfetch_tool {
+            builder = builder.tools(vec![wf]);
         }
 
         if let Some(pm) = parent_model {

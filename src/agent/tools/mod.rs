@@ -12,6 +12,8 @@ pub mod semantic;
 mod skill;
 mod task;
 mod todo;
+mod webfetch;
+mod websearch;
 mod write;
 
 pub use bash::BashTool;
@@ -26,6 +28,8 @@ pub use read::ReadTool;
 pub use skill::SkillTool;
 pub use task::TaskTool;
 pub use todo::WriteTodoList;
+pub use webfetch::WebFetchTool;
+pub use websearch::WebSearchTool;
 pub use write::WriteTool;
 
 use std::io;

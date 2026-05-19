@@ -18,6 +18,13 @@ pub struct CustomProviderConfig {
     pub api_key_env: Option<String>,
 }
 
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub websearch: Option<bool>,
+    pub webfetch: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -43,6 +50,7 @@ pub struct Config {
     pub show_edit_diff: Option<bool>,
     pub tool_result_max_chars: Option<usize>,
     pub default_prompt: Option<String>,
+    pub tools: Option<ToolsConfig>,
     #[cfg(feature = "mcp")]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
