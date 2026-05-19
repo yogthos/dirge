@@ -23,6 +23,7 @@ use clap::Parser;
 use compact_str::CompactString;
 use session::MessageRole;
 
+use crate::agent::tools::question::{QuestionReceiver, QuestionSender};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, SecurityMode};
@@ -46,17 +47,19 @@ fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
     }
 }
 
-fn build_permission_checker(
+fn build_channels(
     cli: &cli::Cli,
     cfg: &config::Config,
 ) -> (
     Option<PermCheck>,
     Option<AskSender>,
     Option<tokio::sync::mpsc::Receiver<crate::permission::ask::AskRequest>>,
+    Option<QuestionSender>,
+    Option<QuestionReceiver>,
 ) {
     let no_tools = cli.resolve_no_tools(cfg);
     if no_tools {
-        return (None, None, None);
+        return (None, None, None, None, None);
     }
 
     let perm_config: PermissionConfig = cfg
@@ -70,7 +73,8 @@ fn build_permission_checker(
     let perm: PermCheck = std::sync::Arc::new(std::sync::Mutex::new(checker));
 
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
-    (Some(perm), Some(ask_tx), Some(ask_rx))
+    let (question_tx, question_rx) = tokio::sync::mpsc::channel(64);
+    (Some(perm), Some(ask_tx), Some(ask_rx), Some(question_tx), Some(question_rx))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -241,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
-    let (permission, ask_tx, ask_rx) = build_permission_checker(&cli, &cfg);
+    let (permission, ask_tx, ask_rx, question_tx, question_rx) = build_channels(&cli, &cfg);
 
     if let Some(perm) = &permission {
         let allowlist: Vec<(String, String)> = session
@@ -264,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
             &context,
             permission,
             ask_tx,
+            question_tx.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
@@ -291,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
                 &context,
                 permission,
                 ask_tx,
+                question_tx.clone(),
                 sandbox.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
@@ -308,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
             &context,
             permission.clone(),
             ask_tx.clone(),
+            question_tx.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
@@ -360,6 +367,7 @@ async fn main() -> anyhow::Result<()> {
             permission,
             ask_tx,
             ask_rx,
+            question_rx,
             sandbox,
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),

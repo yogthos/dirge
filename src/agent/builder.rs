@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::agent::prompt::{SYSTEM_PROMPT, TODO_TOOLS_PROMPT};
 use crate::agent::tools;
+use crate::agent::tools::question::QuestionSender;
 use crate::agent::tools::ToolCache;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -31,6 +32,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     context: &ContextFiles,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    question_tx: Option<QuestionSender>,
     sandbox: Sandbox,
     parent_model: Option<AnyModel>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
@@ -171,8 +173,16 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::MemoryTool::new(permission.clone(), ask_tx.clone())),
         ];
 
+        let question_tool = question_tx.map(|tx| {
+            Box::new(tools::QuestionTool::new(tx)) as Box<dyn rig::tool::ToolDyn>
+        });
+
         #[allow(unused_mut)]
         let mut builder = builder.tools(base_tools);
+
+        if let Some(qt) = question_tool {
+            builder = builder.tools(vec![qt]);
+        }
 
         if let Some(pm) = parent_model {
             let task_tool = Box::new(tools::TaskTool::new(permission.clone(), ask_tx.clone(), pm));

@@ -13,6 +13,7 @@ use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
+use crate::agent::tools::question::{QuestionReceiver, QuestionResponse};
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::context::ContextFiles;
@@ -71,6 +72,7 @@ fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         "grep" => &["pattern", "path"],
         "find_files" => &["pattern"],
         "bash" => &["command"],
+        "question" => &["questions"],
         _ => &[],
     };
 
@@ -113,6 +115,7 @@ pub async fn run_interactive(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     mut ask_rx: Option<AskReceiver>,
+    mut question_rx: Option<QuestionReceiver>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -755,6 +758,7 @@ pub async fn run_interactive(
                                                 context,
                                                 permission.clone(),
                                                 ask_tx.clone(),
+                                                None,
                                                 sandbox.clone(),
                                                 #[cfg(feature = "mcp")] mcp_manager,
                                                 #[cfg(feature = "semantic")] semantic_manager,
@@ -1219,6 +1223,7 @@ pub async fn run_interactive(
                                         context,
                                         permission.clone(),
                                         ask_tx.clone(),
+                                        None,
                                         sandbox.clone(),
                                         #[cfg(feature = "mcp")] mcp_manager,
                                         #[cfg(feature = "semantic")] semantic_manager,
@@ -1347,6 +1352,212 @@ pub async fn run_interactive(
                     )?;
                 }
 
+                renderer.render_viewport()?;
+                renderer.draw_bottom(
+                    &input,
+                    &StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()),
+                    is_running,
+                )?;
+                if let Some(ref picker) = input.picker {
+                    picker.draw(renderer.input_top_row())?;
+                }
+            }
+            Some(question_req) = async {
+                if let Some(rx) = &mut question_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                was_reasoning = false;
+                if agent_line_started {
+                    renderer.write_line("", Color::White)?;
+                    agent_line_started = false;
+                }
+
+                let mut answers: Vec<Vec<String>> = Vec::new();
+                let mut rejected = false;
+
+                for (qi, question) in question_req.questions.iter().enumerate() {
+                    if let Some(header) = &question.header {
+                        renderer.write_line(
+                            &format!("\n--- {} ---", header),
+                            C_PERM,
+                        )?;
+                    }
+                    renderer.write_line(
+                        &format!("\n[question {}] {}", qi + 1, question.question),
+                        C_PERM,
+                    )?;
+
+                    let multi = question.multi_select.unwrap_or(false);
+                    let custom = question.custom;
+                    let num_options = question.options.len();
+                    let mut cursor: usize = 0;
+                    let mut selected: Vec<bool> = vec![false; num_options];
+                    let mut custom_text: Option<String> = None;
+
+                    // First question gets an initial render of options
+                    loop {
+                        // Render options
+                        for (i, opt) in question.options.iter().enumerate() {
+                            let marker = if i == cursor {
+                                if multi {
+                                    if selected[i] { "▶ [x]" } else { "▶ [ ]" }
+                                } else {
+                                    "▶"
+                                }
+                            } else {
+                                if multi {
+                                    if selected[i] { "  [x]" } else { "  [ ]" }
+                                } else {
+                                    "  "
+                                }
+                            };
+                            renderer.write_line(
+                                &format!("  {} {} — {}", marker, opt.label, opt.description),
+                                C_PERM,
+                            )?;
+                        }
+                        if custom {
+                            let custom_marker = if cursor == num_options { "▶" } else { "  " };
+                            let custom_label = if let Some(ref t) = custom_text {
+                                format!("{} (custom) \"{}\"", custom_marker, t)
+                            } else {
+                                format!("{} (custom) type your own answer...", custom_marker)
+                            };
+                            renderer.write_line(&custom_label, C_PERM)?;
+                        }
+                        renderer.write_line(
+                            if multi {
+                                "  ↑↓ navigate  Space toggle  Enter confirm  Esc reject all"
+                            } else {
+                                "  ↑↓ navigate  Enter select  Esc reject all"
+                            },
+                            C_PERM,
+                        )?;
+
+                        renderer.render_viewport()?;
+                        renderer.draw_bottom(
+                            &input,
+                            &StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()),
+                            is_running,
+                        )?;
+
+                        // Wait for user input
+                        let user_ev = user_rx.recv().await;
+                        let Some(UserEvent::Key(key)) = user_ev else {
+                            continue;
+                        };
+
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if cursor > 0 { cursor -= 1; }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let max = if custom { num_options } else { num_options.saturating_sub(1) };
+                                if cursor < max { cursor += 1; }
+                            }
+                            KeyCode::Enter => {
+                                if custom && cursor == num_options {
+                                    // Custom text input (works for both single and multi)
+                                    let mut buf = String::new();
+                                    renderer.write_line("  enter your answer:", C_PERM)?;
+                                    loop {
+                                        renderer.write_line(
+                                            &format!("  > {}", buf),
+                                            C_PERM,
+                                        )?;
+                                        renderer.render_viewport()?;
+                                        renderer.draw_bottom(
+                                            &input,
+                                            &StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()),
+                                            is_running,
+                                        )?;
+                                        let ev = user_rx.recv().await;
+                                        if let Some(UserEvent::Key(k)) = ev {
+                                            match k.code {
+                                                KeyCode::Enter => break,
+                                                KeyCode::Esc => {
+                                                    buf = String::new();
+                                                    break;
+                                                }
+                                                KeyCode::Backspace => { buf.pop(); }
+                                                KeyCode::Char(c) => { buf.push(c); }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    if buf.is_empty() {
+                                        custom_text = None;
+                                    } else {
+                                        custom_text = Some(buf);
+                                    }
+                                    if !multi {
+                                        // Single select: confirm immediately
+                                        if let Some(ct) = custom_text.take() {
+                                            answers.push(vec![ct]);
+                                        }
+                                        break;
+                                    }
+                                    // Multi select: continue, user presses Enter again to confirm
+                                } else if multi {
+                                    // Confirm multi-select
+                                    let mut picked: Vec<String> = question
+                                        .options
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(i, _)| selected[*i])
+                                        .map(|(_, o)| o.label.clone())
+                                        .collect();
+                                    if let Some(ct) = custom_text.take() {
+                                        picked.push(ct);
+                                    }
+                                    if picked.is_empty() {
+                                        renderer.write_line(
+                                            "  select at least one option",
+                                            C_PERM,
+                                        )?;
+                                    } else {
+                                        answers.push(picked);
+                                        break;
+                                    }
+                                } else {
+                                    // Single select
+                                    let opt = &question.options[cursor];
+                                    answers.push(vec![opt.label.clone()]);
+                                    break;
+                                }
+                            }
+                            KeyCode::Char(' ') => {
+                                if multi && cursor < num_options {
+                                    selected[cursor] = !selected[cursor];
+                                } else if !multi && cursor < num_options {
+                                    // Space acts like Enter for single-select
+                                    let opt = &question.options[cursor];
+                                    answers.push(vec![opt.label.clone()]);
+                                    break;
+                                }
+                            }
+                            KeyCode::Esc => {
+                                rejected = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    };
+                    if rejected {
+                        break;
+                    }
+                }
+
+                if rejected {
+                    let _ = question_req.reply.send(QuestionResponse::Rejected);
+                } else {
+                    let _ = question_req.reply.send(QuestionResponse::Answered(answers));
+                }
+
+                renderer.write_line("", Color::White)?;
                 renderer.render_viewport()?;
                 renderer.draw_bottom(
                     &input,

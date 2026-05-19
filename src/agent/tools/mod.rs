@@ -5,6 +5,7 @@ mod find_files;
 mod grep;
 mod list_dir;
 mod memory;
+pub(crate) mod question;
 mod read;
 #[cfg(feature = "semantic")]
 pub mod semantic;
@@ -20,6 +21,7 @@ pub use find_files::FindFilesTool;
 pub use grep::GrepTool;
 pub use list_dir::ListDirTool;
 pub use memory::MemoryTool;
+pub use question::QuestionTool;
 pub use read::ReadTool;
 pub use skill::SkillTool;
 pub use task::TaskTool;

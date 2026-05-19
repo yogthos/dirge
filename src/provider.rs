@@ -9,6 +9,7 @@ use rig::streaming::StreamingChat;
 use crate::agent::builder;
 use crate::agent::prompt;
 use crate::agent::runner::{self, AgentRunner};
+use crate::agent::tools::question::QuestionSender;
 use crate::agent::tools::ToolCache;
 use crate::cli::Cli;
 use crate::config::{Config, CustomProviderConfig};
@@ -434,6 +435,7 @@ pub async fn build_agent(
     context: &ContextFiles,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    question_tx: Option<QuestionSender>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -449,6 +451,7 @@ pub async fn build_agent(
                 context,
                 permission,
                 ask_tx,
+                question_tx.clone(),
                 sandbox.clone(),
                 Some(parent_model.clone()),
                 #[cfg(feature = "mcp")]
