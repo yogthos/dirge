@@ -120,17 +120,6 @@ impl Tool for PlanExitTool {
     }
 
     async fn call(&self, _args: PlanExitArgs) -> Result<String, ToolError> {
-        // Write PLAN.md with current plan if it doesn't exist
-        if let Ok(cwd) = std::env::current_dir() {
-            let plan_path = cwd.join("PLAN.md");
-            if !plan_path.exists() {
-                let _ = std::fs::write(
-                    &plan_path,
-                    "# Implementation Plan\n\n*(plan contents will appear here)*\n",
-                );
-            }
-        }
-
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.plan_tx
