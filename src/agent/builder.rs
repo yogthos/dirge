@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::agent::prompt::{SYSTEM_PROMPT, TODO_TOOLS_PROMPT};
 use crate::agent::tools;
 use crate::agent::tools::ToolCache;
+use crate::agent::tools::background::BackgroundStore;
 use crate::agent::tools::question::QuestionSender;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -218,8 +219,17 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         }
 
         if let Some(pm) = parent_model {
-            let task_tool = Box::new(tools::TaskTool::new(permission.clone(), ask_tx.clone(), pm));
-            builder = builder.tools(vec![task_tool]);
+            let bg_store = BackgroundStore::new();
+            let task_tool = Box::new(tools::TaskTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                pm,
+                Some(bg_store.clone()),
+            ));
+            let status_tool =
+                Box::new(tools::TaskStatusTool::new(bg_store))
+                    as Box<dyn rig::tool::ToolDyn>;
+            builder = builder.tools(vec![task_tool, status_tool]);
         }
 
         #[cfg(feature = "mcp")]

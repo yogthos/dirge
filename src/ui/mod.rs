@@ -73,6 +73,7 @@ fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         "find_files" => &["pattern"],
         "bash" => &["command"],
         "question" => &["questions"],
+        "task" | "task_status" => &["prompt", "task_id"],
         _ => &[],
     };
 

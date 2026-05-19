@@ -1,7 +1,9 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
+use uuid::Uuid;
 
+use crate::agent::tools::background::{BackgroundStore, TaskState};
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 use crate::provider::AnyModel;
 
@@ -9,21 +11,30 @@ pub struct TaskTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     model: AnyModel,
+    bg_store: Option<BackgroundStore>,
 }
 
 impl TaskTool {
-    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>, model: AnyModel) -> Self {
+    pub fn new(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        model: AnyModel,
+        bg_store: Option<BackgroundStore>,
+    ) -> Self {
         Self {
             permission,
             ask_tx,
             model,
+            bg_store,
         }
     }
 }
 
 #[derive(Deserialize)]
 pub struct Args {
-    prompt: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub background: Option<bool>,
 }
 
 impl Tool for TaskTool {
@@ -34,34 +45,93 @@ impl Tool for TaskTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        let mut description = "Spawn a subagent to handle a specific subtask. The subagent runs as a one-shot query (no tools) and returns its result inline. Use for research, analysis, or planning subtasks that don't require file access."
+            .to_string();
+
+        if self.bg_store.is_some() {
+            description.push_str(
+                " Set background=true to run asynchronously — use task_status to poll for the result.",
+            );
+        }
+
+        let mut properties = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Task description for the subagent"
+                }
+            },
+            "required": ["prompt"]
+        });
+
+        if self.bg_store.is_some() {
+            if let serde_json::Value::Object(ref mut props) = properties {
+                props.insert(
+                    "background".to_string(),
+                    serde_json::json!({
+                        "type": "boolean",
+                        "description": "Run asynchronously (default: false). When true, returns a task_id immediately for use with task_status."
+                    }),
+                );
+            }
+        }
+
         ToolDefinition {
             name: "task".to_string(),
-            description: "Spawn a subagent to handle a specific subtask. The subagent runs as a one-shot query (no tools) and returns its result inline. Use for research, analysis, or planning subtasks that don't require file access.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Task description for the subagent"
-                    }
-                },
-                "required": ["prompt"]
-            }),
+            description,
+            parameters: properties,
         }
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "task", &args.prompt).await?;
 
-        let result = self
-            .model
-            .btw_query(format!(
-                "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
-                args.prompt
-            ))
-            .await
-            .map_err(|e| ToolError::Msg(format!("Subagent error: {}", e)))?;
+        let background = args.background.unwrap_or(false);
 
-        Ok(result)
+        if background {
+            let Some(ref store) = self.bg_store else {
+                return Err(ToolError::Msg(
+                    "background tasks not available".to_string(),
+                ));
+            };
+
+            let task_id = Uuid::new_v4().to_string();
+            store.insert(task_id.clone());
+
+            let model = self.model.clone();
+            let prompt = args.prompt;
+            let store = store.clone();
+            let tid = task_id.clone();
+
+            tokio::spawn(async move {
+                let result = model
+                    .btw_query(format!(
+                        "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
+                        prompt
+                    ))
+                    .await;
+                store.update(
+                    &tid,
+                    match result {
+                        Ok(text) => TaskState::Completed(text),
+                        Err(e) => TaskState::Failed(e.to_string()),
+                    },
+                );
+            });
+
+            Ok(format!("background task started\n\ntask_id: {}\nstate: running\n\nUse task_status to check progress.", task_id))
+        } else {
+            let result = self
+                .model
+                .btw_query(format!(
+                    "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
+                    args.prompt
+                ))
+                .await
+                .map_err(|e| ToolError::Msg(format!("Subagent error: {}", e)))?;
+
+            Ok(result)
+        }
     }
 }
