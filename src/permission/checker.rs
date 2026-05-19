@@ -25,6 +25,22 @@ pub struct PermissionChecker {
     mode: SecurityMode,
 }
 
+/// Tool names where the input is a filesystem path. For these, `*` keeps
+/// classic glob semantics (one segment, doesn't cross `/`). Everything else
+/// is treated as shell/text where `*` means "any chars including /".
+pub(crate) fn is_path_tool_name(tool: &str) -> bool {
+    matches!(tool, "read" | "write" | "edit" | "list_dir")
+}
+
+/// Build a Pattern with the right `*` semantics for the given tool.
+pub(crate) fn pattern_for_tool(tool: &str, pat: &str) -> Pattern {
+    if is_path_tool_name(tool) {
+        Pattern::new(pat)
+    } else {
+        Pattern::new_command(pat)
+    }
+}
+
 impl PermissionChecker {
     pub fn new(
         config: &PermissionConfig,
@@ -49,11 +65,11 @@ impl PermissionChecker {
             let mut entries = Vec::new();
             match tp {
                 ToolPerm::Simple(action) => {
-                    entries.push((Pattern::new("*"), *action));
+                    entries.push((pattern_for_tool(tool_name, "*"), *action));
                 }
                 ToolPerm::Granular(map) => {
                     for (pat, action) in map {
-                        entries.push((Pattern::new(pat), *action));
+                        entries.push((pattern_for_tool(tool_name, pat), *action));
                     }
                 }
             }
@@ -63,11 +79,12 @@ impl PermissionChecker {
         if !rules.contains_key("bash") {
             let mut defaults = Vec::new();
             for (pat, action) in crate::permission::default_bash_rules() {
-                defaults.push((Pattern::new(pat), action));
+                defaults.push((pattern_for_tool("bash", pat), action));
             }
             rules.insert("bash".to_string(), defaults);
         }
 
+        // External-directory rules are always path patterns by definition.
         let ext_dir_rules = config
             .external_directory
             .as_ref()
@@ -239,14 +256,14 @@ impl PermissionChecker {
     }
 
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
-        let pattern = Pattern::new(pattern_str);
+        let pattern = pattern_for_tool(&tool, pattern_str);
         self.session_allowlist.push((tool, pattern));
     }
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
         for (tool, pat) in entries {
             self.session_allowlist
-                .push((tool.clone(), Pattern::new(pat)));
+                .push((tool.clone(), pattern_for_tool(tool, pat)));
         }
     }
 
@@ -316,5 +333,90 @@ fn resolve_absolute(path: &str, working_dir: &str) -> String {
         p.to_string_lossy().to_string()
     } else {
         Path::new(working_dir).join(p).to_string_lossy().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::PermissionConfig;
+
+    fn fresh_checker() -> PermissionChecker {
+        PermissionChecker::new(
+            &PermissionConfig::default(),
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        )
+    }
+
+    // Regression: "allow always" → `cd *` saved to session allowlist must
+    // satisfy the NEXT bash check for `cd /absolute/path`. Before the fix,
+    // path-glob semantics on `*` (`[^/]*`) refused to match the absolute
+    // path, so the user was re-prompted every command.
+    #[test]
+    fn regression_session_allowlist_cd_star_matches_path_arg() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cd *");
+
+        // The exact scenario from the bug report.
+        let r1 = checker.check(
+            "bash",
+            "cd /Users/yogthos/src/work/rigging-workshop && git diff",
+        );
+        assert!(
+            matches!(r1, CheckResult::Allowed),
+            "expected Allowed, got {:?}",
+            r1
+        );
+
+        let r2 = checker.check("bash", "cd /Users/yogthos/src/work/rigging-workshop");
+        assert!(matches!(r2, CheckResult::Allowed));
+    }
+
+    // Path-tool patterns still get filesystem-glob semantics — adding
+    // `src/*` doesn't allow nested files. Force default Ask so we can read
+    // the session-allowlist contribution in isolation from the default.
+    #[test]
+    fn path_tool_session_allowlist_keeps_one_segment_semantics() {
+        let mut cfg = PermissionConfig::default();
+        cfg.default = Some(Action::Ask);
+        let mut checker = PermissionChecker::new(
+            &cfg,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        );
+        checker.add_session_allowlist("read".to_string(), "src/*");
+
+        // One-segment hit from the session allowlist.
+        assert!(matches!(
+            checker.check_path("read", "src/main.rs"),
+            CheckResult::Allowed
+        ));
+        // Nested path: not in allowlist, falls through to default Ask.
+        let nested = checker.check_path("read", "src/agent/main.rs");
+        assert!(
+            matches!(nested, CheckResult::Ask),
+            "src/* must not match nested path; got {:?}",
+            nested
+        );
+    }
+
+    // load_session_allowlist roundtrip: persisted patterns from a previous
+    // session should match the way they did when saved.
+    #[test]
+    fn regression_load_session_allowlist_preserves_command_semantics() {
+        let mut checker = fresh_checker();
+        let saved = vec![("bash".to_string(), "cd *".to_string())];
+        checker.load_session_allowlist(&saved);
+
+        let r = checker.check("bash", "cd /home/me/project");
+        assert!(matches!(r, CheckResult::Allowed));
+    }
+
+    #[test]
+    fn pattern_for_tool_distinguishes_path_and_command_tools() {
+        assert!(pattern_for_tool("bash", "cd *").matches("cd /a/b/c"));
+        assert!(!pattern_for_tool("read", "cd *").matches("cd /a/b/c"));
+        assert!(pattern_for_tool("read", "cd *").matches("cd file"));
     }
 }
