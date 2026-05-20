@@ -2,6 +2,8 @@ mod events;
 pub(crate) mod input;
 mod markdown;
 pub(crate) mod picker;
+#[cfg(feature = "plugin")]
+mod plugin_tree;
 mod renderer;
 mod slash;
 mod status;
@@ -541,6 +543,41 @@ pub async fn run_interactive(
                     continue;
                 }
                 render_plugin_entry(&pm_arc, &mut renderer, &entry)?;
+            }
+        }
+
+        // Drain plugin-issued session-tree mutation ops (P4d). Applied
+        // here so any /tree, /fork, /clone, navigate, set-label, or
+        // session-replacement queued by a hook during the previous
+        // event takes effect before the next user input is shown.
+        #[cfg(feature = "plugin")]
+        if let Some(pm_arc) = crate::plugin::hook::global() {
+            let ops = {
+                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.drain_tree_ops()
+            };
+            let mut any_session_replaced = false;
+            for op in ops {
+                let effect = plugin_tree::apply_tree_op(op, session, &mut input);
+                match effect {
+                    plugin_tree::TreeOpEffect::Applied(msg) => {
+                        renderer.write_line(&msg, Color::DarkGrey)?;
+                    }
+                    plugin_tree::TreeOpEffect::Failed(msg) => {
+                        renderer.write_line(&msg, C_ERROR)?;
+                    }
+                    plugin_tree::TreeOpEffect::SessionReplaced(msg) => {
+                        renderer.write_line(&msg, C_AGENT)?;
+                        any_session_replaced = true;
+                    }
+                }
+            }
+            if any_session_replaced {
+                // Repaint chat from the (possibly fresh) session so
+                // the user sees the new state. The agent runtime
+                // keeps the same model — reset_to_new / switch_session
+                // preserve it — so no agent rebuild is needed here.
+                render_session(&mut renderer, session, cli, cfg, context)?;
             }
         }
 

@@ -442,9 +442,8 @@ impl Session {
         self.switch_to_leaf(entry_id)
     }
 
-    /// Set or clear a label on a tree node. Used by the future
+    /// Set or clear a label on a tree node. Used by
     /// `harness/set-label` (P4d) and by `/bookmark`-style commands.
-    #[allow(dead_code)]
     pub fn set_label(
         &mut self,
         entry_id: &CompactString,
@@ -459,6 +458,40 @@ impl Session {
         node.label = label;
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
         Ok(())
+    }
+
+    /// Reset the session in place: assign a fresh id, clear messages,
+    /// tree, message store, compactions, plugin entries, and counters.
+    /// Preserves model/provider/context_window/working_dir so the
+    /// caller doesn't have to rebuild the agent. Used by
+    /// `harness/new-session` (P4d) — mirrors pi's `ctx.newSession()`
+    /// without the file-replacement step (dirge persists in place).
+    ///
+    /// If `parent_session` is provided, the previous session id is
+    /// recorded as `name` for lineage; pi stores this in a session
+    /// header field. We piggyback on `name` to avoid bumping the
+    /// session schema for one optional field.
+    pub fn reset_to_new(&mut self, parent_session: Option<&str>) {
+        let now = CompactString::new(chrono::Utc::now().to_rfc3339());
+        self.id = CompactString::new(Uuid::new_v4().to_string());
+        if let Some(parent) = parent_session {
+            self.name = CompactString::new(format!("parent:{}", parent));
+        } else {
+            self.name = CompactString::new("");
+        }
+        self.messages.clear();
+        self.compactions.clear();
+        self.extra_entries.clear();
+        self.next_entry_seq = 0;
+        self.message_store.clear();
+        self.tree = SessionTree::default();
+        self.total_tokens = 0;
+        self.total_cost = 0.0;
+        self.total_estimated_tokens = 0;
+        self.created_at = now.clone();
+        self.updated_at = now;
+        // Note: model/provider/context_window/working_dir/permission_allowlist
+        // preserved so the host can keep the same agent runtime.
     }
 
     pub fn needs_compaction(&self, reserve_tokens: u64) -> bool {
@@ -958,5 +991,52 @@ mod tests {
                 .map(|m| m.content.as_str()),
             Some("a")
         );
+    }
+
+    /// `reset_to_new` keeps model/provider/working_dir but wipes
+    /// everything else and assigns a fresh id. Mirrors pi's
+    /// newSession() in-place.
+    #[test]
+    fn reset_to_new_clears_content_but_keeps_runtime_metadata() {
+        let mut s = Session::new("openai", "gpt-4", 200_000);
+        s.add_message(MessageRole::User, "old prompt");
+        s.add_message(MessageRole::Assistant, "old reply");
+        s.append_plugin_entry("bookmark", "stale", true);
+        s.compactions.push(Compaction {
+            summary: CompactString::from("dropped"),
+            first_kept_index: 0,
+            summarized_count: 1,
+            token_savings: 0,
+            created_at: CompactString::from("2024-01-01"),
+        });
+        let original_id = s.id.clone();
+
+        s.reset_to_new(None);
+
+        assert_ne!(s.id, original_id, "id must change");
+        assert!(s.messages.is_empty());
+        assert!(s.message_store.is_empty());
+        assert!(s.tree.entries.is_empty());
+        assert!(s.tree.leaf_id.is_none());
+        assert!(s.compactions.is_empty());
+        assert!(s.extra_entries.is_empty());
+        assert_eq!(s.next_entry_seq, 0);
+        assert_eq!(s.total_estimated_tokens, 0);
+        // Runtime metadata preserved.
+        assert_eq!(s.model, "gpt-4");
+        assert_eq!(s.provider, "openai");
+        assert_eq!(s.context_window, 200_000);
+        // Lineage left blank when no parent passed.
+        assert_eq!(s.name, "");
+    }
+
+    /// When given a parent session id, `reset_to_new` records it
+    /// in `name` so the prior session is reachable via session search.
+    #[test]
+    fn reset_to_new_records_parent_lineage() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "x");
+        s.reset_to_new(Some("00000000-prev"));
+        assert_eq!(s.name, "parent:00000000-prev");
     }
 }
