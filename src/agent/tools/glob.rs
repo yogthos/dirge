@@ -5,16 +5,42 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::agent::tools::MAX_FIND_RESULTS;
+use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
 pub struct GlobTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    pub cache: Option<ToolCache>,
 }
 
 impl GlobTool {
+    /// Construct without a cache. Retained for parity with other
+    /// tools (Read/Grep/FindFiles/ListDir) and exercised by unit
+    /// tests; production paths use `with_cache`.
+    #[allow(dead_code)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self { permission, ask_tx }
+        Self {
+            permission,
+            ask_tx,
+            cache: None,
+        }
+    }
+
+    /// Builder that matches the dual-constructor pattern used by
+    /// Read/Grep/FindFiles/ListDir. Same `ToolCache` is shared
+    /// across tools so a `bash`/`write` that mutates the filesystem
+    /// invalidates glob results too via `cache.clear()`.
+    pub fn with_cache(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        cache: ToolCache,
+    ) -> Self {
+        Self {
+            permission,
+            ask_tx,
+            cache: Some(cache),
+        }
     }
 }
 
@@ -95,6 +121,17 @@ impl Tool for GlobTool {
         )
         .await?;
 
+        let cache_key = format!(
+            "glob:{}:{}",
+            args.pattern,
+            args.path.as_deref().unwrap_or("."),
+        );
+        if let Some(ref cache) = self.cache
+            && let Some(cached) = cache.get(&cache_key)
+        {
+            return Ok(cached);
+        }
+
         let re = glob_to_regex(&args.pattern).map_err(|e| ToolError::Msg(e))?;
 
         let root = args
@@ -150,11 +187,15 @@ impl Tool for GlobTool {
         });
 
         let results: Vec<String> = matches.into_iter().map(|(rel, _)| rel).collect();
-        if results.is_empty() {
-            Ok(String::new())
+        let out = if results.is_empty() {
+            String::new()
         } else {
-            Ok(results.join("\n"))
+            results.join("\n")
+        };
+        if let Some(ref cache) = self.cache {
+            cache.set(&cache_key, out.clone());
         }
+        Ok(out)
     }
 }
 

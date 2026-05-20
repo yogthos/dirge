@@ -315,12 +315,15 @@ impl Session {
     pub fn pop_last_message(&mut self) -> Option<SessionMessage> {
         self.ensure_back_compat_initialized();
         let msg = self.messages.pop()?;
-        // Move leaf back to the popped node's parent.
-        let parent = self
-            .tree
-            .entries
-            .get(&msg.id)
-            .and_then(|n| n.parent.clone());
+        // Pull the popped node's parent for leaf rewind. If the tree
+        // somehow lacks this node (corruption / external mutation),
+        // fall back to the previous message in the linear cache rather
+        // than wiping the leaf — wiping would leave the tree dangling
+        // when the user pops on a branched session.
+        let parent = match self.tree.entries.get(&msg.id) {
+            Some(node) => node.parent.clone(),
+            None => self.messages.last().map(|m| m.id.clone()),
+        };
         self.tree.leaf_id = parent;
         // Only prune the node if nothing else (e.g. a forked branch)
         // refers to it as a parent.
@@ -391,6 +394,13 @@ impl Session {
     /// chosen message so the next add_message creates a divergent
     /// branch. Returns the message content (so the UI can restore
     /// it into the input editor for re-editing).
+    ///
+    /// **Root-node behaviour**: if `entry_id` has no parent (it is
+    /// the conversation root), the current `messages` cache is
+    /// cleared and `tree.leaf_id` is set to `None` so the next
+    /// `add_message` starts a fresh root. The tree's other entries
+    /// (sibling branches) are *not* pruned — they remain reachable
+    /// via `/tree`.
     ///
     /// Mirrors pi's `ctx.fork(entryId, { position: "before" })`.
     pub fn fork_at(&mut self, entry_id: &CompactString) -> Result<SessionMessage, String> {
