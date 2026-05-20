@@ -729,6 +729,100 @@ mod tests {
             .unwrap();
         assert_eq!(r, Some("he said \"hi\"\nline 2 \\ x".to_string()));
     }
+
+    // --- R2: coverage gaps from the audit ------------------------------
+
+    /// R2: load_file on a missing path surfaces an error rather than
+    /// panicking or silently succeeding.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_load_file_missing_path_returns_err() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        let bogus = std::path::PathBuf::from("/tmp/dirge-nonexistent-plugin.janet");
+        // Make doubly sure it's not there.
+        let _ = std::fs::remove_file(&bogus);
+        let result = mgr.load_file(&bogus);
+        assert!(
+            result.is_err(),
+            "expected Err on missing file, got {result:?}"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Failed to read plugin"),
+            "error should identify the read failure, got {msg:?}"
+        );
+    }
+
+    /// R2: store_response writes a slot that a subsequent eval can read.
+    /// Verifies the round-trip rather than just that the write doesn't
+    /// crash.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_store_response_round_trips_via_harness_var() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.store_response("the assistant said this");
+        // harness-response is the slot store_response writes to.
+        let read = mgr.eval("harness-response").unwrap();
+        assert_eq!(read, "the assistant said this");
+    }
+
+    /// R2: store_response handles strings with Janet-special chars
+    /// (quotes, backslashes, newlines) without breaking the assignment.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_store_response_escapes_special_chars() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.store_response("line one\n\"quoted\"\nline three \\ backslash");
+        let read = mgr.eval("harness-response").unwrap();
+        assert_eq!(read, "line one\n\"quoted\"\nline three \\ backslash");
+    }
+
+    /// R2: concurrent calls to `dispatch_tool_hook` via an
+    /// `Arc<Mutex<PluginManager>>` serialize cleanly. Two threads each
+    /// fire a unique-tagged hook; both should see their own block
+    /// reason come back in the result, with no interference. Catches
+    /// any future refactor that drops the lock mid-dispatch.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_concurrent_dispatch_tool_hook_serializes() {
+        use std::sync::{Arc, Mutex};
+
+        let pm = Arc::new(Mutex::new(PluginManager::try_new().unwrap()));
+        {
+            let mut mgr = pm.lock().unwrap();
+            mgr.eval(
+                r#"(defn block-by-tool [ctx]
+                    (harness/block (string "blocked:" (ctx :tool))))"#,
+            )
+            .unwrap();
+            mgr.register("on-tool-start", "block-by-tool");
+        }
+
+        // 8 concurrent threads each calling dispatch_tool_hook with a
+        // distinct :tool key. Without proper serialization a thread
+        // could observe another's slot value, mixing reasons.
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let pm = pm.clone();
+            handles.push(std::thread::spawn(move || {
+                let ctx = format!("@{{:tool \"t{i}\"}}");
+                let mut mgr = pm.lock().unwrap();
+                mgr.dispatch_tool_hook("on-tool-start", &ctx).unwrap()
+            }));
+        }
+
+        let mut reasons: Vec<String> = handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .map(|r| r.block.unwrap_or_default())
+            .collect();
+        reasons.sort();
+        let expected: Vec<String> = (0..8).map(|i| format!("blocked:t{i}")).collect();
+        assert_eq!(
+            reasons, expected,
+            "each thread should see its own block reason"
+        );
+    }
 }
 
 use std::collections::HashMap;

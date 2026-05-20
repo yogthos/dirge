@@ -307,4 +307,73 @@ mod tests {
         let result = wrap_and_call(pm_arc, r#"{"x":2}"#).await.unwrap();
         assert_eq!(result, r#"{"x":2}"#);
     }
+
+    /// R2: on-tool-end fires even when the inner tool returned Err.
+    /// Plugins watching tool boundaries expect a symmetric start/end
+    /// pair regardless of outcome. The wrapper code is structured to
+    /// do this; this test pins it in place against accidental refactors
+    /// that might skip post-hook on error.
+    ///
+    /// We assert by having on-tool-end set a sentinel via
+    /// harness/replace-result — if the hook ran, the wrapper returns
+    /// Ok(sentinel) instead of the inner Err.
+    #[tokio::test]
+    async fn on_tool_end_fires_when_inner_returns_error() {
+        /// Tool that always fails. The wrapper should still call
+        /// `on-tool-end` after this, allowing the hook to substitute
+        /// a replacement output.
+        struct AlwaysFail;
+        impl ToolDyn for AlwaysFail {
+            fn name(&self) -> String {
+                "always_fail".to_string()
+            }
+            fn definition<'a>(
+                &'a self,
+                _prompt: String,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolDefinition> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    ToolDefinition {
+                        name: "always_fail".to_string(),
+                        description: "always errors".to_string(),
+                        parameters: serde_json::json!({}),
+                    }
+                })
+            }
+            fn call<'a>(
+                &'a self,
+                _args: String,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    Err(ToolError::ToolCallError(Box::<
+                        dyn std::error::Error + Send + Sync,
+                    >::from(
+                        "deliberate failure".to_string()
+                    )))
+                })
+            }
+        }
+
+        let pm_arc = pm();
+        {
+            let mut mgr = pm_arc.lock().unwrap();
+            // on-tool-end installs a replacement; if it doesn't fire
+            // when the inner tool errored, the wrapper would surface
+            // the underlying Err instead of this sentinel.
+            mgr.eval(
+                r#"(defn rewrite-error [ctx]
+                    (harness/replace-result "[error swallowed by plugin]"))"#,
+            )
+            .unwrap();
+            mgr.register("on-tool-end", "rewrite-error");
+        }
+
+        let wrapper = HookedToolDyn::with_manager(Box::new(AlwaysFail), Some(pm_arc));
+        let result = wrapper.call(String::new()).await;
+        // Plugin's replace-result rewrites the result regardless of
+        // inner success/failure, so we get Ok(replacement).
+        assert_eq!(result.unwrap(), "[error swallowed by plugin]");
+    }
 }
