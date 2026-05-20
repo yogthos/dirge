@@ -3,7 +3,7 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agent::tools::ToolError;
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
 pub type QuestionSender = mpsc::Sender<QuestionRequest>;
 pub type QuestionReceiver = mpsc::Receiver<QuestionRequest>;
@@ -48,11 +48,30 @@ pub struct QuestionOption {
 
 pub struct QuestionTool {
     pub question_tx: QuestionSender,
+    pub permission: Option<PermCheck>,
+    pub ask_tx: Option<AskSender>,
 }
 
 impl QuestionTool {
     pub fn new(question_tx: QuestionSender) -> Self {
-        Self { question_tx }
+        Self {
+            question_tx,
+            permission: None,
+            ask_tx: None,
+        }
+    }
+
+    /// Builder for the production path: wires the permission checker
+    /// + ask channel so `question` invocations go through the same
+    /// allow/ask/deny rules as every other behaviour-altering tool.
+    pub fn with_permission(
+        mut self,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+    ) -> Self {
+        self.permission = permission;
+        self.ask_tx = ask_tx;
+        self
     }
 }
 
@@ -116,6 +135,17 @@ impl Tool for QuestionTool {
     }
 
     async fn call(&self, args: QuestionArgs) -> Result<String, ToolError> {
+        // Route through the same permission system as task / write /
+        // bash. `question` rewrites what the LLM sees by injecting
+        // user input — that's behavior-altering and shouldn't bypass
+        // user rules.
+        let summary = args
+            .questions
+            .first()
+            .map(|q| q.question.clone())
+            .unwrap_or_default();
+        check_perm(&self.permission, &self.ask_tx, "question", &summary).await?;
+
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.question_tx

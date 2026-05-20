@@ -489,7 +489,14 @@ impl Session {
     }
 
     pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
+        // Bounds check — callers compute `first_kept_index` from a
+        // reverse-scan of `messages` so it should always be in range,
+        // but a buggy/racy caller could pass out-of-bounds. Clamp
+        // rather than panic on `drain(..)` so a misuse degrades to
+        // "summarize everything" instead of a hard crash.
+        let first_kept_index = first_kept_index.min(self.messages.len());
         let summarized_count = first_kept_index;
+
         // Subtract the saved tokens from estimated total
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_sub(token_savings);
         // Add back estimated tokens for the summary itself
@@ -513,6 +520,8 @@ impl Session {
             .iter()
             .map(|m| m.id.clone())
             .collect();
+        let dropped_set: std::collections::HashSet<CompactString> =
+            dropped_ids.iter().cloned().collect();
 
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
@@ -544,7 +553,26 @@ impl Session {
                 node.parent = Some(summary_id.clone());
             }
         } else {
-            self.tree.leaf_id = Some(summary_id);
+            self.tree.leaf_id = Some(summary_id.clone());
+        }
+        // Re-point the tree leaf if the previous leaf was one of the
+        // pruned nodes (e.g. a branched session compressed the branch
+        // that owned the leaf). Without this the leaf dangles at an
+        // id that no longer exists in `tree.entries`.
+        let leaf_dropped = self
+            .tree
+            .leaf_id
+            .as_ref()
+            .map(|id| dropped_set.contains(id))
+            .unwrap_or(false);
+        if leaf_dropped {
+            // Anchor the leaf to the new first-kept message, or to the
+            // summary if nothing else survived.
+            self.tree.leaf_id = self
+                .messages
+                .get(1)
+                .map(|m| m.id.clone())
+                .or(Some(summary_id.clone()));
         }
 
         self.compactions.push(Compaction {

@@ -217,8 +217,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             )),
         ];
 
-        let question_tool = question_tx
-            .map(|tx| Box::new(tools::QuestionTool::new(tx)) as Box<dyn rig::tool::ToolDyn>);
+        let question_tool = question_tx.map(|tx| {
+            Box::new(
+                tools::QuestionTool::new(tx).with_permission(permission.clone(), ask_tx.clone()),
+            ) as Box<dyn rig::tool::ToolDyn>
+        });
 
         let plan_tools = plan_tx.map(|tx| {
             let enter =

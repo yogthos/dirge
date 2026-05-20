@@ -28,7 +28,32 @@ pub(crate) fn config_path() -> PathBuf {
     home.join(".config").join("dirge")
 }
 
+/// Validate that a session id is safe to interpolate into a path.
+/// Session ids are normally UUIDs (hex + hyphens), but they round-trip
+/// through JSON on disk so a tampered-with file could carry an id like
+/// `../../etc/passwd`. Reject anything that isn't strictly
+/// `[A-Za-z0-9._-]+` so a malicious id can't escape the session dir.
+fn validate_session_id(id: &str) -> anyhow::Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("session id is empty");
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        anyhow::bail!("session id contains disallowed characters: {:?}", id);
+    }
+    // Belt-and-braces: `..` or leading `.` would still resolve relatively
+    // via `Path::join` even after the char check (`.` is allowed for
+    // legitimate ids like `2024.session`).
+    if id == "." || id == ".." || id.contains("/") || id.contains("\\") {
+        anyhow::bail!("session id resolves outside the session dir: {:?}", id);
+    }
+    Ok(())
+}
+
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
+    validate_session_id(&session.id)?;
     let dir = session_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", session.id));
@@ -38,6 +63,7 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
 }
 
 pub fn load_session(id: &str) -> anyhow::Result<Session> {
+    validate_session_id(id)?;
     let dir = session_dir();
     let path = dir.join(format!("{}.json", id));
     let json = std::fs::read_to_string(path)?;
@@ -45,12 +71,40 @@ pub fn load_session(id: &str) -> anyhow::Result<Session> {
 }
 
 pub fn delete_session(id: &str) -> anyhow::Result<()> {
+    validate_session_id(id)?;
     let dir = session_dir();
     let path = dir.join(format!("{}.json", id));
     if path.exists() {
         std::fs::remove_file(path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_session_id_accepts_uuids() {
+        assert!(validate_session_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890").is_ok());
+        assert!(validate_session_id("plain-id").is_ok());
+        assert!(validate_session_id("2024.session").is_ok());
+        assert!(validate_session_id("session_42").is_ok());
+    }
+
+    #[test]
+    fn validate_session_id_rejects_traversal() {
+        assert!(validate_session_id("../../../etc/passwd").is_err());
+        assert!(validate_session_id("..\\windows").is_err());
+        assert!(validate_session_id("..").is_err());
+        assert!(validate_session_id(".").is_err());
+        assert!(validate_session_id("a/b").is_err());
+        assert!(validate_session_id("a\\b").is_err());
+        assert!(validate_session_id("").is_err());
+        // Null bytes, newlines, spaces — anything non-id-shaped.
+        assert!(validate_session_id("foo bar").is_err());
+        assert!(validate_session_id("foo\nbar").is_err());
+    }
 }
 
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
