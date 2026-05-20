@@ -733,10 +733,11 @@ mod tests {
 
 use std::collections::HashMap;
 
-#[cfg(feature = "plugin")]
-use janetrs::client::{Error as JanetError, JanetClient};
+use worker::Worker;
+pub use worker::{DialogReply, DialogRequest};
 
 pub mod hook;
+pub mod worker;
 
 /// Escape a Rust string so it can be safely embedded inside a Janet
 /// double-quoted string literal. Janet's parser accepts the standard
@@ -800,125 +801,45 @@ pub fn filter_existing_dirs(candidates: &[std::path::PathBuf]) -> Vec<std::path:
 
 pub struct PluginManager {
     hooks: HashMap<String, Vec<String>>,
-    #[cfg(feature = "plugin")]
-    client: JanetClient,
+    /// All Janet evaluation goes through this handle to the worker
+    /// thread. The handle is naturally `Send + Sync` (only an mpsc Sender
+    /// + JoinHandle inside) so no unsafe impl is needed — the previous
+    /// `unsafe impl Send for PluginManager` is gone now that Janet lives
+    /// on its own OS thread.
+    worker: Worker,
+    /// One-shot consumer end of the dialog channel. Taken out by
+    /// `take_dialog_rx` on first call so the UI can register it in its
+    /// `tokio::select!`. After that, the field is `None`.
+    dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DialogRequest>>,
 }
-
-// SAFETY: dirge uses `#[tokio::main(flavor = "current_thread")]` so every
-// PluginManager access happens on the same OS thread. Janet's per-thread
-// global state is therefore stable for the lifetime of the process.
-//
-// rig's ToolDyn trait requires Send+Sync on futures returned by `call`,
-// which transitively requires the wrapper around PluginManager to be
-// Sync. Without this impl HookedToolDyn cannot be constructed.
-//
-// If dirge ever switches to `#[tokio::main]` (multi-thread runtime) or
-// otherwise lets tools execute on a different OS thread, this impl
-// becomes unsound — replace it with a dedicated Janet worker thread
-// and a message channel.
-#[cfg(feature = "plugin")]
-unsafe impl Send for PluginManager {}
-#[cfg(feature = "plugin")]
-unsafe impl Sync for PluginManager {}
 
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 impl PluginManager {
-    /// Initialize a Janet VM and the harness API. Returns Err if Janet
-    /// init fails (e.g. already initialized on this thread) so the host
-    /// can fall back instead of panicking.
+    /// Spawn the Janet worker thread and wait for it to install the
+    /// harness API. Returns Err if Janet VM init fails so the host can
+    /// fall back to a no-plugin path rather than panicking.
     pub fn try_new() -> Result<Self, String> {
-        #[cfg(feature = "plugin")]
-        let client = {
-            let c = JanetClient::init_with_default_env()
-                .map_err(|e| format!("Failed to initialize Janet VM: {e}"))?;
-
-            // Define harness API functions in Janet
-            let _ = c.run(
-                r#"
-                (var harness-pending nil)
-                (var harness-response nil)
-                # Per-tool-hook slots: cleared by the host at the start of
-                # dispatch_tool_hook so previous-call state doesn't leak.
-                (var harness-block nil)
-                (var harness-mutate-input nil)
-                (var harness-replace-result nil)
-
-                (defn harness/log [msg] (print "[plugin] " msg))
-                (defn harness/get-cwd [] (os/cwd))
-                (defn harness/request-prompt [prompt]
-                  (when (string? prompt)
-                    (set harness-pending prompt)))
-                (defn harness/store-response [resp]
-                  (set harness-response resp))
-                (defn harness/has-symbol? [name]
-                  (truthy? (get (curenv) (symbol name))))
-
-                # Tool-hook slots. Plugins call these from inside
-                # on-tool-start / on-tool-end. The host reads them via
-                # dispatch_tool_hook on the Rust side.
-                (defn harness/block [reason]
-                  (when (string? reason) (set harness-block reason)))
-                (defn harness/mutate-input [json-str]
-                  (when (string? json-str) (set harness-mutate-input json-str)))
-                (defn harness/replace-result [output]
-                  (when (string? output) (set harness-replace-result output)))
-
-                # Slash-command registry. Plugins register at load time;
-                # the host reads the list once after all plugins load and
-                # dispatches matching /cmd input back to the named handler.
-                # Stored as a `name|handler\n` blob to keep the read side
-                # easy (single Janet -> Rust string roundtrip).
-                (var harness-cmd-list "")
-                (defn harness/register-command [name handler]
-                  (when (and (string? name) (string? handler))
-                    (set harness-cmd-list
-                         (string harness-cmd-list name "|" handler "\n"))))
-
-                # Replace the user's prompt for the current turn. Plugins
-                # call this from on-prompt hooks. Distinct from
-                # harness/request-prompt which queues a follow-up turn.
-                (var harness-prompt-replace nil)
-                (defn harness/replace-prompt [text]
-                  (when (string? text)
-                    (set harness-prompt-replace text)))
-
-                # Notification queue. Plugins call (harness/notify msg level?)
-                # to push a line into the host's chat display. Stored as a
-                # `level\tmsg\n` blob; the host's drain_notifications
-                # splits and clears in one round-trip.
-                (var harness-notif-list "")
-                (defn harness/notify [msg &opt level]
-                  (when (string? msg)
-                    (let [lvl (cond
-                                (or (= level :info) (= level "info")) "info"
-                                (or (= level :warn) (= level "warn")) "warn"
-                                (or (= level :error) (= level "error")) "error"
-                                "info")]
-                      (set harness-notif-list
-                           (string harness-notif-list lvl "\t" msg "\n")))))
-            "#,
-            );
-
-            c
-        };
-
+        let (worker, dialog_rx) = Worker::try_spawn()?;
         Ok(PluginManager {
             hooks: HashMap::new(),
-            #[cfg(feature = "plugin")]
-            client,
+            worker,
+            dialog_rx: Some(dialog_rx),
         })
     }
 
-    #[cfg(feature = "plugin")]
+    /// Consume the dialog-request consumer end so the UI loop can wire it
+    /// into its `tokio::select!`. Only succeeds once; subsequent calls
+    /// return `None` because the Receiver has a single owner.
+    pub fn take_dialog_rx(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<DialogRequest>> {
+        self.dialog_rx.take()
+    }
+
     pub fn load_file(&mut self, path: &std::path::Path) -> Result<(), String> {
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("Failed to read plugin: {e}"))?;
         self.eval(&content)?;
-        Ok(())
-    }
-
-    #[cfg(not(feature = "plugin"))]
-    pub fn load_file(&mut self, _path: &std::path::Path) -> Result<(), String> {
         Ok(())
     }
 
@@ -929,75 +850,32 @@ impl PluginManager {
             .push(script.to_string());
     }
 
-    #[cfg(feature = "plugin")]
     pub fn take_pending_prompt(&mut self) -> Option<String> {
-        // Stringify on the Janet side so we can disambiguate Janet's
-        // nil value from a string with the characters "nil". Probe the
-        // type first; only fetch the value if it really is a string.
-        let is_string = self
-            .client
-            .run("(if (string? harness-pending) true false)")
-            .map(|v| v.to_string() == "true")
-            .unwrap_or(false);
-        if !is_string {
-            return None;
-        }
-        let val = match self.client.run("harness-pending") {
-            Ok(v) => v,
-            Err(_) => return None,
-        };
-        let s = val.to_string();
-        let _ = self.client.run("(set harness-pending nil)");
-        Some(s)
+        self.take_string_slot("harness-pending")
     }
 
-    #[cfg(not(feature = "plugin"))]
-    pub fn take_pending_prompt(&mut self) -> Option<String> {
-        None
-    }
-
-    #[cfg(feature = "plugin")]
     pub fn store_response(&mut self, response: &str) {
         let escaped = escape_janet_string(response);
         let _ = self
-            .client
-            .run(&format!(r#"(set harness-response "{}")"#, escaped));
+            .worker
+            .eval(&format!(r#"(set harness-response "{}")"#, escaped));
     }
-
-    #[cfg(not(feature = "plugin"))]
-    pub fn store_response(&mut self, _response: &str) {}
 
     /// Check whether a top-level symbol is bound in the Janet env
     /// without triggering Janet's compile-error stderr output.
-    #[cfg(feature = "plugin")]
     pub fn has_symbol(&mut self, name: &str) -> bool {
         let escaped = escape_janet_string(name);
         let code = format!(r#"(harness/has-symbol? "{}")"#, escaped);
-        match self.client.run(&code) {
-            Ok(val) => val.to_string() == "true",
-            Err(_) => false,
-        }
+        self.worker
+            .eval(&code)
+            .map(|s| s == "true")
+            .unwrap_or(false)
     }
 
-    #[cfg(not(feature = "plugin"))]
-    pub fn has_symbol(&mut self, _name: &str) -> bool {
-        false
-    }
-
-    #[cfg(feature = "plugin")]
     pub fn eval(&mut self, code: &str) -> Result<String, String> {
-        self.client
-            .run(code)
-            .map(|val| val.to_string())
-            .map_err(|e: JanetError| format!("Janet error: {e}"))
+        self.worker.eval(code)
     }
 
-    #[cfg(not(feature = "plugin"))]
-    pub fn eval(&mut self, _code: &str) -> Result<String, String> {
-        Err("plugin feature not enabled".to_string())
-    }
-
-    #[cfg(feature = "plugin")]
     pub fn dispatch(&mut self, hook: &str, context_janet: &str) -> Result<Vec<String>, String> {
         let names = match self.hooks.get(hook) {
             Some(names) => names.clone(),
@@ -1013,8 +891,7 @@ impl PluginManager {
                 ctx = context_janet,
                 fname = name,
             );
-            if let Ok(result) = self.eval(&code) {
-                let s = result.to_string();
+            if let Ok(s) = self.eval(&code) {
                 // Janet nil -> skip
                 if s != "nil" && !s.is_empty() {
                     results.push(s);
@@ -1025,87 +902,56 @@ impl PluginManager {
         Ok(results)
     }
 
-    #[cfg(not(feature = "plugin"))]
-    pub fn dispatch(&mut self, _hook: &str, _context_janet: &str) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
-    }
-
     /// Read and clear the `harness-block` slot. Returns the reason a plugin
     /// gave when calling `(harness/block "...")` from inside a tool hook,
     /// or `None` if no plugin set it.
-    #[cfg(feature = "plugin")]
     pub fn take_pending_block(&mut self) -> Option<String> {
         self.take_string_slot("harness-block")
-    }
-
-    #[cfg(not(feature = "plugin"))]
-    pub fn take_pending_block(&mut self) -> Option<String> {
-        None
     }
 
     /// Read and clear the `harness-mutate-input` slot. The returned string,
     /// when present, is a JSON encoding of the new tool args that the host
     /// should re-deserialize before invoking the tool.
-    #[cfg(feature = "plugin")]
     pub fn take_pending_mutate_input(&mut self) -> Option<String> {
         self.take_string_slot("harness-mutate-input")
-    }
-
-    #[cfg(not(feature = "plugin"))]
-    pub fn take_pending_mutate_input(&mut self) -> Option<String> {
-        None
     }
 
     /// Read and clear the `harness-replace-result` slot. The returned
     /// string, when present, is the tool output the LLM should see instead
     /// of the real one.
-    #[cfg(feature = "plugin")]
     pub fn take_pending_replace_result(&mut self) -> Option<String> {
         self.take_string_slot("harness-replace-result")
-    }
-
-    #[cfg(not(feature = "plugin"))]
-    pub fn take_pending_replace_result(&mut self) -> Option<String> {
-        None
     }
 
     /// Read and clear the `harness-prompt-replace` slot. Set by plugins
     /// from `on-prompt` to rewrite the user turn before the agent runs.
     /// Distinct from `take_pending_prompt`, which carries the
     /// `request-prompt` queue for the *next* turn.
-    #[cfg(feature = "plugin")]
     pub fn take_pending_prompt_replace(&mut self) -> Option<String> {
         self.take_string_slot("harness-prompt-replace")
-    }
-
-    #[cfg(not(feature = "plugin"))]
-    pub fn take_pending_prompt_replace(&mut self) -> Option<String> {
-        None
     }
 
     /// Shared body of the three `take_pending_*` functions: probe the type
     /// to disambiguate Janet's nil from a string with the characters "nil",
     /// fetch the value if it's a string, then clear the slot.
-    #[cfg(feature = "plugin")]
     fn take_string_slot(&mut self, var: &str) -> Option<String> {
         let is_string = self
-            .client
-            .run(format!("(if (string? {var}) true false)"))
-            .map(|v| v.to_string() == "true")
+            .worker
+            .eval(&format!("(if (string? {var}) true false)"))
+            .map(|s| s == "true")
             .unwrap_or(false);
         if !is_string {
             return None;
         }
-        let val = self.client.run(var).ok()?;
-        let _ = self.client.run(format!("(set {var} nil)"));
-        Some(val.to_string())
+        let val = self.worker.eval(var).ok()?;
+        let _ = self.worker.eval(&format!("(set {var} nil)"));
+        Some(val)
     }
 
     /// Specialized dispatcher for tool-hook events (`on-tool-start`,
     /// `on-tool-end`). Clears all tool-hook slots first so previous-call
     /// state doesn't leak, runs every registered hook, then collects the
     /// slot values into a structured result.
-    #[cfg(feature = "plugin")]
     pub fn dispatch_tool_hook(
         &mut self,
         hook: &str,
@@ -1114,8 +960,8 @@ impl PluginManager {
         // Pre-clear so a stale (harness/block ...) left by an unrelated
         // hook can't cause us to mis-block this tool.
         let _ = self
-            .client
-            .run("(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)");
+            .worker
+            .eval("(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)");
 
         let _ = self.dispatch(hook, context_janet)?;
 
@@ -1126,28 +972,18 @@ impl PluginManager {
         })
     }
 
-    #[cfg(not(feature = "plugin"))]
-    pub fn dispatch_tool_hook(
-        &mut self,
-        _hook: &str,
-        _context_janet: &str,
-    ) -> Result<ToolHookResult, String> {
-        Ok(ToolHookResult::default())
-    }
-
     /// Snapshot the plugin-registered slash commands as `(cmd-name,
     /// handler-fn-name)` pairs in load order. Read once after all plugins
     /// finish loading; subsequent registrations require a reload to take
     /// effect (kept simple for now — Phase 5 will add hot-reload).
-    #[cfg(feature = "plugin")]
     pub fn list_commands(&mut self) -> Vec<(String, String)> {
         // harness-cmd-list is a `name|handler\n` blob populated by the
         // (harness/register-command ...) calls in plugin scripts. Janet
         // stringifies strings without quotes, so the raw read is parseable
         // as-is — no escaping concerns because plugins only ever pass
         // alphanumeric command/handler names through here.
-        let raw = match self.client.run("harness-cmd-list") {
-            Ok(v) => v.to_string(),
+        let raw = match self.worker.eval("harness-cmd-list") {
+            Ok(s) => s,
             Err(_) => return Vec::new(),
         };
         raw.lines()
@@ -1164,11 +1000,6 @@ impl PluginManager {
             .collect()
     }
 
-    #[cfg(not(feature = "plugin"))]
-    pub fn list_commands(&mut self) -> Vec<(String, String)> {
-        Vec::new()
-    }
-
     /// Invoke a registered handler fn by name with the user-provided args
     /// string (everything after the command name). Returns `Ok(Some(text))`
     /// when the handler produced a non-nil string, `Ok(None)` when it
@@ -1176,7 +1007,6 @@ impl PluginManager {
     /// caller-visible error path is reserved for catastrophic Janet
     /// failures (VM dead, etc.) — handler-level errors are swallowed so a
     /// broken plugin doesn't tear down the slash dispatch.
-    #[cfg(feature = "plugin")]
     pub fn invoke_command(
         &mut self,
         handler_fn: &str,
@@ -1205,23 +1035,13 @@ impl PluginManager {
         }
     }
 
-    #[cfg(not(feature = "plugin"))]
-    pub fn invoke_command(
-        &mut self,
-        _handler_fn: &str,
-        _args: &str,
-    ) -> Result<Option<String>, String> {
-        Ok(None)
-    }
-
     /// Drain pending `(harness/notify ...)` entries as `(level, msg)`
     /// pairs in insertion order. The UI calls this each loop tick and
     /// renders entries as colored chat lines. Returns an empty Vec when
     /// no plugin has posted anything.
-    #[cfg(feature = "plugin")]
     pub fn drain_notifications(&mut self) -> Vec<(String, String)> {
-        let raw = match self.client.run("harness-notif-list") {
-            Ok(v) => v.to_string(),
+        let raw = match self.worker.eval("harness-notif-list") {
+            Ok(s) => s,
             Err(_) => return Vec::new(),
         };
         if raw.is_empty() {
@@ -1240,17 +1060,9 @@ impl PluginManager {
                 }
             })
             .collect();
-        // Atomic-ish clear: blank the slot after read so the next tick
-        // starts fresh. A plugin could race a write between our read and
-        // clear, but on a single-threaded runtime that can't happen since
-        // PluginManager methods serialize through the lock.
-        let _ = self.client.run(r#"(set harness-notif-list "")"#);
+        // Drain the slot after read so the next tick starts fresh.
+        let _ = self.worker.eval(r#"(set harness-notif-list "")"#);
         parsed
-    }
-
-    #[cfg(not(feature = "plugin"))]
-    pub fn drain_notifications(&mut self) -> Vec<(String, String)> {
-        Vec::new()
     }
 }
 

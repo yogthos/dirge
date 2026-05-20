@@ -293,6 +293,19 @@ async fn main() -> anyhow::Result<()> {
         plugin::hook::init_global(pm_arc.clone());
     }
 
+    // Pull the dialog-request receiver out of the PluginManager once,
+    // here, so we can hand it to the UI loop. After this point, calling
+    // take_dialog_rx again returns None — single owner by design. Always
+    // an Option so the UI signature is uniform across feature flags.
+    #[cfg(feature = "plugin")]
+    let dialog_rx = plugin_manager.as_ref().and_then(|pm| {
+        pm.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_dialog_rx()
+    });
+    #[cfg(not(feature = "plugin"))]
+    let dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<plugin::DialogRequest>> = None;
+
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;
@@ -520,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
             semantic_manager.as_ref(),
             #[cfg(feature = "plugin")]
             plugin_manager.as_ref(),
+            dialog_rx,
         )
         .await?;
     }

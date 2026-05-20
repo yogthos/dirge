@@ -266,6 +266,11 @@ pub async fn run_interactive(
     #[cfg(feature = "plugin")] plugin_manager: Option<
         &std::sync::Arc<std::sync::Mutex<PluginManager>>,
     >,
+    // Consumer end of the Janet worker's dialog channel. None for
+    // non-plugin builds (no worker, no channel). Always present as an
+    // Option so the `tokio::select!` arm can be unconditional —
+    // `tokio::select!` doesn't accept `cfg` attributes on its arms.
+    mut dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::plugin::DialogRequest>>,
 ) -> anyhow::Result<()> {
     let _guard = TerminalGuard::new()?;
 
@@ -2051,6 +2056,98 @@ pub async fn run_interactive(
                 if let Some(ref picker) = input.picker {
                     picker.draw(renderer.input_top_row())?;
                 }
+            }
+            Some(dialog_req) = async {
+                if let Some(rx) = dialog_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                // Plugin asked the user a question via harness/confirm or
+                // harness/select. The Janet worker thread is blocked on
+                // the reply channel; render the dialog, drive a synchronous
+                // key-read loop, then send the answer back. Other agent
+                // events keep queuing in their channels — they'll process
+                // after this arm returns.
+                use crate::plugin::{DialogReply, DialogRequest};
+                match dialog_req {
+                    DialogRequest::Confirm { title, question, reply } => {
+                        renderer.write_line(
+                            &format!("[plugin {}] {}", title, question),
+                            C_PERM,
+                        )?;
+                        renderer.write_line(
+                            "  (y) yes  (n) no  (ESC) cancel = no",
+                            C_PERM,
+                        )?;
+                        let answer = loop {
+                            tokio::select! {
+                                Some(ev) = user_rx.recv() => {
+                                    if let UserEvent::Key(key) = ev {
+                                        match key.code {
+                                            KeyCode::Char('y') | KeyCode::Char('Y') => break true,
+                                            KeyCode::Char('n')
+                                            | KeyCode::Char('N')
+                                            | KeyCode::Esc => break false,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        let _ = reply.send(DialogReply::Confirm(answer));
+                        renderer.write_line(
+                            &format!("  -> {}", if answer { "yes" } else { "no" }),
+                            Color::DarkGrey,
+                        )?;
+                    }
+                    DialogRequest::Select { title, options, reply } => {
+                        renderer.write_line(
+                            &format!("[plugin {}] pick one:", title),
+                            C_PERM,
+                        )?;
+                        for (i, opt) in options.iter().enumerate() {
+                            renderer.write_line(
+                                &format!("  {}: {}", i + 1, opt),
+                                C_PERM,
+                            )?;
+                        }
+                        renderer.write_line(
+                            "  (1-9) select  (ESC) cancel",
+                            C_PERM,
+                        )?;
+                        let answer: Option<String> = loop {
+                            tokio::select! {
+                                Some(ev) = user_rx.recv() => {
+                                    if let UserEvent::Key(key) = ev {
+                                        match key.code {
+                                            KeyCode::Char(c) if c.is_ascii_digit() => {
+                                                let idx = (c as u8 - b'0') as usize;
+                                                if idx >= 1 && idx <= options.len() {
+                                                    break Some(options[idx - 1].clone());
+                                                }
+                                            }
+                                            KeyCode::Esc => break None,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        let label = answer.as_deref().unwrap_or("(cancelled)").to_string();
+                        let _ = reply.send(DialogReply::Select(answer));
+                        renderer.write_line(
+                            &format!("  -> {}", label),
+                            Color::DarkGrey,
+                        )?;
+                    }
+                }
+                renderer.draw_bottom(
+                    &input,
+                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                    is_running,
+                )?;
             }
             Some(plan_req) = async {
                 if let Some(rx) = &mut plan_rx {

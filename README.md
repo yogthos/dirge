@@ -255,7 +255,16 @@ Janet scripts access harness capabilities through built-in functions:
 (harness/replace-prompt "rewritten user message")
 # Replaces the user's message for the current turn entirely.
 # Distinct from harness/request-prompt, which queues a follow-up turn.
+
+# Blocking user-input dialogs (rendered by the UI; safe to call from
+# any hook — the worker thread blocks while the UI handles the dialog):
+(harness/confirm "title" "really delete?")           # -> true|false
+(harness/select  "pick one" ["alpha" "beta" "gamma"]) # -> string|nil
 ```
+
+Plugins live in `~/.config/dirge/plugins/*.janet` (global) or
+`./.dirge/plugins/*.janet` (project-local). Janet runs on a dedicated
+worker thread so blocking dialogs don't freeze the UI.
 
 See `plugins/protected_paths.janet` for an example that blocks writes
 to sensitive paths and truncates oversized tool outputs.
