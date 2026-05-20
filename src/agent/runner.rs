@@ -12,6 +12,101 @@ use crate::agent::tools::ToolCache;
 use crate::event::AgentEvent;
 use crate::session::{MessageRole, Session};
 
+/// Turn-boundary detector. Rig's multi-turn stream is a flat sequence
+/// of assistant content + tool results + a final response; consumers
+/// downstream (plugin hooks in P3, session-tree branch accounting in
+/// P4) want to bracket per-turn observability. Track the boundaries
+/// here as a pure state machine so the integration with rig stays
+/// thin and the rules are unit-testable without spinning up an LLM.
+///
+/// One "turn" = one LLM call + the tool calls it dispatched + the
+/// tool results returning. A pure-text response is one turn; a run
+/// with two cycles of tool calls is two turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnState {
+    /// Before the first assistant content or between turns. `next_index`
+    /// is the index of the next turn that will open.
+    Idle { next_index: u32 },
+    /// Currently inside turn `index` — assistant content is streaming
+    /// or being collected. Stays in this state across multiple
+    /// Text/Reasoning/ToolCall events.
+    InTurn { index: u32 },
+    /// Inside turn `index`, after at least one tool result arrived.
+    /// The boundary is only emitted lazily — when the next assistant
+    /// content begins (→ TurnEnd index, then TurnStart index+1) or
+    /// when the stream ends (→ TurnEnd index). This avoids needing
+    /// lookahead to know whether more tool results are still coming.
+    AwaitingNext { index: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Boundary {
+    Start { index: u32 },
+    End { index: u32 },
+}
+
+#[derive(Debug)]
+pub(crate) struct TurnTracker {
+    state: TurnState,
+}
+
+impl TurnTracker {
+    pub fn new() -> Self {
+        Self {
+            state: TurnState::Idle { next_index: 0 },
+        }
+    }
+
+    /// Call before forwarding an assistant Text / Reasoning / ToolCall
+    /// event to the event channel. Returns the boundary events that
+    /// must be emitted *first* (typically a TurnStart, optionally a
+    /// preceding TurnEnd if we're transitioning from one turn to the
+    /// next after tool results arrived).
+    pub fn observe_assistant_content(&mut self) -> Vec<Boundary> {
+        match self.state {
+            TurnState::Idle { next_index } => {
+                self.state = TurnState::InTurn { index: next_index };
+                vec![Boundary::Start { index: next_index }]
+            }
+            TurnState::InTurn { .. } => Vec::new(),
+            TurnState::AwaitingNext { index } => {
+                let next = index + 1;
+                self.state = TurnState::InTurn { index: next };
+                vec![Boundary::End { index }, Boundary::Start { index: next }]
+            }
+        }
+    }
+
+    /// Call after forwarding a ToolResult event. Tool results don't
+    /// emit boundaries directly — only the *next* assistant content
+    /// (or stream end) does — so this just advances state.
+    pub fn observe_tool_result(&mut self) {
+        match self.state {
+            TurnState::InTurn { index } | TurnState::AwaitingNext { index } => {
+                self.state = TurnState::AwaitingNext { index };
+            }
+            TurnState::Idle { .. } => {
+                // Shouldn't happen in a well-formed rig stream — a tool
+                // result before any assistant content. Leave state alone.
+            }
+        }
+    }
+
+    /// Call when the stream terminates (FinalResponse, Error, or
+    /// interjection abort). Emits a closing TurnEnd if a turn is open.
+    pub fn observe_stream_end(&mut self) -> Vec<Boundary> {
+        match self.state {
+            TurnState::InTurn { index } | TurnState::AwaitingNext { index } => {
+                self.state = TurnState::Idle {
+                    next_index: index + 1,
+                };
+                vec![Boundary::End { index }]
+            }
+            TurnState::Idle { .. } => Vec::new(),
+        }
+    }
+}
+
 pub struct AgentRunner {
     pub event_rx: mpsc::Receiver<AgentEvent>,
     /// Handle to the spawned tokio task. The UI calls `abort()` on interrupt
@@ -82,10 +177,25 @@ where
     // be lost (the UI also tracks it, but echoing it here keeps the event
     // payload self-contained).
     let mut partial = String::new();
+    let mut turns = TurnTracker::new();
+
+    // Helper: forward any pending turn-boundary events. Called before
+    // assistant-content events (to emit TurnStart / TurnEnd+TurnStart)
+    // and at stream end (to emit a closing TurnEnd).
+    async fn flush_boundaries(boundaries: Vec<Boundary>, event_tx: &mpsc::Sender<AgentEvent>) {
+        for b in boundaries {
+            let ev = match b {
+                Boundary::Start { index } => AgentEvent::TurnStart { index },
+                Boundary::End { index } => AgentEvent::TurnEnd { index },
+            };
+            let _ = event_tx.send(ev).await;
+        }
+    }
 
     while let Some(item) = stream.next().await {
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+                flush_boundaries(turns.observe_assistant_content(), event_tx).await;
                 partial.push_str(&text.text);
                 let _ = event_tx
                     .send(AgentEvent::Token(CompactString::from(text.text)))
@@ -94,6 +204,7 @@ where
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
                 r,
             ))) => {
+                flush_boundaries(turns.observe_assistant_content(), event_tx).await;
                 let _ = event_tx
                     .send(AgentEvent::Reasoning(CompactString::new(r.display_text())))
                     .await;
@@ -102,6 +213,7 @@ where
                 tool_call,
                 ..
             })) => {
+                flush_boundaries(turns.observe_assistant_content(), event_tx).await;
                 outcome.had_tool_calls = true;
                 let _ = event_tx
                     .send(AgentEvent::ToolCall {
@@ -129,6 +241,7 @@ where
                         output: CompactString::from(output),
                     })
                     .await;
+                turns.observe_tool_result();
                 // Tool-result boundaries are the only safe place to honor an
                 // interjection: the LLM has just received the result and is
                 // about to plan its next action, so cutting here preserves
@@ -137,6 +250,7 @@ where
                     // Drain any further pending signals so a flurry of typing
                     // doesn't queue them up for the *next* run.
                     while interject_rx.try_recv().is_ok() {}
+                    flush_boundaries(turns.observe_stream_end(), event_tx).await;
                     let estimated_tokens = Session::estimate_tokens(&partial);
                     outcome.interjected = true;
                     let _ = event_tx
@@ -149,6 +263,7 @@ where
                 }
             }
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                flush_boundaries(turns.observe_stream_end(), event_tx).await;
                 let response_text = res.response();
                 let estimated_tokens = Session::estimate_tokens(response_text);
                 let _ = event_tx
@@ -161,12 +276,16 @@ where
                 return outcome;
             }
             Err(e) => {
+                flush_boundaries(turns.observe_stream_end(), event_tx).await;
                 outcome.error = Some(e.to_string());
                 return outcome;
             }
             _ => {}
         }
     }
+    // Stream ended without a FinalResponse (rare; usually means the
+    // provider closed the stream unexpectedly). Still close any open turn.
+    flush_boundaries(turns.observe_stream_end(), event_tx).await;
     outcome
 }
 
@@ -318,4 +437,137 @@ where
 
     println!();
     Ok(full_response)
+}
+
+#[cfg(test)]
+mod turn_tracker_tests {
+    use super::{Boundary, TurnTracker};
+
+    /// Pure-text response (no tool calls): TurnStart 0 fires on first
+    /// assistant content, TurnEnd 0 fires on stream end.
+    #[test]
+    fn pure_text_emits_one_turn_around_content() {
+        let mut t = TurnTracker::new();
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::Start { index: 0 }]
+        );
+        // Subsequent content in the same turn doesn't emit.
+        assert!(t.observe_assistant_content().is_empty());
+        assert!(t.observe_assistant_content().is_empty());
+        assert_eq!(t.observe_stream_end(), vec![Boundary::End { index: 0 }]);
+    }
+
+    /// Single tool call: turn 0 has text + tool call + tool result;
+    /// turn 1 starts on the next assistant content (post-tool reply).
+    #[test]
+    fn single_tool_call_produces_two_turns() {
+        let mut t = TurnTracker::new();
+        // Turn 0 opens on first assistant text.
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::Start { index: 0 }]
+        );
+        // Tool result mid-turn doesn't emit anything; it just primes the
+        // tracker for a possible next turn.
+        t.observe_tool_result();
+        // The next assistant content closes turn 0 and opens turn 1.
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::End { index: 0 }, Boundary::Start { index: 1 },]
+        );
+        // Stream end closes turn 1.
+        assert_eq!(t.observe_stream_end(), vec![Boundary::End { index: 1 }]);
+    }
+
+    /// Multiple tool calls in one turn (parallel tools): turn 0
+    /// receives several ToolResult events; only the final transition
+    /// (or stream end) advances the turn index.
+    #[test]
+    fn multiple_tool_results_collapse_into_one_turn_boundary() {
+        let mut t = TurnTracker::new();
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::Start { index: 0 }]
+        );
+        // Three tool results in a row — none emit boundaries.
+        t.observe_tool_result();
+        t.observe_tool_result();
+        t.observe_tool_result();
+        // Stream ends without a follow-up assistant message (e.g. agent
+        // chose not to continue). Single closing TurnEnd, index unchanged.
+        assert_eq!(t.observe_stream_end(), vec![Boundary::End { index: 0 }]);
+    }
+
+    /// Three back-to-back tool cycles produce three turns, with the
+    /// boundary indices counting up monotonically.
+    #[test]
+    fn alternating_text_and_tools_advances_turn_index() {
+        let mut t = TurnTracker::new();
+        // Turn 0
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::Start { index: 0 }]
+        );
+        t.observe_tool_result();
+        // → Turn 1
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::End { index: 0 }, Boundary::Start { index: 1 },]
+        );
+        t.observe_tool_result();
+        // → Turn 2
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::End { index: 1 }, Boundary::Start { index: 2 },]
+        );
+        assert_eq!(t.observe_stream_end(), vec![Boundary::End { index: 2 }]);
+    }
+
+    /// Empty stream (no assistant content, no tool results, just an
+    /// immediate end) emits no boundaries at all.
+    #[test]
+    fn empty_stream_emits_no_boundaries() {
+        let mut t = TurnTracker::new();
+        assert!(t.observe_stream_end().is_empty());
+    }
+
+    /// Stream end after assistant content but before any tool results
+    /// still closes the open turn. This is the "tool was called but
+    /// the run aborted before results came back" case.
+    #[test]
+    fn stream_end_during_tool_dispatch_still_closes_turn() {
+        let mut t = TurnTracker::new();
+        // Assistant emitted a tool call but no result yet.
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::Start { index: 0 }]
+        );
+        assert_eq!(t.observe_stream_end(), vec![Boundary::End { index: 0 }]);
+    }
+
+    /// Lone tool result with no preceding assistant content is silently
+    /// dropped (shouldn't happen with rig, but tracker stays robust).
+    #[test]
+    fn tool_result_without_open_turn_is_a_noop() {
+        let mut t = TurnTracker::new();
+        t.observe_tool_result();
+        // No turn was opened, so stream-end emits nothing either.
+        assert!(t.observe_stream_end().is_empty());
+    }
+
+    /// A fresh `observe_assistant_content` AFTER `observe_stream_end`
+    /// opens a new turn at index+1 — supports the runner's retry loop
+    /// where the same tracker survives across stream restarts.
+    #[test]
+    fn tracker_can_be_reused_across_stream_restarts() {
+        let mut t = TurnTracker::new();
+        t.observe_assistant_content(); // turn 0 start
+        t.observe_stream_end(); // turn 0 end
+        // Next stream's first content opens turn 1, not 0.
+        assert_eq!(
+            t.observe_assistant_content(),
+            vec![Boundary::Start { index: 1 }]
+        );
+    }
 }
