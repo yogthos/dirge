@@ -406,6 +406,26 @@ pub async fn run_interactive(
             lsp_manager.as_ref(),
         ));
 
+        // Drain any pending plugin notifications and surface each as a
+        // colored chat line. Done at loop top so notifications posted
+        // during a tool hook or slash command appear on the next event,
+        // not several events later.
+        #[cfg(feature = "plugin")]
+        if let Some(pm_arc) = crate::plugin::hook::global() {
+            let pending = {
+                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.drain_notifications()
+            };
+            for (level, msg) in pending {
+                let color = match level.as_str() {
+                    "warn" => Color::Yellow,
+                    "error" => C_ERROR,
+                    _ => Color::DarkGrey,
+                };
+                renderer.write_line(&format!("[plugin] {}", msg), color)?;
+            }
+        }
+
         tokio::select! {
             Some(ev) = user_rx.recv() => {
                 match ev {

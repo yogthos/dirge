@@ -524,6 +524,70 @@ mod tests {
         assert_eq!(result.block, Some("no".to_string()));
     }
 
+    // --- Phase 3: harness/notify ----------------------------------------
+
+    /// A single notify writes one entry the host can drain.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_notify_writes_one_entry() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/notify "hello" :info)"#).unwrap();
+        let pending = mgr.drain_notifications();
+        assert_eq!(pending, vec![("info".to_string(), "hello".to_string())]);
+        // Drained.
+        assert!(mgr.drain_notifications().is_empty());
+    }
+
+    /// Multiple notifies queue in call order.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_notify_preserves_order() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/notify "first" :info)"#).unwrap();
+        mgr.eval(r#"(harness/notify "second" :warn)"#).unwrap();
+        mgr.eval(r#"(harness/notify "third" :error)"#).unwrap();
+        let pending = mgr.drain_notifications();
+        assert_eq!(
+            pending,
+            vec![
+                ("info".to_string(), "first".to_string()),
+                ("warn".to_string(), "second".to_string()),
+                ("error".to_string(), "third".to_string()),
+            ]
+        );
+    }
+
+    /// Level defaults to "info" when omitted.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_notify_default_level_is_info() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/notify "no level given")"#).unwrap();
+        let pending = mgr.drain_notifications();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "info");
+    }
+
+    /// Non-string msg silently drops instead of crashing the plugin.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_notify_ignores_non_string_msg() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/notify 42 :warn)"#).unwrap();
+        assert!(mgr.drain_notifications().is_empty());
+    }
+
+    /// Unknown level falls back to "info" so plugins typo-ing the level
+    /// keyword still see their messages.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_notify_unknown_level_falls_back_to_info() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/notify "msg" :weird)"#).unwrap();
+        let pending = mgr.drain_notifications();
+        assert_eq!(pending, vec![("info".to_string(), "msg".to_string())]);
+    }
+
     // --- Phase 2: plugin-registered slash commands ----------------------
 
     /// `harness/register-command` records a (cmd-name, handler-fn) pair
@@ -752,6 +816,21 @@ impl PluginManager {
                   (when (and (string? name) (string? handler))
                     (set harness-cmd-list
                          (string harness-cmd-list name "|" handler "\n"))))
+
+                # Notification queue. Plugins call (harness/notify msg level?)
+                # to push a line into the host's chat display. Stored as a
+                # `level\tmsg\n` blob; the host's drain_notifications
+                # splits and clears in one round-trip.
+                (var harness-notif-list "")
+                (defn harness/notify [msg &opt level]
+                  (when (string? msg)
+                    (let [lvl (cond
+                                (or (= level :info) (= level "info")) "info"
+                                (or (= level :warn) (= level "warn")) "warn"
+                                (or (= level :error) (= level "error")) "error"
+                                "info")]
+                      (set harness-notif-list
+                           (string harness-notif-list lvl "\t" msg "\n")))))
             "#,
             );
 
@@ -1054,6 +1133,45 @@ impl PluginManager {
         _args: &str,
     ) -> Result<Option<String>, String> {
         Ok(None)
+    }
+
+    /// Drain pending `(harness/notify ...)` entries as `(level, msg)`
+    /// pairs in insertion order. The UI calls this each loop tick and
+    /// renders entries as colored chat lines. Returns an empty Vec when
+    /// no plugin has posted anything.
+    #[cfg(feature = "plugin")]
+    pub fn drain_notifications(&mut self) -> Vec<(String, String)> {
+        let raw = match self.client.run("harness-notif-list") {
+            Ok(v) => v.to_string(),
+            Err(_) => return Vec::new(),
+        };
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let parsed: Vec<(String, String)> = raw
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, '\t');
+                let level = parts.next()?.trim();
+                let msg = parts.next()?;
+                if level.is_empty() || msg.is_empty() {
+                    None
+                } else {
+                    Some((level.to_string(), msg.to_string()))
+                }
+            })
+            .collect();
+        // Atomic-ish clear: blank the slot after read so the next tick
+        // starts fresh. A plugin could race a write between our read and
+        // clear, but on a single-threaded runtime that can't happen since
+        // PluginManager methods serialize through the lock.
+        let _ = self.client.run(r#"(set harness-notif-list "")"#);
+        parsed
+    }
+
+    #[cfg(not(feature = "plugin"))]
+    pub fn drain_notifications(&mut self) -> Vec<(String, String)> {
+        Vec::new()
     }
 }
 

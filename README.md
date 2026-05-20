@@ -245,6 +245,11 @@ Janet scripts access harness capabilities through built-in functions:
 # Then define the handler. It receives one arg string and returns nil
 # or a string the chat will display.
 (defn handler-fn-name [args] (string "result: " args))
+
+# Notifications (fire-and-forget; rendered as colored chat lines):
+(harness/notify "msg")              # default :info, dim grey
+(harness/notify "watch out" :warn)  # yellow
+(harness/notify "broken" :error)    # red
 ```
 
 See `plugins/protected_paths.janet` for an example that blocks writes
