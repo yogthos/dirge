@@ -41,6 +41,12 @@ pub fn render_session(
     } else {
         cli.resolve_model(cfg)
     };
+    // Top padding rows. Without this, when the user scrolls all the
+    // way up, the banner's top border `╭───╮` sits pressed against
+    // the terminal's top edge, which reads as "cut off." Two blank
+    // rows give the eye breathing room above the banner.
+    renderer.write_line("", Color::Reset)?;
+    renderer.write_line("", Color::Reset)?;
     render_banner(renderer, &provider, &model)?;
     if context.agents.is_some() {
         renderer.write_line("░ loaded AGENTS.md", theme::dim())?;
