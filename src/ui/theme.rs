@@ -64,18 +64,21 @@ pub struct Theme {
 
 impl Theme {
     /// 80s-CRT phosphor green. Default. Errors red, warnings yellow.
+    /// No grey anywhere on the green axis — secondary tones use
+    /// DarkGreen so the whole display reads like a single-phosphor
+    /// monochrome monitor.
     pub const fn phosphor() -> Self {
         Theme {
             agent: Color::Green,
             user: Color::Green,
             system: Color::DarkGreen,
-            tool: Color::DarkGreen,
+            tool: Color::Green,
             perm: Color::Yellow,
             result: Color::DarkGreen,
             error: Color::Red,
             warn: Color::Yellow,
             accent: Color::Green,
-            dim: Color::DarkGrey,
+            dim: Color::DarkGreen,
             header: Color::Green,
             divider: Color::DarkGreen,
             banner_primary: Color::Green,

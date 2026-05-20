@@ -689,16 +689,24 @@ impl Renderer {
 
         let status_row = rows.saturating_sub(1);
         let input_top = rows.saturating_sub(self.input_rows + 1);
+        // Heavy block prompt indicator. While running, we tick a 4-stage
+        // gradient through the block characters to suggest a phosphor
+        // pulse — readable without becoming distracting.
         let prompt_main = if is_running {
             self.spinner_tick = !self.spinner_tick;
-            if self.spinner_tick { ". " } else { ": " }
+            // Two-state spinner using ░/▒ blocks so the eye registers
+            // motion at slow refresh rates.
+            if self.spinner_tick {
+                "▒▌ "
+            } else {
+                "░▌ "
+            }
         } else {
-            "> "
+            "▌▌ "
         };
-        // Continuation rows get a dimmer prompt. We mark the *first* visual
-        // row of the *first* logical line as the prompt row; everything else
-        // (later logical lines, wrapped continuations) gets the cont prefix.
-        let prompt_cont = "· ";
+        // Continuation rows show a fainter single-block guide so wrapped
+        // text reads as a vertical "chamber" attached to the prompt.
+        let prompt_cont = "▏  ";
 
         // Pre-collect chars per logical line so each visual row's slice can
         // be cut without re-iterating.
@@ -740,25 +748,28 @@ impl Renderer {
             "{}",
             SetForegroundColor(self.color(crate::ui::theme::dim()))
         )?;
-        let mut status_display = if self.scroll_offset > 0 {
-            format!("-- SCROLL -- {}", status)
+        // Status bar with bracketed BBS-style segments. Reads as a row
+        // of small chips: `▒░ STATUS ░▒  ▒░ NEXT ░▒  …` so each fact
+        // gets visual breathing room and the bar feels like a single
+        // designed element rather than dim flowing text.
+        let scroll_prefix = if self.scroll_offset > 0 {
+            "▒░ SCROLL ░▒  "
         } else {
-            status.to_string()
+            ""
         };
+        let mut status_display = format!("{}▒░ {} ░▒", scroll_prefix, status);
         if line_count > 1 || total_visual > MAX_INPUT_VISIBLE_LINES {
-            // Surface logical line count and visual-row overflow so the user
-            // knows there is content scrolled off the top of the input box.
             let hidden = total_visual.saturating_sub(visible_input_rows);
             if hidden > 0 {
                 status_display
-                    .push_str(&format!(" [{} lines, {} rows hidden]", line_count, hidden));
+                    .push_str(&format!("  ▒░ {} lines · {} hidden ░▒", line_count, hidden));
             } else if line_count > 1 {
-                status_display.push_str(&format!(" [{} lines]", line_count));
+                status_display.push_str(&format!("  ▒░ {} lines ░▒", line_count));
             }
         }
         let token_est = editor.expanded().len() as u64 / 4;
         if token_est > 0 {
-            status_display.push_str(&format!(" ({} tk)", token_est));
+            status_display.push_str(&format!("  ▒░ {} tk ░▒", token_est));
         }
         let truncated: String = status_display.chars().take(cols as usize).collect();
         write!(stdout, "{}", truncated)?;
@@ -858,15 +869,33 @@ impl Renderer {
             }
         };
 
-        // Header
-        out.push((truncate(&format!(" {}", d.cwd), width), Color::Cyan));
+        // Top header: gradient bar + SYS banner + cwd. The banner
+        // anchors the panel with the same aesthetic as the welcome
+        // banner so the eye treats both surfaces as one design system.
+        let bar_len = width.saturating_sub(1).max(4);
+        let top_bar: String = std::iter::repeat('▓')
+            .take(bar_len / 3)
+            .chain(std::iter::repeat('▒').take(bar_len / 3))
+            .chain(std::iter::repeat('░').take(bar_len - 2 * (bar_len / 3)))
+            .collect();
+        out.push((top_bar, Color::Cyan));
+        out.push((truncate(&format!(" ▒░ DIRGE.SYS ░▒"), width), Color::Cyan));
+        out.push((truncate(&format!(" {}", d.cwd), width), Color::White));
 
+        // Section helper: framed header `─[ NAME ]──…` then items.
+        // Empty sections render a single dimmed "  · (none)" line so
+        // the user sees the section is checked-and-empty rather than
+        // missing.
         let push_section =
             |out: &mut Vec<(String, Color)>, title: &str, items: Vec<(String, Color)>| {
                 out.push((String::new(), Color::Reset));
-                out.push((truncate(title, width), Color::Cyan));
+                let pre = format!("─[ {} ]", title);
+                let pre_len = pre.chars().count();
+                let dashes = width.saturating_sub(pre_len);
+                let header = format!("{}{}", pre, "─".repeat(dashes));
+                out.push((truncate(&header, width), Color::Cyan));
                 if items.is_empty() {
-                    out.push((truncate("  (none)", width), Color::DarkGrey));
+                    out.push((truncate("  · (none)", width), Color::Reset));
                 } else {
                     for (text, color) in items {
                         out.push((truncate(&text, width), color));
@@ -901,14 +930,14 @@ impl Renderer {
             .iter()
             .map(|(status, text)| (format!("  {} {}", status, text), Color::White))
             .collect();
-        push_section(&mut out, "Todos", todo_items);
+        push_section(&mut out, "TODOS", todo_items);
 
         let mod_items: Vec<(String, Color)> = d
             .modified
             .iter()
             .map(|p| (format!("  {}", p), Color::White))
             .collect();
-        push_section(&mut out, "Modified", mod_items);
+        push_section(&mut out, "MODIFIED", mod_items);
 
         out
     }
