@@ -18,11 +18,21 @@ use crate::session::{MessageRole, Session};
 use crate::ui::events::{format_time, render_session};
 use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
+use crate::ui::theme;
 use crate::ui::tree::{self, short_id};
 
-const C_AGENT: Color = Color::White;
-const C_RESULT: Color = Color::DarkGrey;
-const C_ERROR: Color = Color::Red;
+#[inline]
+fn c_agent() -> Color {
+    theme::agent()
+}
+#[inline]
+fn c_result() -> Color {
+    theme::result()
+}
+#[inline]
+fn c_error() -> Color {
+    theme::error()
+}
 
 pub fn undo_last(session: &mut Session) -> usize {
     let len = session.messages.len();
@@ -68,7 +78,7 @@ pub async fn handle_compress(
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
 ) -> anyhow::Result<()> {
-    renderer.write_line("compressing...", C_AGENT)?;
+    renderer.write_line("compressing...", c_agent())?;
     renderer.write_line("", Color::White)?;
 
     let reserve = cfg.resolve_reserve_tokens();
@@ -76,7 +86,7 @@ pub async fn handle_compress(
     let max_tokens = session.context_window.saturating_sub(reserve);
 
     if session.total_estimated_tokens <= max_tokens {
-        renderer.write_line("context within limits, no compression needed", C_AGENT)?;
+        renderer.write_line("context within limits, no compression needed", c_agent())?;
         return Ok(());
     }
 
@@ -91,7 +101,7 @@ pub async fn handle_compress(
     }
 
     if cut_idx == 0 {
-        renderer.write_line("nothing to compress (entire context is recent)", C_AGENT)?;
+        renderer.write_line("nothing to compress (entire context is recent)", c_agent())?;
         return Ok(());
     }
 
@@ -134,7 +144,7 @@ pub async fn handle_compress(
         semantic_manager,
     )
     .await;
-    renderer.write_line("prompt cleared (back to default behavior)", C_AGENT)?;
+    renderer.write_line("prompt cleared (back to default behavior)", c_agent())?;
 
     render_session(renderer, session, cli, cfg, context)?;
     renderer.write_line(
@@ -142,7 +152,7 @@ pub async fn handle_compress(
             "compressed {} messages (saved ~{} tokens)",
             cut_idx, tokens_before,
         ),
-        C_AGENT,
+        c_agent(),
     )?;
 
     Ok(())
@@ -174,7 +184,7 @@ pub async fn handle_slash(
     match parts[0] {
         "/model" => {
             if parts.len() < 2 {
-                renderer.write_line(&format!("current model: {}", session.model), C_AGENT)?;
+                renderer.write_line(&format!("current model: {}", session.model), c_agent())?;
             } else {
                 let new_model = CompactString::new(parts[1].trim());
                 let model = client.completion_model(new_model.to_string());
@@ -199,17 +209,17 @@ pub async fn handle_slash(
                 .await;
                 session.model = new_model.clone();
                 session.provider = cli.resolve_provider(cfg);
-                renderer.write_line(&format!("switched to model: {}", new_model), C_AGENT)?;
+                renderer.write_line(&format!("switched to model: {}", new_model), c_agent())?;
             }
         }
         "/sessions" => {
             if parts.len() < 2 {
                 let sessions = crate::session::storage::find_recent_sessions(20)?;
                 if sessions.is_empty() {
-                    renderer.write_line("no saved sessions", C_AGENT)?;
+                    renderer.write_line("no saved sessions", c_agent())?;
                 } else {
                     renderer
-                        .write_line(&format!("recent sessions ({}):", sessions.len()), C_AGENT)?;
+                        .write_line(&format!("recent sessions ({}):", sessions.len()), c_agent())?;
                     for s in &sessions {
                         let last = s
                             .messages
@@ -228,7 +238,7 @@ pub async fn handle_slash(
                                 s.model,
                                 last
                             ),
-                            C_RESULT,
+                            c_result(),
                         )?;
                     }
                 }
@@ -236,7 +246,7 @@ pub async fn handle_slash(
                 let prefix = parts[2].trim();
                 let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
                 if sessions.is_empty() {
-                    renderer.write_line(&format!("no session matching '{}'", prefix), C_AGENT)?;
+                    renderer.write_line(&format!("no session matching '{}'", prefix), c_agent())?;
                 } else if sessions.len() == 1 {
                     if let Some(s) = sessions.into_iter().next() {
                         let id = s.id.clone();
@@ -248,18 +258,18 @@ pub async fn handle_slash(
                             })
                             .unwrap_or_default();
                         if let Err(e) = crate::session::storage::delete_session(&id) {
-                            renderer.write_line(&format!("failed to delete: {}", e), C_ERROR)?;
+                            renderer.write_line(&format!("failed to delete: {}", e), c_error())?;
                         } else {
                             renderer.write_line(
                                 &format!("deleted session {} {}", &id[..8], preview),
-                                C_AGENT,
+                                c_agent(),
                             )?;
                         }
                     }
                 } else {
                     renderer.write_line(
                         &format!("multiple sessions match '{}', be more specific", prefix),
-                        C_AGENT,
+                        c_agent(),
                     )?;
                     for s in &sessions {
                         let last = s
@@ -279,7 +289,7 @@ pub async fn handle_slash(
                                 s.model,
                                 last
                             ),
-                            C_RESULT,
+                            c_result(),
                         )?;
                     }
                 }
@@ -287,18 +297,20 @@ pub async fn handle_slash(
                 let prefix = parts[1].trim();
                 let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
                 if sessions.is_empty() {
-                    renderer.write_line(&format!("no session matching '{}'", prefix), C_AGENT)?;
+                    renderer.write_line(&format!("no session matching '{}'", prefix), c_agent())?;
                 } else if sessions.len() == 1 {
                     if let Some(s) = sessions.into_iter().next() {
                         let msg_count = s.messages.len();
                         *session = s;
                         render_session(renderer, session, cli, cfg, context)?;
-                        renderer
-                            .write_line(&format!("loaded session ({} msgs)", msg_count), C_AGENT)?;
+                        renderer.write_line(
+                            &format!("loaded session ({} msgs)", msg_count),
+                            c_agent(),
+                        )?;
                     }
                 } else {
                     renderer
-                        .write_line(&format!("multiple sessions match '{}':", prefix), C_AGENT)?;
+                        .write_line(&format!("multiple sessions match '{}':", prefix), c_agent())?;
                     for s in &sessions {
                         let last = s
                             .messages
@@ -317,7 +329,7 @@ pub async fn handle_slash(
                                 s.model,
                                 last
                             ),
-                            C_RESULT,
+                            c_result(),
                         )?;
                     }
                 }
@@ -330,7 +342,7 @@ pub async fn handle_slash(
                     "reasoning visibility: {}",
                     if *show_reasoning { "on" } else { "off" }
                 ),
-                C_AGENT,
+                c_agent(),
             )?;
         }
         "/mode" => {
@@ -340,21 +352,24 @@ pub async fn handle_slash(
                 .unwrap_or(SecurityMode::Standard);
 
             if parts.len() < 2 {
-                renderer.write_line("security mode:", C_AGENT)?;
-                renderer.write_line(&format!("  current: {}", current_mode), C_RESULT)?;
-                renderer.write_line("", C_AGENT)?;
+                renderer.write_line("security mode:", c_agent())?;
+                renderer.write_line(&format!("  current: {}", current_mode), c_result())?;
+                renderer.write_line("", c_agent())?;
                 renderer.write_line(
                     "  /mode standard      use configured permission rules",
-                    C_RESULT,
-                )?;
-                renderer.write_line("  /mode restrictive   default all tools to ask", C_RESULT)?;
-                renderer.write_line(
-                    "  /mode accept        auto-accept within working directory",
-                    C_RESULT,
+                    c_result(),
                 )?;
                 renderer
-                    .write_line("  /mode yolo          auto-accept ALL operations", C_RESULT)?;
-                renderer.write_line("", C_AGENT)?;
+                    .write_line("  /mode restrictive   default all tools to ask", c_result())?;
+                renderer.write_line(
+                    "  /mode accept        auto-accept within working directory",
+                    c_result(),
+                )?;
+                renderer.write_line(
+                    "  /mode yolo          auto-accept ALL operations",
+                    c_result(),
+                )?;
+                renderer.write_line("", c_agent())?;
             } else {
                 match parts[1] {
                     "standard" => {
@@ -362,9 +377,9 @@ pub async fn handle_slash(
                             p.lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .set_mode(SecurityMode::Standard);
-                            renderer.write_line("security mode: standard", C_AGENT)?;
+                            renderer.write_line("security mode: standard", c_agent())?;
                         } else {
-                            renderer.write_line("permission system not active", C_ERROR)?;
+                            renderer.write_line("permission system not active", c_error())?;
                         }
                     }
                     "restrictive" => {
@@ -372,9 +387,9 @@ pub async fn handle_slash(
                             p.lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .set_mode(SecurityMode::Restrictive);
-                            renderer.write_line("security mode: restrictive", C_AGENT)?;
+                            renderer.write_line("security mode: restrictive", c_agent())?;
                         } else {
-                            renderer.write_line("permission system not active", C_ERROR)?;
+                            renderer.write_line("permission system not active", c_error())?;
                         }
                     }
                     "accept" => {
@@ -384,10 +399,10 @@ pub async fn handle_slash(
                                 .set_mode(SecurityMode::Accept);
                             renderer.write_line(
                                 "security mode: accept (auto-allow within CWD)",
-                                C_AGENT,
+                                c_agent(),
                             )?;
                         } else {
-                            renderer.write_line("permission system not active", C_ERROR)?;
+                            renderer.write_line("permission system not active", c_error())?;
                         }
                     }
                     "yolo" => {
@@ -397,14 +412,14 @@ pub async fn handle_slash(
                                 .set_mode(SecurityMode::Yolo);
                             renderer.write_line(
                                 "security mode: YOLO (all operations allowed)",
-                                C_AGENT,
+                                c_agent(),
                             )?;
                         } else {
-                            renderer.write_line("permission system not active", C_ERROR)?;
+                            renderer.write_line("permission system not active", c_error())?;
                         }
                     }
                     _ => {
-                        renderer.write_line(&format!("unknown mode: {}", parts[1]), C_ERROR)?;
+                        renderer.write_line(&format!("unknown mode: {}", parts[1]), c_error())?;
                     }
                 }
             }
@@ -412,25 +427,25 @@ pub async fn handle_slash(
         #[cfg(feature = "mcp")]
         "/mcp" => {
             let Some(mgr) = mcp_manager else {
-                renderer.write_line("no MCP servers configured", C_AGENT)?;
+                renderer.write_line("no MCP servers configured", c_agent())?;
                 return Ok(());
             };
             if mgr.handles.is_empty() {
-                renderer.write_line("no MCP servers connected", C_AGENT)?;
+                renderer.write_line("no MCP servers connected", c_agent())?;
             } else if parts.len() == 1 {
-                renderer.write_line("MCP servers:", C_AGENT)?;
+                renderer.write_line("MCP servers:", c_agent())?;
                 for handle in &mgr.handles {
                     match handle.list_tools().await {
                         Ok(tools) => {
                             renderer.write_line(
                                 &format!("  {} ({} tools)", handle.server_name, tools.len()),
-                                C_RESULT,
+                                c_result(),
                             )?;
                         }
                         Err(e) => {
                             renderer.write_line(
                                 &format!("  {} (error: {})", handle.server_name, e),
-                                C_ERROR,
+                                c_error(),
                             )?;
                         }
                     }
@@ -443,15 +458,15 @@ pub async fn handle_slash(
                             if tools.is_empty() {
                                 renderer.write_line(
                                     &format!("server '{}' has no tools", name),
-                                    C_AGENT,
+                                    c_agent(),
                                 )?;
                             } else {
-                                renderer.write_line(&format!("tools on '{}':", name), C_AGENT)?;
+                                renderer.write_line(&format!("tools on '{}':", name), c_agent())?;
                                 for tool in &tools {
                                     let desc = tool.description.as_deref().unwrap_or("");
                                     renderer.write_line(
                                         &format!("  {}  {}", tool.name, desc),
-                                        C_RESULT,
+                                        c_result(),
                                     )?;
                                 }
                             }
@@ -459,30 +474,32 @@ pub async fn handle_slash(
                         Err(e) => {
                             renderer.write_line(
                                 &format!("error listing tools on '{}': {}", name, e),
-                                C_ERROR,
+                                c_error(),
                             )?;
                         }
                     }
                 } else {
-                    renderer.write_line(&format!("unknown MCP server: '{}'", name), C_ERROR)?;
+                    renderer.write_line(&format!("unknown MCP server: '{}'", name), c_error())?;
                 }
             }
         }
         "/toggle" => {
             if parts.len() < 2 {
-                renderer.write_line("usage: /toggle <feature> [on|off]", C_AGENT)?;
-                renderer.write_line("features:", C_AGENT)?;
+                renderer.write_line("usage: /toggle <feature> [on|off]", c_agent())?;
+                renderer.write_line("features:", c_agent())?;
                 renderer.write_line(
                     &format!("  todo  {}", if *todo_tools_enabled { "on" } else { "off" }),
-                    C_RESULT,
+                    c_result(),
                 )?;
             } else {
                 let new_state = match parts.get(2).copied() {
                     Some("on") => true,
                     Some("off") => false,
                     Some(other) => {
-                        renderer
-                            .write_line(&format!("invalid: '{}', use on or off", other), C_ERROR)?;
+                        renderer.write_line(
+                            &format!("invalid: '{}', use on or off", other),
+                            c_error(),
+                        )?;
                         return Ok(());
                     }
                     None => !*todo_tools_enabled,
@@ -493,7 +510,7 @@ pub async fn handle_slash(
                             "todo tools already {}",
                             if new_state { "on" } else { "off" }
                         ),
-                        C_AGENT,
+                        c_agent(),
                     )?;
                 } else {
                     *todo_tools_enabled = new_state;
@@ -522,7 +539,7 @@ pub async fn handle_slash(
                             "todo tools: {}",
                             if *todo_tools_enabled { "on" } else { "off" }
                         ),
-                        C_AGENT,
+                        c_agent(),
                     )?;
                 }
             }
@@ -549,23 +566,23 @@ pub async fn handle_slash(
                                 ls.iteration_label(),
                                 ls.plan_file.display()
                             ),
-                            C_AGENT,
+                            c_agent(),
                         )?;
                     } else {
-                        renderer.write_line("no active loop", C_AGENT)?;
-                        renderer.write_line("usage: /loop <prompt>  |  /loop stop", C_RESULT)?;
+                        renderer.write_line("no active loop", c_agent())?;
+                        renderer.write_line("usage: /loop <prompt>  |  /loop stop", c_result())?;
                     }
                 } else if parts[1] == "stop" {
                     if let Some(ls) = loop_state {
                         ls.active = false;
-                        renderer.write_line("loop stopped", C_AGENT)?;
+                        renderer.write_line("loop stopped", c_agent())?;
                     } else {
-                        renderer.write_line("no active loop", C_AGENT)?;
+                        renderer.write_line("no active loop", c_agent())?;
                     }
                 } else {
                     let prompt = parts[1..].join(" ");
                     if prompt.is_empty() {
-                        renderer.write_line("usage: /loop <prompt>", C_ERROR)?;
+                        renderer.write_line("usage: /loop <prompt>", c_error())?;
                         return Ok(());
                     }
                     let plan_file = std::path::PathBuf::from("LOOP_PLAN.md");
@@ -573,7 +590,7 @@ pub async fn handle_slash(
                     *loop_state = Some(ls);
                     renderer.write_line(
                         "loop started — iteration 1 will run after this message",
-                        C_AGENT,
+                        c_agent(),
                     )?;
                 }
             }
@@ -581,7 +598,7 @@ pub async fn handle_slash(
             {
                 renderer.write_line(
                     "/loop requires the 'loop' feature: cargo build --features loop",
-                    C_ERROR,
+                    c_error(),
                 )?;
             }
         }
@@ -590,22 +607,22 @@ pub async fn handle_slash(
             sorted.sort();
             if parts.len() < 2 {
                 if sorted.is_empty() {
-                    renderer.write_line("no prompts available", C_AGENT)?;
+                    renderer.write_line("no prompts available", c_agent())?;
                 } else {
                     let current = context.current_prompt_name.as_deref().unwrap_or("(none)");
                     renderer.write_line(
                         &format!("available prompts (current: {}):", current),
-                        C_AGENT,
+                        c_agent(),
                     )?;
                     for name in &sorted {
-                        renderer.write_line(&format!("  {}", name), C_RESULT)?;
+                        renderer.write_line(&format!("  {}", name), c_result())?;
                     }
-                    renderer.write_line("", C_AGENT)?;
-                    renderer.write_line("usage: /prompt <name>  |  /prompt default", C_RESULT)?;
+                    renderer.write_line("", c_agent())?;
+                    renderer.write_line("usage: /prompt <name>  |  /prompt default", c_result())?;
                 }
             } else if parts[1] == "default" {
                 if context.current_prompt.is_none() {
-                    renderer.write_line("no active prompt to clear", C_AGENT)?;
+                    renderer.write_line("no active prompt to clear", c_agent())?;
                 } else {
                     context.current_prompt = None;
                     context.current_prompt_name = None;
@@ -655,13 +672,13 @@ pub async fn handle_slash(
                         semantic_manager,
                     )
                     .await;
-                    renderer.write_line(&format!("active prompt: {}", name), C_AGENT)?;
+                    renderer.write_line(&format!("active prompt: {}", name), c_agent())?;
                 } else {
-                    renderer.write_line(&format!("unknown prompt: '{}'", name), C_ERROR)?;
+                    renderer.write_line(&format!("unknown prompt: '{}'", name), c_error())?;
                     if !sorted.is_empty() {
-                        renderer.write_line("available prompts:", C_AGENT)?;
+                        renderer.write_line("available prompts:", c_agent())?;
                         for p in &sorted {
-                            renderer.write_line(&format!("  {}", p), C_RESULT)?;
+                            renderer.write_line(&format!("  {}", p), c_result())?;
                         }
                     }
                 }
@@ -670,14 +687,14 @@ pub async fn handle_slash(
         #[cfg(feature = "git-worktree")]
         "/worktree" => {
             if parts.len() < 2 {
-                renderer.write_line("usage: /worktree <name>", C_ERROR)?;
+                renderer.write_line("usage: /worktree <name>", c_error())?;
                 return Ok(());
             }
             let name = parts[1].trim();
             if name.is_empty() || name.contains(' ') || name.contains('/') {
                 renderer.write_line(
                     "invalid name: use a single word without spaces or slashes",
-                    C_ERROR,
+                    c_error(),
                 )?;
                 return Ok(());
             }
@@ -711,11 +728,11 @@ pub async fn handle_slash(
                     render_session(renderer, session, cli, cfg, context)?;
                     renderer.write_line(
                         &format!("worktree created: branch '{}' at {}", name, path.display()),
-                        C_AGENT,
+                        c_agent(),
                     )?;
                 }
                 Err(e) => {
-                    renderer.write_line(&format!("failed: {}", e), C_ERROR)?;
+                    renderer.write_line(&format!("failed: {}", e), c_error())?;
                 }
             }
         }
@@ -724,7 +741,7 @@ pub async fn handle_slash(
             let info = match crate::extras::git_worktree::detect() {
                 Some(i) => i,
                 None => {
-                    renderer.write_line("not in a git worktree", C_ERROR)?;
+                    renderer.write_line("not in a git worktree", c_error())?;
                     return Ok(());
                 }
             };
@@ -736,7 +753,7 @@ pub async fn handle_slash(
                     None => {
                         renderer.write_line(
                             "no target branch specified and couldn't detect main/master",
-                            C_ERROR,
+                            c_error(),
                         )?;
                         return Ok(());
                     }
@@ -750,7 +767,7 @@ pub async fn handle_slash(
                     "merging '{}' into '{}' in {}...",
                     info.branch, target, repo_name
                 ),
-                C_AGENT,
+                c_agent(),
             )?;
             return Err(anyhow::anyhow!(
                 "DEFER_WT_MERGE:{}:{}:{}:{}:{}",
@@ -766,12 +783,15 @@ pub async fn handle_slash(
             let info = match crate::extras::git_worktree::detect() {
                 Some(i) => i,
                 None => {
-                    renderer.write_line("not in a git worktree", C_ERROR)?;
+                    renderer.write_line("not in a git worktree", c_error())?;
                     return Ok(());
                 }
             };
             let main_path = info.main_repo_path.display();
-            renderer.write_line(&format!("returning to main repo at {}", main_path), C_AGENT)?;
+            renderer.write_line(
+                &format!("returning to main repo at {}", main_path),
+                c_agent(),
+            )?;
             return Err(anyhow::anyhow!(
                 "DEFER_WT_EXIT:{}:{}",
                 main_path,
@@ -781,10 +801,10 @@ pub async fn handle_slash(
         "/regen-prompts" => match crate::context::prompts::regen() {
             Ok(()) => {
                 context.prompts = crate::context::prompts::load();
-                renderer.write_line("default prompts regenerated", C_AGENT)?;
+                renderer.write_line("default prompts regenerated", c_agent())?;
             }
             Err(e) => {
-                renderer.write_line(&format!("failed to regenerate prompts: {}", e), C_ERROR)?;
+                renderer.write_line(&format!("failed to regenerate prompts: {}", e), c_error())?;
             }
         },
         "/quit" => {
@@ -813,26 +833,26 @@ pub async fn handle_slash(
             let arg = parts.get(1).copied().unwrap_or("").trim();
             if arg.is_empty() {
                 if session.tree.entries.is_empty() {
-                    renderer.write_line("(empty session)", C_AGENT)?;
+                    renderer.write_line("(empty session)", c_agent())?;
                 } else {
                     for line in tree::render_tree(session) {
-                        renderer.write_line(&line, C_RESULT)?;
+                        renderer.write_line(&line, c_result())?;
                     }
                 }
             } else {
                 match tree::resolve_id_prefix(session, arg) {
                     Ok(id) => {
                         if let Err(e) = session.switch_to_leaf(&id) {
-                            renderer.write_line(&format!("switch failed: {}", e), C_ERROR)?;
+                            renderer.write_line(&format!("switch failed: {}", e), c_error())?;
                         } else {
                             render_session(renderer, session, cli, cfg, context)?;
                             renderer.write_line(
                                 &format!("switched to leaf {}", short_id(&id)),
-                                C_AGENT,
+                                c_agent(),
                             )?;
                         }
                     }
-                    Err(e) => renderer.write_line(&format!("/tree: {}", e), C_ERROR)?,
+                    Err(e) => renderer.write_line(&format!("/tree: {}", e), c_error())?,
                 }
             }
         }
@@ -870,12 +890,12 @@ pub async fn handle_slash(
                                 "forked at {} — original prompt restored to editor",
                                 short_id(&id)
                             ),
-                            C_AGENT,
+                            c_agent(),
                         )?;
                     }
-                    Err(e) => renderer.write_line(&format!("/fork: {}", e), C_ERROR)?,
+                    Err(e) => renderer.write_line(&format!("/fork: {}", e), c_error())?,
                 },
-                Err(e) => renderer.write_line(&format!("/fork: {}", e), C_ERROR)?,
+                Err(e) => renderer.write_line(&format!("/fork: {}", e), c_error())?,
             }
         }
         "/clone" => {
@@ -886,7 +906,7 @@ pub async fn handle_slash(
             session.ensure_message_store_initialized();
             let arg = parts.get(1).copied().unwrap_or("").trim();
             if arg.is_empty() {
-                renderer.write_line("usage: /clone <id-prefix>", C_ERROR)?;
+                renderer.write_line("usage: /clone <id-prefix>", c_error())?;
             } else {
                 match tree::resolve_id_prefix(session, arg) {
                     Ok(id) => match session.clone_at(&id) {
@@ -894,12 +914,12 @@ pub async fn handle_slash(
                             render_session(renderer, session, cli, cfg, context)?;
                             renderer.write_line(
                                 &format!("cloned path through {}", short_id(&id)),
-                                C_AGENT,
+                                c_agent(),
                             )?;
                         }
-                        Err(e) => renderer.write_line(&format!("/clone: {}", e), C_ERROR)?,
+                        Err(e) => renderer.write_line(&format!("/clone: {}", e), c_error())?,
                     },
-                    Err(e) => renderer.write_line(&format!("/clone: {}", e), C_ERROR)?,
+                    Err(e) => renderer.write_line(&format!("/clone: {}", e), c_error())?,
                 }
             }
         }
@@ -914,7 +934,7 @@ pub async fn handle_slash(
                 other => {
                     renderer.write_line(
                         &format!("unknown /panel mode '{}' (use on|off|auto)", other),
-                        C_ERROR,
+                        c_error(),
                     )?;
                     return Ok(());
                 }
@@ -933,13 +953,13 @@ pub async fn handle_slash(
                     current,
                     if visible { "shown" } else { "hidden" }
                 ),
-                C_AGENT,
+                c_agent(),
             )?;
         }
         "/btw" => {
             let query = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
             if query.is_empty() {
-                renderer.write_line("usage: /btw <question>", C_ERROR)?;
+                renderer.write_line("usage: /btw <question>", c_error())?;
             } else {
                 let model = client.completion_model(session.model.to_string());
                 renderer.write_line(&format!("btw: {}", query), Color::DarkGrey)?;
@@ -954,7 +974,7 @@ pub async fn handle_slash(
                         renderer.write_line("", Color::White)?;
                     }
                     Err(e) => {
-                        renderer.write_line(&format!("btw error: {}", e), C_ERROR)?;
+                        renderer.write_line(&format!("btw error: {}", e), c_error())?;
                     }
                 }
             }
@@ -1004,11 +1024,11 @@ pub async fn handle_slash(
                     render_session(renderer, session, cli, cfg, context)?;
                     renderer.write_line(
                         &format!("changed directory to {}", session.working_dir),
-                        C_AGENT,
+                        c_agent(),
                     )?;
                 }
                 Err(e) => {
-                    renderer.write_line(&format!("cd: {}", e), C_ERROR)?;
+                    renderer.write_line(&format!("cd: {}", e), c_error())?;
                 }
             }
         }
@@ -1016,9 +1036,9 @@ pub async fn handle_slash(
             let removed = undo_last(session);
             if removed > 0 {
                 render_session(renderer, session, cli, cfg, context)?;
-                renderer.write_line(&format!("removed {} message(s)", removed), C_AGENT)?;
+                renderer.write_line(&format!("removed {} message(s)", removed), c_agent())?;
             } else {
-                renderer.write_line("nothing to undo", C_AGENT)?;
+                renderer.write_line("nothing to undo", c_agent())?;
             }
         }
         "/retry" => {
@@ -1032,149 +1052,152 @@ pub async fn handle_slash(
                 Some(msg) => {
                     input.buffer = msg.content.clone();
                     input.cursor = msg.content.len();
-                    renderer.write_line("edit last message and press Enter to retry", C_AGENT)?;
+                    renderer.write_line("edit last message and press Enter to retry", c_agent())?;
                 }
                 None => {
-                    renderer.write_line("no previous message to retry", C_AGENT)?;
+                    renderer.write_line("no previous message to retry", c_agent())?;
                 }
             }
         }
         "/help" => {
-            renderer.write_line("commands:", C_AGENT)?;
-            renderer.write_line("  /model [name]          show or switch model", C_RESULT)?;
-            renderer.write_line("  /sessions              list recent sessions", C_RESULT)?;
+            renderer.write_line("commands:", c_agent())?;
+            renderer.write_line("  /model [name]          show or switch model", c_result())?;
+            renderer.write_line("  /sessions              list recent sessions", c_result())?;
             renderer.write_line(
                 "  /sessions <id>         load a session (by ID prefix)",
-                C_RESULT,
+                c_result(),
             )?;
-            renderer.write_line("  /sessions delete <id>  delete a session", C_RESULT)?;
+            renderer.write_line("  /sessions delete <id>  delete a session", c_result())?;
             renderer.write_line(
                 "  /reasoning             toggle reasoning visibility",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /mode                  show/change security mode",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /mode <mode>           set mode (standard|restrictive|accept|yolo)",
-                C_RESULT,
+                c_result(),
             )?;
             #[cfg(feature = "mcp")]
             {
                 let _ = renderer.write_line(
                     "  /mcp                   list MCP servers and tools",
-                    C_RESULT,
+                    c_result(),
                 );
                 let _ = renderer.write_line(
                     "  /mcp <server>          list tools of an MCP server",
-                    C_RESULT,
+                    c_result(),
                 );
             }
             renderer.write_line(
                 "  /clear                 clear screen + reset tree",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /tree                  show the session tree (use /tree <id-prefix> to switch branches)",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /fork [id-prefix]      branch off at the chosen message (default: last user message)",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /clone <id-prefix>     switch to the branch ending at the chosen entry",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /panel [on|off|auto]   toggle right-hand info panel",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /cd [path]             change working directory",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /btw <question>        ask a quick question (no tools, doesn't affect session)",
-                C_RESULT,
+                c_result(),
             )?;
-            renderer.write_line("  /undo                  undo last exchange", C_RESULT)?;
-            renderer.write_line("  /retry                 retry last prompt", C_RESULT)?;
+            renderer.write_line("  /undo                  undo last exchange", c_result())?;
+            renderer.write_line("  /retry                 retry last prompt", c_result())?;
             renderer.write_line(
                 "  /compress [/compact]   compress conversation history",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  /compress [instr]      compress with custom instructions",
-                C_RESULT,
+                c_result(),
             )?;
             #[cfg(feature = "loop")]
             {
                 let _ = renderer.write_line(
                     "  /loop [prompt]         start iterative coding loop",
-                    C_RESULT,
+                    c_result(),
                 );
-                let _ = renderer.write_line("  /loop stop             stop the loop", C_RESULT);
+                let _ = renderer.write_line("  /loop stop             stop the loop", c_result());
             }
             #[cfg(not(feature = "loop"))]
             {
                 let _ = renderer.write_line(
                     "  /loop [prompt]         start iterative coding loop (req. 'loop' feature)",
-                    C_RESULT,
+                    c_result(),
                 );
             }
-            renderer.write_line("  /prompt                list available prompts", C_RESULT)?;
-            renderer.write_line("  /prompt <name>         activate a prompt", C_RESULT)?;
-            renderer.write_line("  /prompt default        clear active prompt", C_RESULT)?;
+            renderer.write_line(
+                "  /prompt                list available prompts",
+                c_result(),
+            )?;
+            renderer.write_line("  /prompt <name>         activate a prompt", c_result())?;
+            renderer.write_line("  /prompt default        clear active prompt", c_result())?;
             renderer.write_line(
                 "  /regen-prompts        restore built-in prompts to global dir",
-                C_RESULT,
+                c_result(),
             )?;
             #[cfg(feature = "git-worktree")]
             {
                 let _ = renderer.write_line(
                     "  /worktree <name>       create a git worktree on <name> branch and cd into it",
-                    C_RESULT,
+                    c_result(),
                 );
                 let _ = renderer.write_line(
                     "  /wt-merge [branch]     merge worktree branch into [branch] (default: main/master)",
-                    C_RESULT,
+                    c_result(),
                 );
                 let _ = renderer.write_line(
                     "  /wt-exit               exit worktree and return to main repo",
-                    C_RESULT,
+                    c_result(),
                 );
             }
-            renderer.write_line("  /quit                  exit dirge", C_RESULT)?;
-            renderer.write_line("  /help                  show this message", C_RESULT)?;
-            renderer.write_line("", C_AGENT)?;
-            renderer.write_line("keys:", C_AGENT)?;
-            renderer.write_line("  PgUp/PgDn             scroll chat history", C_RESULT)?;
-            renderer.write_line("  Home/End               jump to top/bottom", C_RESULT)?;
+            renderer.write_line("  /quit                  exit dirge", c_result())?;
+            renderer.write_line("  /help                  show this message", c_result())?;
+            renderer.write_line("", c_agent())?;
+            renderer.write_line("keys:", c_agent())?;
+            renderer.write_line("  PgUp/PgDn             scroll chat history", c_result())?;
+            renderer.write_line("  Home/End               jump to top/bottom", c_result())?;
             renderer.write_line(
                 "  @<query>               file picker (Tab/Enter select, Esc cancel)",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  mouse drag             select text (copies to clipboard on release)",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  Esc (while selected)   clear selection (no copy)",
-                C_RESULT,
+                c_result(),
             )?;
-            renderer.write_line("  Ctrl+R                 toggle reasoning", C_RESULT)?;
-            renderer.write_line("  Ctrl+C / Ctrl+D        interrupt/quit", C_RESULT)?;
+            renderer.write_line("  Ctrl+R                 toggle reasoning", c_result())?;
+            renderer.write_line("  Ctrl+C / Ctrl+D        interrupt/quit", c_result())?;
             renderer.write_line(
                 "  Ctrl+X                 drop last queued interjection",
-                C_RESULT,
+                c_result(),
             )?;
             renderer.write_line(
                 "  (type while agent runs to queue a follow-up message)",
-                C_RESULT,
+                c_result(),
             )?;
-            renderer.write_line("  mouse scroll           scroll chat", C_RESULT)?;
+            renderer.write_line("  mouse scroll           scroll chat", c_result())?;
 
             // Plugin-registered commands, if any. Listed last so they sit
             // visually after the built-ins and the keybindings.
@@ -1185,10 +1208,11 @@ pub async fn handle_slash(
                     mgr.list_commands()
                 };
                 if !cmds.is_empty() {
-                    renderer.write_line("", C_AGENT)?;
-                    renderer.write_line("plugin commands:", C_AGENT)?;
+                    renderer.write_line("", c_agent())?;
+                    renderer.write_line("plugin commands:", c_agent())?;
                     for (cmd, handler) in cmds {
-                        renderer.write_line(&format!("  /{:<20} -> {}", cmd, handler), C_RESULT)?;
+                        renderer
+                            .write_line(&format!("  /{:<20} -> {}", cmd, handler), c_result())?;
                     }
                 }
             }
@@ -1217,15 +1241,17 @@ pub async fn handle_slash(
                     match result {
                         Ok(Some(text)) => {
                             for line in text.lines() {
-                                renderer.write_line(line, C_AGENT)?;
+                                renderer.write_line(line, c_agent())?;
                             }
                         }
                         Ok(None) => {
                             // Handler ran cleanly but had nothing to say — no-op.
                         }
                         Err(e) => {
-                            renderer
-                                .write_line(&format!("[plugin] {} failed: {}", cmd, e), C_ERROR)?;
+                            renderer.write_line(
+                                &format!("[plugin] {} failed: {}", cmd, e),
+                                c_error(),
+                            )?;
                         }
                     }
                     return Ok(());
@@ -1233,7 +1259,7 @@ pub async fn handle_slash(
             }
             renderer.write_line(
                 &format!("unknown command: {} (try /help)", parts[0]),
-                C_ERROR,
+                c_error(),
             )?;
         }
     }

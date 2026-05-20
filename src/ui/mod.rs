@@ -10,6 +10,7 @@ mod status;
 #[cfg(feature = "plugin")]
 mod streaming;
 mod terminal;
+pub(crate) mod theme;
 mod tree;
 
 use std::collections::VecDeque;
@@ -48,10 +49,25 @@ use crate::ui::slash::{handle_compress, handle_slash};
 use crate::ui::status::StatusLine;
 use crate::ui::terminal::TerminalGuard;
 
-const C_AGENT: Color = Color::White;
-const C_ERROR: Color = Color::Red;
-const C_TOOL: Color = Color::Yellow;
-const C_PERM: Color = Color::Magenta;
+// Themed color accessors. These wrap `theme::agent()` etc. so we can
+// keep the existing call-site spelling (e.g. `c_agent()` is now a fn).
+// Active palette is set at startup via `theme::init`.
+#[inline]
+fn c_agent() -> Color {
+    theme::agent()
+}
+#[inline]
+fn c_error() -> Color {
+    theme::error()
+}
+#[inline]
+fn c_tool() -> Color {
+    theme::tool()
+}
+#[inline]
+fn c_perm() -> Color {
+    theme::perm()
+}
 
 /// Append a `q:N` queue-depth suffix to the status line when there are
 /// interjections waiting to be sent to the agent. Hidden when the queue
@@ -514,7 +530,7 @@ pub async fn run_interactive(
             for (level, msg) in pending {
                 let color = match level.as_str() {
                     "warn" => Color::Yellow,
-                    "error" => C_ERROR,
+                    "error" => c_error(),
                     _ => Color::DarkGrey,
                 };
                 renderer.write_line(&format!("[plugin] {}", msg), color)?;
@@ -564,10 +580,10 @@ pub async fn run_interactive(
                         renderer.write_line(&msg, Color::DarkGrey)?;
                     }
                     plugin_tree::TreeOpEffect::Failed(msg) => {
-                        renderer.write_line(&msg, C_ERROR)?;
+                        renderer.write_line(&msg, c_error())?;
                     }
                     plugin_tree::TreeOpEffect::SessionReplaced(msg) => {
-                        renderer.write_line(&msg, C_AGENT)?;
+                        renderer.write_line(&msg, c_agent())?;
                         any_session_replaced = true;
                     }
                 }
@@ -713,10 +729,10 @@ pub async fn run_interactive(
                                 if dropped > 0 {
                                     renderer.write_line(
                                         &format!("interrupted ({} queued message{} dropped)", dropped, if dropped == 1 { "" } else { "s" }),
-                                        C_ERROR,
+                                        c_error(),
                                     )?;
                                 } else {
-                                    renderer.write_line("interrupted", C_ERROR)?;
+                                    renderer.write_line("interrupted", c_error())?;
                                 }
                                 renderer.draw_bottom(
                                     &input,
@@ -869,7 +885,7 @@ pub async fn run_interactive(
                                 ls.active = false;
                                 loop_label = None;
                             }
-                            renderer.write_line("interrupted (Esc)", C_ERROR)?;
+                            renderer.write_line("interrupted (Esc)", c_error())?;
                             renderer.draw_bottom(
                                 &input,
                                 &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -1003,7 +1019,7 @@ pub async fn run_interactive(
                         if let Some(text) = input.handle_key(key) {
                             #[cfg(feature = "loop")]
                             if loop_state.as_ref().is_some_and(|ls| ls.active) && !text.starts_with('/') {
-                                renderer.write_line("loop active: /loop stop to cancel", C_ERROR)?;
+                                renderer.write_line("loop active: /loop stop to cancel", c_error())?;
                                 renderer.draw_bottom(
                                     &input,
                                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -1016,7 +1032,7 @@ pub async fn run_interactive(
                             }
                             if let Some(prefix) = shell::parse_shell_prefix(&text) {
                                 if is_running {
-                                    renderer.write_line("agent is busy, wait or interrupt first", C_ERROR)?;
+                                    renderer.write_line("agent is busy, wait or interrupt first", c_error())?;
                                     renderer.draw_bottom(
                                         &input,
                                         &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -1047,7 +1063,7 @@ pub async fn run_interactive(
                                                 is_running = true;
                                             }
                                             Err(e) => {
-                                                renderer.write_line(&format!("shell error: {}", e), C_ERROR)?;
+                                                renderer.write_line(&format!("shell error: {}", e), c_error())?;
                                             }
                                         }
                                     }
@@ -1057,7 +1073,7 @@ pub async fn run_interactive(
                                                 renderer.write_line(&output, Color::DarkGrey)?;
                                             }
                                             Err(e) => {
-                                                renderer.write_line(&format!("shell error: {}", e), C_ERROR)?;
+                                                renderer.write_line(&format!("shell error: {}", e), c_error())?;
                                             }
                                         }
                                     }
@@ -1074,7 +1090,7 @@ pub async fn run_interactive(
                                     text.split_whitespace().next().unwrap_or(""),
                                     "/quit" | "/help" | "/reasoning"
                                 ) {
-                                    renderer.write_line("agent is busy — wait, interrupt (Ctrl+C), or use /quit", C_ERROR)?;
+                                    renderer.write_line("agent is busy — wait, interrupt (Ctrl+C), or use /quit", c_error())?;
                                     renderer.draw_bottom(
                                         &input,
                                         &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -1103,12 +1119,12 @@ pub async fn run_interactive(
                                             #[cfg(feature = "semantic")] semantic_manager,
                                         ).await;
                                         if let Err(e) = compress_result {
-                                            renderer.write_line(&format!("compress error: {}", e), C_ERROR)?;
+                                            renderer.write_line(&format!("compress error: {}", e), c_error())?;
                                         }
                                         if let Err(e) = crate::session::storage::save_session(session) {
                                             renderer.write_line(
                                                 &format!("warning: failed to save session: {}", e),
-                                                C_ERROR,
+                                                c_error(),
                                             )?;
                                         }
                                     }
@@ -1172,7 +1188,7 @@ pub async fn run_interactive(
                                             render_session(&mut renderer, session, cli, cfg, context)?;
                                             renderer.write_line(
                                                 &format!("returned to main repo at {}", main_path),
-                                                C_AGENT,
+                                                c_agent(),
                                             )?;
                                         }
                                     }
@@ -1180,7 +1196,7 @@ pub async fn run_interactive(
                                         if e.downcast_ref::<std::io::Error>().is_some_and(|e: &std::io::Error| e.kind() == std::io::ErrorKind::Interrupted) {
                                             break;
                                         }
-                                        renderer.write_line(&format!("error: {}", e), C_ERROR)?;
+                                        renderer.write_line(&format!("error: {}", e), c_error())?;
                                     }
                                     Ok(_) => {
                                         if !cli.no_session
@@ -1188,7 +1204,7 @@ pub async fn run_interactive(
                                         {
                                             renderer.write_line(
                                                 &format!("warning: failed to save session: {}", e),
-                                                C_ERROR,
+                                                c_error(),
                                             )?;
                                         }
                                         #[cfg(feature = "loop")]
@@ -1214,7 +1230,7 @@ pub async fn run_interactive(
                                 {
                                     renderer.write_line(
                                         &format!("warning: failed to save session: {}", e),
-                                        C_ERROR,
+                                        c_error(),
                                     )?;
                                 }
                             } else if is_running {
@@ -1281,7 +1297,7 @@ pub async fn run_interactive(
                                         Err(e) => {
                                             renderer.write_line(
                                                 &format!("[plugin] on-prompt error: {e}"),
-                                                C_ERROR,
+                                                c_error(),
                                             )?;
                                         }
                                     }
@@ -1428,7 +1444,7 @@ pub async fn run_interactive(
                         response_buf.clear();
                         response_start_line = None;
                         let line = format!("◈ {}", format_tool_call_summary(&name, &args));
-                        renderer.write_line(&sanitize_output(&line), C_TOOL)?;
+                        renderer.write_line(&sanitize_output(&line), c_tool())?;
 
                         // Note: on-tool-start fires from HookedToolDyn now,
                         // around the actual tool invocation. The UI no
@@ -1527,7 +1543,7 @@ pub async fn run_interactive(
                                 Err(e) => {
                                     renderer.write_line(
                                         &format!("[plugin] on-response error: {e}"),
-                                        C_ERROR,
+                                        c_error(),
                                     )?;
                                 }
                             }
@@ -1553,7 +1569,7 @@ pub async fn run_interactive(
                                 renderer.render_viewport()?;
                             }
                         } else if !agent_line_started {
-                            renderer.write("< ", C_AGENT)?;
+                            renderer.write("< ", c_agent())?;
                         }
 
                         renderer.write_line("", Color::White)?;
@@ -1584,7 +1600,7 @@ pub async fn run_interactive(
                                 #[cfg(feature = "semantic")] semantic_manager,
                             ).await;
                             if let Err(e) = compress_result {
-                                renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;
+                                renderer.write_line(&format!("auto-compact error: {}", e), c_error())?;
                             }
                         }
 
@@ -1593,7 +1609,7 @@ pub async fn run_interactive(
                         {
                             renderer.write_line(
                                 &format!("warning: failed to save session: {}", e),
-                                C_ERROR,
+                                c_error(),
                             )?;
                         }
                         is_running = false;
@@ -1640,7 +1656,7 @@ pub async fn run_interactive(
                                             "[loop] max iterations ({}) reached, stopping",
                                             ls.iteration
                                         ),
-                                        C_AGENT,
+                                        c_agent(),
                                     )?;
                                     ls.active = false;
                                     loop_label = None;
@@ -1664,7 +1680,7 @@ pub async fn run_interactive(
                                     loop_label = Some(ls.iteration_label());
                                     renderer.write_line(
                                         &format!("[loop] launching {}", ls.iteration_label()),
-                                        C_AGENT,
+                                        c_agent(),
                                     )?;
                                 }
                             }
@@ -1697,13 +1713,13 @@ pub async fn run_interactive(
                                     render_session(&mut renderer, session, cli, cfg, context)?;
                                     renderer.write_line(
                                         &format!("merged and returned to main repo at {}", main_path),
-                                        C_AGENT,
+                                        c_agent(),
                                     )?;
                                 }
                                 Err(e) => {
                                     renderer.write_line(
                                         &format!("warning: failed to change back to main repo: {}", e),
-                                        C_ERROR,
+                                        c_error(),
                                     )?;
                                 }
                             }
@@ -1785,7 +1801,7 @@ pub async fn run_interactive(
                         {
                             renderer.write_line(
                                 &format!("warning: failed to save session: {}", e),
-                                C_ERROR,
+                                c_error(),
                             )?;
                         }
                         is_running = false;
@@ -1826,7 +1842,7 @@ pub async fn run_interactive(
                         was_reasoning = false;
                         last_tool_name = None;
                         let safe = sanitize_output(&e);
-                        renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
+                        renderer.write_line(&format!("error: {}", safe), c_error())?;
 
                         #[cfg(feature = "plugin")]
                         if let Some(pm) = plugin_manager {
@@ -1840,7 +1856,7 @@ pub async fn run_interactive(
                             ) {
                                 renderer.write_line(
                                     &format!("[plugin] on-error error: {dispatch_err}"),
-                                    C_ERROR,
+                                    c_error(),
                                 )?;
                             }
                         }
@@ -1866,7 +1882,7 @@ pub async fn run_interactive(
                                     dropped,
                                     if dropped == 1 { "" } else { "s" }
                                 ),
-                                C_ERROR,
+                                c_error(),
                             )?;
                         }
                     }
@@ -1955,11 +1971,11 @@ pub async fn run_interactive(
 
                 renderer.write_line(
                     &format!("[permission] {}: {}", ask_req.tool, ask_req.input),
-                    C_PERM,
+                    c_perm(),
                 )?;
                 renderer.write_line(
                     "  (y) allow once  (a) allow always  (n) deny  (ESC) abort",
-                    C_PERM,
+                    c_perm(),
                 )?;
 
                 let decision = loop {
@@ -1999,7 +2015,7 @@ pub async fn run_interactive(
                         if let Err(e) = crate::session::storage::save_session(session) {
                             renderer.write_line(
                                 &format!("warning: failed to save session: {}", e),
-                                C_ERROR,
+                                c_error(),
                             )?;
                         }
                     }
@@ -2036,7 +2052,7 @@ pub async fn run_interactive(
                 let (label, color) = match &lifecycle_evt {
                     LifecycleEvent::Started { id } => {
                         let short: String = id.chars().take(8).collect();
-                        (format!("[task {} started]", short), C_TOOL)
+                        (format!("[task {} started]", short), c_tool())
                     }
                     LifecycleEvent::Finished(notif) => {
                         let short: String = notif.id.chars().take(8).collect();
@@ -2046,7 +2062,7 @@ pub async fn run_interactive(
                             }
                             TS::Failed(err) => {
                                 let head = sanitize_single_line(err, 80);
-                                (format!("[task {} failed: {}]", short, head), C_ERROR)
+                                (format!("[task {} failed: {}]", short, head), c_error())
                             }
                             // Running is never queued for notification.
                             TS::Running => continue,
@@ -2086,12 +2102,12 @@ pub async fn run_interactive(
                     if let Some(header) = &question.header {
                         renderer.write_line(
                             &format!("\n--- {} ---", header),
-                            C_PERM,
+                            c_perm(),
                         )?;
                     }
                     renderer.write_line(
                         &format!("\n[question {}] {}", qi + 1, question.question),
-                        C_PERM,
+                        c_perm(),
                     )?;
 
                     let multi = question.multi_select.unwrap_or(false);
@@ -2127,7 +2143,7 @@ pub async fn run_interactive(
                                 text: compact_str::CompactString::new(
                                     &format!("  {} {} — {}", marker, opt.label, opt.description),
                                 ),
-                                color: C_PERM,
+                                color: c_perm(),
                             });
                         }
                         if custom {
@@ -2139,7 +2155,7 @@ pub async fn run_interactive(
                             };
                             lines.push(LineEntry {
                                 text: compact_str::CompactString::new(&custom_label),
-                                color: C_PERM,
+                                color: c_perm(),
                             });
                         }
                         lines.push(LineEntry {
@@ -2148,7 +2164,7 @@ pub async fn run_interactive(
                             } else {
                                 "  ↑↓ navigate  Enter select  Esc reject all"
                             }),
-                            color: C_PERM,
+                            color: c_perm(),
                         });
 
                         // Replace previous render with updated options
@@ -2178,7 +2194,7 @@ pub async fn run_interactive(
                                 if custom && cursor == num_options {
                                     // Custom text input (works for both single and multi)
                                     let mut buf = String::new();
-                                    renderer.write_line("  enter your answer:", C_PERM)?;
+                                    renderer.write_line("  enter your answer:", c_perm())?;
                                     let input_anchor = renderer.buffer_len();
                                     loop {
                                         renderer.replace_from(
@@ -2187,7 +2203,7 @@ pub async fn run_interactive(
                                                 text: compact_str::CompactString::new(
                                                     &format!("  > {}", buf),
                                                 ),
-                                                color: C_PERM,
+                                                color: c_perm(),
                                             }],
                                         );
                                         renderer.render_viewport()?;
@@ -2238,7 +2254,7 @@ pub async fn run_interactive(
                                     if picked.is_empty() {
                                         renderer.write_line(
                                             "  select at least one option",
-                                            C_PERM,
+                                            c_perm(),
                                         )?;
                                     } else {
                                         answers.push(picked);
@@ -2313,11 +2329,11 @@ pub async fn run_interactive(
                     DialogRequest::Confirm { title, question, reply } => {
                         renderer.write_line(
                             &format!("[plugin {}] {}", title, question),
-                            C_PERM,
+                            c_perm(),
                         )?;
                         renderer.write_line(
                             "  (y) yes  (n) no  (ESC) cancel = no",
-                            C_PERM,
+                            c_perm(),
                         )?;
                         let answer = loop {
                             tokio::select! {
@@ -2360,17 +2376,17 @@ pub async fn run_interactive(
                     DialogRequest::Select { title, options, reply } => {
                         renderer.write_line(
                             &format!("[plugin {}] pick one:", title),
-                            C_PERM,
+                            c_perm(),
                         )?;
                         for (i, opt) in options.iter().enumerate() {
                             renderer.write_line(
                                 &format!("  {}: {}", i + 1, opt),
-                                C_PERM,
+                                c_perm(),
                             )?;
                         }
                         renderer.write_line(
                             "  (1-9) select  (ESC) cancel",
-                            C_PERM,
+                            c_perm(),
                         )?;
                         let answer: Option<String> = loop {
                             tokio::select! {
@@ -2438,7 +2454,7 @@ pub async fn run_interactive(
 
                 renderer.write_line(
                     &format!("[plan] switch to {}? (y/n)", label),
-                    C_PERM,
+                    c_perm(),
                 )?;
 
                 let accepted = loop {
@@ -2492,7 +2508,7 @@ pub async fn run_interactive(
                         if let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
                             renderer.write_line(
                                 &format!("render error: {}", e),
-                                resolve_color(C_ERROR, cli.no_color),
+                                resolve_color(c_error(), cli.no_color),
                             )?;
                         }
                     }
@@ -2593,7 +2609,7 @@ fn update_search(renderer: &Renderer, query: &str, matches: &mut Vec<usize>, sel
 }
 
 fn draw_search_bar(query: &str, matches: &[usize], selected: usize) -> std::io::Result<()> {
-    use crossterm::style::{Color, ResetColor, SetForegroundColor};
+    use crossterm::style::{ResetColor, SetForegroundColor};
     use crossterm::terminal::{Clear, ClearType};
     use std::io::Write;
 
@@ -2606,7 +2622,7 @@ fn draw_search_bar(query: &str, matches: &[usize], selected: usize) -> std::io::
     };
     let bar = format!("Search: {} [{}]", query, indicator);
     crossterm::execute!(stdout, Clear(ClearType::CurrentLine))?;
-    crossterm::execute!(stdout, SetForegroundColor(Color::Cyan))?;
+    crossterm::execute!(stdout, SetForegroundColor(theme::accent()))?;
     write!(stdout, "\r\n")?;
     write!(stdout, "{}", bar)?;
     crossterm::execute!(stdout, ResetColor)?;
@@ -2650,7 +2666,7 @@ fn rewind_session(
         let removed = session.messages.len() - msg_idx;
         session.messages.truncate(msg_idx);
         session.total_estimated_tokens = session.messages.iter().map(|m| m.estimated_tokens).sum();
-        renderer.write_line(&format!("rewound {} message(s)", removed), Color::Cyan)?;
+        renderer.write_line(&format!("rewound {} message(s)", removed), theme::accent())?;
     }
     Ok(())
 }

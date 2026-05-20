@@ -8,6 +8,7 @@ use crate::context::ContextFiles;
 use crate::session::{MessageRole, Session};
 use crate::ui::markdown;
 use crate::ui::renderer::Renderer;
+use crate::ui::theme;
 
 pub fn format_time(rfc3339: &str) -> CompactString {
     let dt = chrono::DateTime::parse_from_rfc3339(rfc3339).ok();
@@ -40,22 +41,15 @@ pub fn render_session(
     } else {
         cli.resolve_model(cfg)
     };
-    let welcome = format!(
-        "dirge {}  {}  {}",
-        provider,
-        model,
-        env!("CARGO_PKG_VERSION")
-    );
-    renderer.write_line(&welcome, Color::Cyan)?;
-    renderer.write_line("", Color::White)?;
+    render_banner(renderer, &provider, &model)?;
     if context.agents.is_some() {
-        renderer.write_line("loaded AGENTS.md", Color::DarkGrey)?;
-        renderer.write_line("", Color::White)?;
+        renderer.write_line("░ loaded AGENTS.md", theme::dim())?;
+        renderer.write_line("", Color::Reset)?;
     }
     if !session.compactions.is_empty() {
         renderer.write_line(
             &format!(
-                "compacted {} times (saved ~{} tokens)",
+                "░ compacted {} times (saved ~{} tokens)",
                 session.compactions.len(),
                 session
                     .compactions
@@ -63,15 +57,15 @@ pub fn render_session(
                     .map(|c| c.token_savings)
                     .unwrap_or(0),
             ),
-            Color::DarkGrey,
+            theme::dim(),
         )?;
-        renderer.write_line("", Color::White)?;
+        renderer.write_line("", Color::Reset)?;
     }
     for msg in &session.messages {
-        let (prefix, _c) = match msg.role {
-            MessageRole::User => (">", Color::Green),
-            MessageRole::Assistant => ("<", Color::White),
-            MessageRole::System => ("#", Color::DarkGrey),
+        let (prefix, line_color) = match msg.role {
+            MessageRole::User => (">", theme::user()),
+            MessageRole::Assistant => ("<", theme::agent()),
+            MessageRole::System => ("#", theme::system()),
         };
         if msg.role == MessageRole::Assistant {
             let max_width = renderer.line_width();
@@ -84,12 +78,61 @@ pub fn render_session(
             }
         } else {
             for line in msg.content.lines() {
-                renderer.write_line(&format!("{} {}", prefix, line), _c)?;
+                renderer.write_line(&format!("{} {}", prefix, line), line_color)?;
             }
         }
-        renderer.write_line("", Color::White)?;
+        renderer.write_line("", Color::Reset)?;
     }
     Ok(())
+}
+
+/// 80s-CRT welcome banner. Four lines: top border, wordmark + theme +
+/// version, provider/model summary, bottom border. Width clamps to the
+/// terminal so narrow windows don't see overrunning box-drawing chars.
+fn render_banner(renderer: &mut Renderer, provider: &str, model: &str) -> anyhow::Result<()> {
+    let label = theme::current().label;
+    let version = env!("CARGO_PKG_VERSION");
+    let title = format!("░ DIRGE ░ {} ░ v{}", label, version);
+    let subtitle = format!("provider: {} · model: {}", provider, model);
+    // Inner width = max content length + 2 padding on each side.
+    // Clamp to terminal width − 4 (margin) so we don't push the banner
+    // past the visible region.
+    let term_w = renderer.line_width().max(20);
+    let max_inner = term_w.saturating_sub(4);
+    let inner = title
+        .chars()
+        .count()
+        .max(subtitle.chars().count())
+        .min(max_inner);
+    let inner_width = inner + 2; // single-space padding each side
+
+    let border_top = format!("╔{}╗", "═".repeat(inner_width));
+    let border_bot = format!("╚{}╝", "═".repeat(inner_width));
+    let title_line = format!("║ {:width$} ║", truncate(&title, inner), width = inner);
+    let sub_line = format!("║ {:width$} ║", truncate(&subtitle, inner), width = inner);
+
+    renderer.write_line(&border_top, theme::banner_secondary())?;
+    renderer.write_line(&title_line, theme::banner_primary())?;
+    renderer.write_line(&sub_line, theme::banner_secondary())?;
+    renderer.write_line(&border_bot, theme::banner_secondary())?;
+    renderer.write_line("", Color::Reset)?;
+    Ok(())
+}
+
+/// Truncate a string to `max` *characters* (not bytes), adding an
+/// ellipsis when shortened. Used by the banner so wordmarks stay
+/// inside the box drawing.
+fn truncate(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else if max <= 1 {
+        s.chars().take(max).collect()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
 }
 
 pub fn sanitize_output(text: &str) -> CompactString {

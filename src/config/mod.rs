@@ -104,6 +104,10 @@ pub struct Config {
     pub show_edit_diff: Option<bool>,
     pub tool_result_max_chars: Option<usize>,
     pub default_prompt: Option<String>,
+    /// UI color theme. Known values: `phosphor` (default, 80s CRT
+    /// green) and `plain` (the pre-theme white/cyan look). Unknown
+    /// values fall back to `phosphor` with a warning.
+    pub theme: Option<String>,
     pub tools: Option<ToolsConfig>,
     #[cfg(feature = "lsp")]
     pub lsp: Option<LspConfig>,

@@ -83,17 +83,26 @@ impl ListPicker {
     pub fn draw(&self) -> std::io::Result<()> {
         use std::io::Write;
         let mut stdout = std::io::stdout();
-        crossterm::execute!(stdout, SetForegroundColor(self.color(Color::Cyan)),)?;
+        crossterm::execute!(
+            stdout,
+            SetForegroundColor(self.color(crate::ui::theme::accent())),
+        )?;
         writeln!(stdout, "  {}", self.prompt)?;
         writeln!(stdout)?;
 
         for (i, item) in self.items.iter().enumerate() {
             let truncated: String = item.chars().take(60).collect();
             if i == self.selected {
-                crossterm::execute!(stdout, SetForegroundColor(self.color(Color::Green)),)?;
+                crossterm::execute!(
+                    stdout,
+                    SetForegroundColor(self.color(crate::ui::theme::accent())),
+                )?;
                 writeln!(stdout, " ▸ {}", truncated)?;
             } else {
-                crossterm::execute!(stdout, SetForegroundColor(self.color(Color::DarkGrey)),)?;
+                crossterm::execute!(
+                    stdout,
+                    SetForegroundColor(self.color(crate::ui::theme::dim())),
+                )?;
                 writeln!(stdout, "   {}", truncated)?;
             }
         }
@@ -247,7 +256,7 @@ impl FilePicker {
             write!(
                 stdout,
                 "{}",
-                SetForegroundColor(self.color(Color::DarkGrey))
+                SetForegroundColor(self.color(crate::ui::theme::dim()))
             )?;
             write!(stdout, "{}", "no matches")?;
             write!(stdout, "{}", ResetColor)?;
@@ -281,13 +290,17 @@ impl FilePicker {
                 .collect();
 
             if i == self.selected {
-                write!(stdout, "{}", SetForegroundColor(self.color(Color::Green)))?;
+                write!(
+                    stdout,
+                    "{}",
+                    SetForegroundColor(self.color(crate::ui::theme::accent()))
+                )?;
                 write!(stdout, "▸ {}", truncated)?;
             } else {
                 write!(
                     stdout,
                     "{}",
-                    SetForegroundColor(self.color(Color::DarkGrey))
+                    SetForegroundColor(self.color(crate::ui::theme::dim()))
                 )?;
                 write!(stdout, "  {}", truncated)?;
             }

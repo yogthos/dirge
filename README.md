@@ -301,6 +301,16 @@ Session allowlists persist approvals for the session. Doom-loop detection trigge
 
 See [CONFIG.md](CONFIG.md) for config file location, accepted keys, provider aliases, permission rules, and MCP server configuration.
 
+### UI theme
+
+dirge ships with an 80s-CRT phosphor green palette by default. To opt out, set `"theme": "plain"` in `config.json` for the pre-theme white/cyan look:
+
+```json
+{ "theme": "plain" }
+```
+
+Errors stay red and warnings stay yellow under every theme — those colors are part of the load-bearing semantic contract.
+
 ## Supported providers
 
 - OpenRouter (default)

@@ -431,7 +431,7 @@ impl Renderer {
             write!(
                 stdout,
                 "{}",
-                SetForegroundColor(self.color(Color::DarkYellow))
+                SetForegroundColor(self.color(crate::ui::theme::warn()))
             )?;
             write!(stdout, "{}", indicator)?;
             write!(stdout, "{}", ResetColor)?;
@@ -711,7 +711,11 @@ impl Renderer {
             stdout.execute(MoveTo(0, row))?;
             write!(stdout, "{}", " ".repeat(cols as usize))?;
             stdout.execute(MoveTo(0, row))?;
-            write!(stdout, "{}", SetForegroundColor(self.color(Color::Cyan)))?;
+            write!(
+                stdout,
+                "{}",
+                SetForegroundColor(self.color(crate::ui::theme::accent()))
+            )?;
             let is_prompt_row = vr_idx == 0;
             if is_prompt_row {
                 write!(stdout, "{}", prompt_main)?;
@@ -734,7 +738,7 @@ impl Renderer {
         write!(
             stdout,
             "{}",
-            SetForegroundColor(self.color(Color::DarkGrey))
+            SetForegroundColor(self.color(crate::ui::theme::dim()))
         )?;
         let mut status_display = if self.scroll_offset > 0 {
             format!("-- SCROLL -- {}", status)
@@ -795,9 +799,15 @@ impl Renderer {
         // paint top-to-bottom up to last_row-1.
         let lines = self.build_panel_lines(width);
 
-        let divider_color = self.color(Color::DarkGrey);
-        let header_color = self.color(Color::Cyan);
-        let dim = self.color(Color::DarkGrey);
+        // Themed panel colors. Source lines still use the legacy
+        // sentinels (Color::Cyan = header, Color::Reset = dim,
+        // Color::White = body, Color::Green/Red = status); the paint
+        // stage remaps them to the active theme so the phosphor look
+        // applies without rewriting `build_panel_lines`.
+        let divider_color = self.color(crate::ui::theme::divider());
+        let header_color = self.color(crate::ui::theme::header());
+        let dim = self.color(crate::ui::theme::dim());
+        let body = self.color(crate::ui::theme::agent());
 
         for row in 0..last_row {
             stdout.execute(MoveTo(divider_x, row))?;
@@ -807,11 +817,11 @@ impl Renderer {
 
             stdout.execute(MoveTo(panel_x, row))?;
             if let Some((text, color)) = lines.get(row as usize) {
-                let c = if *color == Color::Reset { dim } else { *color };
-                let painted = if *color == Color::Cyan {
-                    header_color
-                } else {
-                    c
+                let painted = match *color {
+                    Color::Cyan => header_color,
+                    Color::Reset | Color::DarkGrey => dim,
+                    Color::White => body,
+                    other => self.color(other),
                 };
                 write!(stdout, "{}", SetForegroundColor(painted))?;
                 write!(stdout, "{}", text)?;

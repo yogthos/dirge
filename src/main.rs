@@ -194,6 +194,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = cli::Cli::parse();
     let cfg = config::load();
+    // Initialize the global UI theme before any rendering happens. The
+    // theme is global state; setting it once at boot keeps every
+    // render site from having to thread it explicitly.
+    ui::theme::init(cfg.theme.as_deref().unwrap_or("phosphor"));
     let mut context = context::load(cli.resolve_no_context_files(&cfg));
 
     let default_prompt = cfg.default_prompt.as_deref().unwrap_or("code");
