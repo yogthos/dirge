@@ -1106,6 +1106,188 @@ mod tests {
         // Trailing backslash at end of field is preserved.
         assert_eq!(super::unescape_harness_field("a\\"), "a\\");
     }
+
+    // --- Phase 4d: session-tree harness ops ------------------------------
+
+    /// `harness/set-label "node" "label"` queues a SetLabel op with
+    /// the literal label.
+    #[test]
+    fn harness_set_label_queues_op() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/set-label "node-abc" "checkpoint")"#)
+            .unwrap();
+        let ops = mgr.drain_tree_ops();
+        assert_eq!(
+            ops,
+            vec![TreeOp::SetLabel {
+                id: "node-abc".to_string(),
+                label: Some("checkpoint".to_string()),
+            }]
+        );
+        // Drained = next call returns empty.
+        assert!(mgr.drain_tree_ops().is_empty());
+    }
+
+    /// Passing nil for the label clears it (label is None on the op).
+    #[test]
+    fn harness_set_label_with_nil_clears() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/set-label "node-abc" nil)"#).unwrap();
+        let ops = mgr.drain_tree_ops();
+        assert_eq!(
+            ops,
+            vec![TreeOp::SetLabel {
+                id: "node-abc".to_string(),
+                label: None,
+            }]
+        );
+    }
+
+    /// `harness/fork "id"` with no position arg defaults to :before
+    /// (restore prompt text into editor).
+    #[test]
+    fn harness_fork_defaults_to_restore_text() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/fork "node-1")"#).unwrap();
+        let ops = mgr.drain_tree_ops();
+        assert_eq!(
+            ops,
+            vec![TreeOp::Fork {
+                id: "node-1".to_string(),
+                restore_text: true,
+            }]
+        );
+    }
+
+    /// `harness/fork "id" :at` opts out of editor restoration.
+    #[test]
+    fn harness_fork_at_position_does_not_restore_text() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/fork "node-1" :at)"#).unwrap();
+        let ops = mgr.drain_tree_ops();
+        assert_eq!(
+            ops,
+            vec![TreeOp::Fork {
+                id: "node-1".to_string(),
+                restore_text: false,
+            }]
+        );
+    }
+
+    /// `harness/navigate-tree "id"` queues a NavigateTree op.
+    #[test]
+    fn harness_navigate_tree_queues_op() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/navigate-tree "tip")"#).unwrap();
+        assert_eq!(
+            mgr.drain_tree_ops(),
+            vec![TreeOp::NavigateTree {
+                id: "tip".to_string(),
+            }]
+        );
+    }
+
+    /// `harness/new-session` with no parent stores no lineage.
+    #[test]
+    fn harness_new_session_without_parent_has_none() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/new-session)"#).unwrap();
+        assert_eq!(
+            mgr.drain_tree_ops(),
+            vec![TreeOp::NewSession { parent: None }]
+        );
+    }
+
+    /// `harness/new-session "parent-id"` records the parent for
+    /// lineage tracking.
+    #[test]
+    fn harness_new_session_with_parent_records_lineage() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/new-session "prev-session-uuid")"#)
+            .unwrap();
+        assert_eq!(
+            mgr.drain_tree_ops(),
+            vec![TreeOp::NewSession {
+                parent: Some("prev-session-uuid".to_string())
+            }]
+        );
+    }
+
+    /// `harness/switch-session "id-prefix"` queues a SwitchSession op.
+    #[test]
+    fn harness_switch_session_queues_op() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/switch-session "abc12345")"#).unwrap();
+        assert_eq!(
+            mgr.drain_tree_ops(),
+            vec![TreeOp::SwitchSession {
+                id_prefix: "abc12345".to_string(),
+            }]
+        );
+    }
+
+    /// Multiple ops queued in one eval drain in insertion order.
+    /// Order matters: the host applies sequentially (e.g. set-label
+    /// then fork should land the label before the branch shift).
+    #[test]
+    fn drain_tree_ops_preserves_insertion_order() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(do
+                 (harness/set-label "a" "first")
+                 (harness/fork "b")
+                 (harness/navigate-tree "c"))"#,
+        )
+        .unwrap();
+        let ops = mgr.drain_tree_ops();
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(&ops[0], TreeOp::SetLabel { id, .. } if id == "a"));
+        assert!(matches!(&ops[1], TreeOp::Fork { id, .. } if id == "b"));
+        assert!(matches!(&ops[2], TreeOp::NavigateTree { id, .. } if id == "c"));
+    }
+
+    /// Ids/labels with embedded tabs and newlines round-trip cleanly —
+    /// harness/-escape ensures the tab-separated wire format isn't
+    /// corrupted by plugin payloads.
+    #[test]
+    fn drain_tree_ops_unescapes_payload_chars() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        // \t in the label arg has to survive parsing.
+        mgr.eval(r#"(harness/set-label "id" "with\ttab\nnewline")"#)
+            .unwrap();
+        let ops = mgr.drain_tree_ops();
+        assert_eq!(
+            ops,
+            vec![TreeOp::SetLabel {
+                id: "id".to_string(),
+                label: Some("with\ttab\nnewline".to_string()),
+            }]
+        );
+    }
+
+    /// Non-string args are silently dropped (matches the rest of the
+    /// harness — bad type = no-op, not a panic).
+    #[test]
+    fn harness_tree_ops_reject_non_string_ids() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/set-label 42 "label")"#).unwrap();
+        mgr.eval(r#"(harness/fork nil)"#).unwrap();
+        mgr.eval(r#"(harness/navigate-tree :keyword)"#).unwrap();
+        assert!(mgr.drain_tree_ops().is_empty());
+    }
+
+    /// Unknown op verbs (forward-compat from a newer plugin) are
+    /// skipped rather than poisoning the rest of the drain.
+    #[test]
+    fn drain_tree_ops_skips_unknown_op_verbs() {
+        // Drive harness-tree-ops directly to simulate a future op.
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(set harness-tree-ops "future-op\tfoo\nset-label\tnode\tlbl\n")"#)
+            .unwrap();
+        let ops = mgr.drain_tree_ops();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], TreeOp::SetLabel { .. }));
+    }
 }
 
 use std::collections::HashMap;
@@ -1576,6 +1758,97 @@ impl PluginManager {
             .collect();
         let _ = self.worker.eval(r#"(set harness-render-buf "")"#);
         Ok(parsed)
+    }
+
+    /// Drain pending session-tree ops queued by plugins via the
+    /// `harness/set-label`, `harness/fork`, `harness/navigate-tree`,
+    /// `harness/new-session`, `harness/switch-session` APIs (P4d).
+    ///
+    /// The buffer is `op\targ1[\targ2]\n` per line; arguments are
+    /// `harness/-escape`d so embedded tabs/newlines round-trip. Lines
+    /// the host doesn't recognize are skipped (forward compat — a newer
+    /// plugin shipping an op the host doesn't know yet is silently
+    /// ignored rather than blowing up the whole queue).
+    pub fn drain_tree_ops(&mut self) -> Vec<TreeOp> {
+        let raw = match self.worker.eval("harness-tree-ops") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let parsed: Vec<TreeOp> = raw.lines().filter_map(parse_tree_op_line).collect();
+        let _ = self.worker.eval(r#"(set harness-tree-ops "")"#);
+        parsed
+    }
+}
+
+/// Plugin-issued session-tree mutation. Carries the args as Strings so
+/// the UI dispatch layer can resolve id-prefixes / persist the previous
+/// session / etc., before applying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+pub enum TreeOp {
+    /// `harness/set-label <id> <label-or-empty>`. Empty label = clear.
+    SetLabel { id: String, label: Option<String> },
+    /// `harness/fork <id> <position>`. position is "before" or "at".
+    Fork { id: String, restore_text: bool },
+    /// `harness/navigate-tree <id>`.
+    NavigateTree { id: String },
+    /// `harness/new-session [parent-session]`. parent empty = no lineage.
+    NewSession { parent: Option<String> },
+    /// `harness/switch-session <session-id-prefix>`.
+    SwitchSession { id_prefix: String },
+}
+
+fn parse_tree_op_line(line: &str) -> Option<TreeOp> {
+    let mut parts = line.split('\t');
+    let op = parts.next()?.trim();
+    if op.is_empty() {
+        return None;
+    }
+    let arg1 = parts.next().map(unescape_harness_field).unwrap_or_default();
+    let arg2 = parts.next().map(unescape_harness_field).unwrap_or_default();
+    match op {
+        "set-label" => {
+            if arg1.is_empty() {
+                None
+            } else {
+                Some(TreeOp::SetLabel {
+                    id: arg1,
+                    label: if arg2.is_empty() { None } else { Some(arg2) },
+                })
+            }
+        }
+        "fork" => {
+            if arg1.is_empty() {
+                None
+            } else {
+                Some(TreeOp::Fork {
+                    id: arg1,
+                    // Plugins choosing :at opt out of editor restoration.
+                    restore_text: arg2 != "at",
+                })
+            }
+        }
+        "navigate-tree" => {
+            if arg1.is_empty() {
+                None
+            } else {
+                Some(TreeOp::NavigateTree { id: arg1 })
+            }
+        }
+        "new-session" => Some(TreeOp::NewSession {
+            parent: if arg1.is_empty() { None } else { Some(arg1) },
+        }),
+        "switch-session" => {
+            if arg1.is_empty() {
+                None
+            } else {
+                Some(TreeOp::SwitchSession { id_prefix: arg1 })
+            }
+        }
+        _ => None,
     }
 }
 

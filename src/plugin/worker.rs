@@ -172,6 +172,50 @@ const HARNESS_INIT: &str = r#"
       (set harness-providers-list
            (string harness-providers-list
                    name "|" type "|" base-url "|" env "\n")))))
+
+# Session-tree mutation ops queued from plugins (P4d). Mirrors pi's
+# ctx.setLabel / ctx.fork / ctx.navigateTree / ctx.newSession /
+# ctx.switchSession but routed through the host so the drain happens
+# between turns. Each line is `op\targ1[\targ2...]\n` (escaped via
+# harness/-escape) so a single round-trip + parse gives the host the
+# whole queue.
+(var harness-tree-ops "")
+(defn- harness/-push-op [& parts]
+  (set harness-tree-ops
+       (string harness-tree-ops
+               (string/join (map harness/-escape (map string parts)) "\t")
+               "\n")))
+# (harness/set-label id label-or-nil) — set or clear a node label.
+# Pass nil/false to clear; any string is set verbatim.
+(defn harness/set-label [id label]
+  (when (string? id)
+    (harness/-push-op "set-label" id (if (string? label) label ""))))
+# (harness/fork id &opt position) — branch off the chosen entry.
+# position defaults to :before (extracts prompt text into editor);
+# :at switches to that entry as the leaf without touching the editor.
+(defn harness/fork [id &opt position]
+  (when (string? id)
+    (let [pos (cond
+                (or (= position :at) (= position "at")) "at"
+                "before")]
+      (harness/-push-op "fork" id pos))))
+# (harness/navigate-tree id) — move active leaf to id. User-message
+# entries restore prompt text + go to parent (matching pi's behaviour);
+# other entries become the new leaf directly.
+(defn harness/navigate-tree [id]
+  (when (string? id)
+    (harness/-push-op "navigate-tree" id)))
+# (harness/new-session &opt parent-session) — start a fresh session
+# in place, optionally recording the prior session id as parent
+# lineage. The host persists the current session before resetting.
+(defn harness/new-session [&opt parent-session]
+  (let [p (if (string? parent-session) parent-session "")]
+    (harness/-push-op "new-session" p)))
+# (harness/switch-session session-id-prefix) — load a saved session
+# matching the id prefix and replace the current session in place.
+(defn harness/switch-session [session-id]
+  (when (string? session-id)
+    (harness/-push-op "switch-session" session-id)))
 "#;
 
 /// Janet-side aliases that defer the actual blocking work to the

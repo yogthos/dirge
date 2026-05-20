@@ -278,6 +278,16 @@ Janet scripts access harness capabilities through built-in functions:
 (harness/register-provider "local-openai" "openai"
                             "http://localhost:8000/v1"
                             "LOCAL_OPENAI_API_KEY")
+
+# Session-tree control (P4d) — mirrors pi's ctx.setLabel /
+# ctx.fork / ctx.navigateTree / ctx.newSession / ctx.switchSession.
+# Queued through the host and applied between UI events.
+(harness/set-label entry-id "milestone")   # bookmark a node; pass nil to clear
+(harness/fork entry-id)                    # branch at parent + restore prompt
+(harness/fork entry-id :at)                # branch at this entry, no editor pop
+(harness/navigate-tree entry-id)           # switch active leaf
+(harness/new-session)                      # reset in place; optional parent id
+(harness/switch-session "id-prefix")       # load saved session by id prefix
 ```
 
 Plugins live in `~/.config/dirge/plugins/*.janet` (global) or
@@ -298,6 +308,7 @@ Example plugins in `plugins/`:
 | `turn_timing.janet` | `on-turn-start`/`on-turn-end` measuring per-turn elapsed time |
 | `bookmark.janet` | `harness/append-entry` + `harness/register-renderer` — typed entries with custom rendering |
 | `local_openai.janet` | `harness/register-provider` declaring vLLM/Ollama/LMStudio local endpoints |
+| `session_tree.janet` | `harness/set-label` + `harness/new-session` — `/label` and `/fresh` slash commands |
 
 ### Workflow plugin
 
