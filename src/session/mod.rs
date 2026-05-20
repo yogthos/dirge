@@ -1,5 +1,7 @@
 pub mod storage;
 
+use std::collections::HashMap;
+
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -43,6 +45,72 @@ pub struct Compaction {
     pub summarized_count: usize,
     pub token_savings: u64,
     pub created_at: CompactString,
+}
+
+/// Single node in the session tree. References a `SessionMessage` by
+/// `id` (the id lives both here and on the message itself; we keep
+/// the duplication minimal but it gives the tree a self-contained
+/// identity if we ever want to detach content).
+///
+/// `parent` is None for the root node; otherwise it's the previous
+/// node on the current branch. `label` is an optional bookmark set
+/// via the future `harness/set-label` (P4d) — None for unlabeled
+/// nodes, which is the common case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeNode {
+    pub id: CompactString,
+    pub parent: Option<CompactString>,
+    pub timestamp: i64,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Node-based session storage. `entries` is keyed by node id; each
+/// `SessionMessage` in `Session::messages` has a corresponding entry
+/// in `tree.entries` with the same id.
+///
+/// For the current linear-only use case, `entries` mirrors `messages`
+/// as a degenerate chain: root → second → … → leaf. P4c (fork/clone)
+/// will introduce branches by letting alternate paths share a parent.
+///
+/// `leaf_id` points at the current end of the active branch. When new
+/// messages are appended (`add_message`), they extend from `leaf_id`
+/// and the leaf advances. Forks (P4c) will switch `leaf_id` to a
+/// different branch without disturbing the entries map.
+///
+/// Defaults to empty (`leaf_id = None`, no entries) so pre-P4b
+/// session JSON loads cleanly via the serde defaults; `Session::new`
+/// + `add_message` initialize it correctly on subsequent appends.
+/// Legacy linear sessions are auto-converted on first access via
+/// `Session::ensure_tree_initialized`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionTree {
+    #[serde(default)]
+    pub entries: HashMap<CompactString, TreeNode>,
+    #[serde(default)]
+    pub leaf_id: Option<CompactString>,
+}
+
+impl SessionTree {
+    /// Walk from `leaf_id` to root, returning the chain of ids in
+    /// chronological order (root first, leaf last). Used to confirm
+    /// the tree's current path matches `Session::messages`.
+    ///
+    /// Returns an empty Vec if `leaf_id` is None or any link is
+    /// broken (defensive — a healthy tree always reconstructs).
+    pub fn path_from_leaf(&self) -> Vec<&TreeNode> {
+        let mut path = Vec::new();
+        let mut cursor = self.leaf_id.as_ref();
+        while let Some(id) = cursor {
+            let Some(node) = self.entries.get(id) else {
+                return Vec::new();
+            };
+            path.push(node);
+            cursor = node.parent.as_ref();
+        }
+        path.reverse();
+        path
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +168,15 @@ pub struct Session {
     /// load so new appends don't collide with existing seq values.
     #[serde(default)]
     pub next_entry_seq: u64,
+    /// Node-based mirror of `messages` enabling future fork/clone /
+    /// branch navigation. Each message has a corresponding entry in
+    /// `tree.entries` with parent links pointing at the previous
+    /// message on the current branch. Defaulted on deserialize for
+    /// pre-P4b session files; `ensure_tree_initialized()` rebuilds
+    /// the linear chain from `messages` when the loaded tree is
+    /// empty but messages aren't.
+    #[serde(default)]
+    pub tree: SessionTree,
 }
 
 impl Session {
@@ -128,7 +205,30 @@ impl Session {
             permission_allowlist: Vec::new(),
             extra_entries: Vec::new(),
             next_entry_seq: 0,
+            tree: SessionTree::default(),
         }
+    }
+
+    /// If this session was loaded from a pre-P4b file (or any file
+    /// where `tree.entries` is empty but `messages` isn't), build a
+    /// linear tree from `messages` so all subsequent appends extend
+    /// from the correct leaf. Idempotent and safe to call repeatedly.
+    pub fn ensure_tree_initialized(&mut self) {
+        if !self.tree.entries.is_empty() || self.messages.is_empty() {
+            return;
+        }
+        let mut prev: Option<CompactString> = None;
+        for msg in &self.messages {
+            let node = TreeNode {
+                id: msg.id.clone(),
+                parent: prev.clone(),
+                timestamp: msg.timestamp,
+                label: None,
+            };
+            prev = Some(msg.id.clone());
+            self.tree.entries.insert(msg.id.clone(), node);
+        }
+        self.tree.leaf_id = prev;
     }
 
     /// Append a plugin entry to this session. Assigns the next
@@ -155,14 +255,36 @@ impl Session {
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
+        // Make sure the tree mirrors any messages that were loaded
+        // from a pre-P4b session file BEFORE we append the new one —
+        // otherwise the rebuild would also re-insert this new
+        // message with the wrong parent.
+        self.ensure_tree_initialized();
         let tokens = Self::estimate_tokens(content);
+        let id = new_message_id();
+        let timestamp = chrono::Utc::now().timestamp();
+        // Capture the parent NOW, before we touch the leaf — first
+        // message in a fresh session has parent=None.
+        let parent = self.tree.leaf_id.clone();
         self.messages.push(SessionMessage {
             role,
             content: CompactString::new(content),
             estimated_tokens: tokens,
-            id: new_message_id(),
-            timestamp: chrono::Utc::now().timestamp(),
+            id: id.clone(),
+            timestamp,
         });
+        // Mirror into the tree as a node extending from the previous
+        // leaf. The first message in a fresh session gets parent=None.
+        self.tree.entries.insert(
+            id.clone(),
+            TreeNode {
+                id: id.clone(),
+                parent,
+                timestamp,
+                label: None,
+            },
+        );
+        self.tree.leaf_id = Some(id);
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(tokens);
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     }
@@ -190,17 +312,53 @@ impl Session {
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(summary_tokens);
 
         // Insert a System message with the summary at the boundary
+        let summary_id = new_message_id();
+        let summary_ts = chrono::Utc::now().timestamp();
         let summary_msg = SessionMessage {
             role: MessageRole::System,
             content: CompactString::from(summary.clone()),
             estimated_tokens: summary_tokens,
-            id: new_message_id(),
-            timestamp: chrono::Utc::now().timestamp(),
+            id: summary_id.clone(),
+            timestamp: summary_ts,
         };
+
+        // Collect the IDs of the messages we're about to drop so we
+        // can prune them from the tree too. Keep the tree consistent
+        // with the messages cache.
+        let dropped_ids: Vec<CompactString> = self.messages[..first_kept_index]
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
 
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
         self.messages.insert(0, summary_msg);
+
+        // Mirror into the tree: remove dropped nodes, insert the new
+        // summary node as the new root, and re-parent the first
+        // kept node to point at the summary.
+        self.ensure_tree_initialized();
+        for id in &dropped_ids {
+            self.tree.entries.remove(id);
+        }
+        let new_root = TreeNode {
+            id: summary_id.clone(),
+            parent: None,
+            timestamp: summary_ts,
+            label: None,
+        };
+        self.tree.entries.insert(summary_id.clone(), new_root);
+        // The new "first kept" message (index 1 in the cache, after
+        // the summary at index 0) becomes the summary's child. If
+        // every prior message was dropped, the summary is also the
+        // new leaf.
+        if let Some(first_kept) = self.messages.get(1) {
+            if let Some(node) = self.tree.entries.get_mut(&first_kept.id) {
+                node.parent = Some(summary_id.clone());
+            }
+        } else {
+            self.tree.leaf_id = Some(summary_id);
+        }
 
         self.compactions.push(Compaction {
             summary: CompactString::from(summary),
@@ -317,5 +475,132 @@ mod tests {
         assert!(matches!(m.role, MessageRole::System));
         assert_eq!(m.id.chars().count(), 36);
         assert!(m.timestamp > 0);
+    }
+
+    // --- P4b: tree storage --------------------------------------------
+
+    /// A fresh session has no tree entries; `add_message` builds the
+    /// chain, with each node's parent pointing at the previous one.
+    #[test]
+    fn add_message_extends_tree_chain() {
+        let mut s = Session::new("p", "m", 0);
+        assert!(s.tree.entries.is_empty());
+        assert!(s.tree.leaf_id.is_none());
+
+        s.add_message(MessageRole::User, "first");
+        let first_id = s.messages[0].id.clone();
+        assert_eq!(s.tree.entries.len(), 1);
+        assert_eq!(s.tree.leaf_id.as_ref(), Some(&first_id));
+        assert_eq!(s.tree.entries[&first_id].parent, None);
+
+        s.add_message(MessageRole::Assistant, "second");
+        let second_id = s.messages[1].id.clone();
+        assert_eq!(s.tree.entries.len(), 2);
+        assert_eq!(s.tree.leaf_id.as_ref(), Some(&second_id));
+        // Second node's parent is the first node.
+        assert_eq!(s.tree.entries[&second_id].parent.as_ref(), Some(&first_id));
+    }
+
+    /// `path_from_leaf` walks back to root and reports the chain in
+    /// chronological order. Matches the linear `messages` Vec ordering.
+    #[test]
+    fn path_from_leaf_matches_messages_order() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "a");
+        s.add_message(MessageRole::Assistant, "b");
+        s.add_message(MessageRole::User, "c");
+        let path = s.tree.path_from_leaf();
+        let path_ids: Vec<_> = path.iter().map(|n| n.id.as_str()).collect();
+        let msg_ids: Vec<_> = s.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(path_ids, msg_ids);
+    }
+
+    /// Pre-P4b session JSON (no `tree` field) deserializes with an
+    /// empty tree; `ensure_tree_initialized` rebuilds the linear
+    /// chain from `messages` on first access. Critical backward
+    /// compat — users have existing sessions on disk.
+    #[test]
+    fn legacy_session_initializes_tree_from_messages() {
+        // Pre-P4b session JSON has no `tree` key.
+        let legacy = r#"{
+            "id": "abc",
+            "name": "",
+            "messages": [
+                {"role": "user", "content": "a", "estimated_tokens": 1,
+                 "id": "msg-1", "timestamp": 100},
+                {"role": "assistant", "content": "b", "estimated_tokens": 1,
+                 "id": "msg-2", "timestamp": 101}
+            ],
+            "compactions": [],
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "total_tokens": 0,
+            "total_cost": 0.0,
+            "total_estimated_tokens": 2,
+            "context_window": 0,
+            "model": "x",
+            "provider": "p",
+            "working_dir": ""
+        }"#;
+        let mut s: Session = serde_json::from_str(legacy).unwrap();
+        assert!(s.tree.entries.is_empty(), "tree should default empty");
+        // The first call to ensure_tree_initialized builds the chain.
+        s.ensure_tree_initialized();
+        assert_eq!(s.tree.entries.len(), 2);
+        assert_eq!(s.tree.leaf_id.as_deref(), Some("msg-2"));
+        assert_eq!(s.tree.entries["msg-1"].parent, None);
+        assert_eq!(s.tree.entries["msg-2"].parent.as_deref(), Some("msg-1"));
+    }
+
+    /// Modern session JSON serializes both `messages` AND `tree`,
+    /// and the tree round-trips intact.
+    #[test]
+    fn session_serde_roundtrip_preserves_tree() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "hi");
+        s.add_message(MessageRole::Assistant, "yo");
+        let orig_leaf = s.tree.leaf_id.clone();
+        let serialized = serde_json::to_string(&s).unwrap();
+        let restored: Session = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.tree.entries.len(), 2);
+        assert_eq!(restored.tree.leaf_id, orig_leaf);
+    }
+
+    /// `compress` prunes the dropped messages from the tree, inserts
+    /// the new summary as the root, and re-parents the first kept
+    /// message to point at the summary.
+    #[test]
+    fn compress_rebuilds_tree_with_summary_root() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "ancient-1");
+        s.add_message(MessageRole::Assistant, "ancient-2");
+        s.add_message(MessageRole::User, "kept");
+        // Compress the first two messages.
+        s.compress("compacted".to_string(), 2, 10);
+        // The kept message and the new summary are the only nodes.
+        assert_eq!(s.tree.entries.len(), 2);
+        let summary_id = s.messages[0].id.clone();
+        let kept_id = s.messages[1].id.clone();
+        // Summary is the new root.
+        assert_eq!(s.tree.entries[&summary_id].parent, None);
+        // Kept message points at the summary.
+        assert_eq!(s.tree.entries[&kept_id].parent.as_ref(), Some(&summary_id));
+        // Leaf is the kept message.
+        assert_eq!(s.tree.leaf_id.as_ref(), Some(&kept_id));
+    }
+
+    /// Repeated `ensure_tree_initialized` calls are no-ops once
+    /// initialized — idempotent and cheap.
+    #[test]
+    fn ensure_tree_initialized_is_idempotent() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "msg");
+        let snapshot = s.tree.entries.len();
+        let snapshot_leaf = s.tree.leaf_id.clone();
+        s.ensure_tree_initialized();
+        s.ensure_tree_initialized();
+        s.ensure_tree_initialized();
+        assert_eq!(s.tree.entries.len(), snapshot);
+        assert_eq!(s.tree.leaf_id, snapshot_leaf);
     }
 }
