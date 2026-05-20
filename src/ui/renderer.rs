@@ -521,6 +521,7 @@ impl Renderer {
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
         self.commit_partial();
         let max_width = self.max_line_width();
+        let indent = self.content_indent();
         for segment in text.split('\n') {
             let wrapped = self.wrap_line(segment, max_width);
             for chunk in &wrapped {
@@ -538,6 +539,15 @@ impl Renderer {
                     let r = self.content_row();
                     stdout.execute(MoveTo(0, r))?;
                     stdout.execute(Clear(ClearType::CurrentLine))?;
+                    // Indent so the directly-painted line matches the
+                    // centered layout that `render_viewport` produces.
+                    // Without this, the streaming path writes at col 0
+                    // and the chat visibly jumps from centered (after
+                    // a render_viewport repaint) to left-aligned
+                    // (immediately after each write).
+                    if indent > 0 {
+                        write!(stdout, "{}", " ".repeat(indent))?;
+                    }
                     write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                     writeln!(stdout, "{}", chunk)?;
                     write!(stdout, "{}", ResetColor)?;
@@ -565,6 +575,11 @@ impl Renderer {
         if self.scroll_offset == 0 {
             io::stdout().execute(Hide)?;
         }
+        // Same centering offset render_viewport / write_line use.
+        // Without this the streaming token path paints at col 0 while
+        // the rest of the chat is centered — content jumps left as it
+        // streams and back to center on the next full repaint.
+        let indent = self.content_indent() as u16;
         let parts: Vec<&str> = text.split('\n').collect();
         let last = parts.len() - 1;
         for (i, segment) in parts.iter().enumerate() {
@@ -586,7 +601,7 @@ impl Renderer {
                     self.ensure_room();
                     let mut stdout = io::stdout();
                     let r = self.content_row();
-                    stdout.execute(MoveTo(self.col, r))?;
+                    stdout.execute(MoveTo(indent + self.col, r))?;
                     if !segment.is_empty() {
                         write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                         write!(stdout, "{}", segment)?;
@@ -617,7 +632,7 @@ impl Renderer {
                         self.ensure_room();
                         let mut stdout = io::stdout();
                         let r = self.content_row();
-                        stdout.execute(MoveTo(self.col, r))?;
+                        stdout.execute(MoveTo(indent + self.col, r))?;
                         write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                         write!(stdout, "{}", chunk)?;
                         write!(stdout, "{}", ResetColor)?;
