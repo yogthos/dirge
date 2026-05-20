@@ -446,7 +446,10 @@ impl Session {
         entry_id: &CompactString,
         label: Option<String>,
     ) -> Result<(), String> {
-        self.ensure_tree_initialized();
+        // Mirror the other mutation methods — keep tree + store in
+        // lockstep even though set_label only touches the tree, in
+        // case a future label-aware code path inspects the store.
+        self.ensure_back_compat_initialized();
         let node = self
             .tree
             .entries

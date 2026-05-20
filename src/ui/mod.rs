@@ -1666,7 +1666,14 @@ pub async fn run_interactive(
                             && session.needs_compaction(cfg.resolve_reserve_tokens())
                             && !cli.no_session
                         {
-                            renderer.write_line("auto-compacting...", theme::dim())?;
+                            // Auto-compact failure used to render as a
+                            // single dim red line that scrolled past
+                            // unnoticed — users kept typing into an
+                            // over-full context and saw mysterious
+                            // context-length errors next turn. Frame
+                            // the warning so it visibly stops the eye
+                            // and tells the user what to do next.
+                            renderer.write_line("▒░ auto-compacting context ░▒", theme::accent())?;
                             let compress_result = handle_compress(
                                 None,
                                 &mut agent, &client, &mut renderer, session, cli, cfg, context,
@@ -1675,7 +1682,34 @@ pub async fn run_interactive(
                                 #[cfg(feature = "semantic")] semantic_manager,
                             ).await;
                             if let Err(e) = compress_result {
-                                renderer.write_line(&format!("auto-compact error: {}", e), c_error())?;
+                                renderer.write_line(
+                                    "╭─ ⚠ AUTO-COMPACT FAILED ─────────────────────────────╮",
+                                    c_error(),
+                                )?;
+                                renderer.write_line(
+                                    &format!("│ cause: {}", e),
+                                    c_error(),
+                                )?;
+                                renderer.write_line(
+                                    "│ context is over the threshold — replies may start",
+                                    c_error(),
+                                )?;
+                                renderer.write_line(
+                                    "│ hitting context-length errors. Try /compress",
+                                    c_error(),
+                                )?;
+                                renderer.write_line(
+                                    "│ manually, /clear to start fresh, or restart with",
+                                    c_error(),
+                                )?;
+                                renderer.write_line(
+                                    "│ a larger context_window in config.",
+                                    c_error(),
+                                )?;
+                                renderer.write_line(
+                                    "╰─────────────────────────────────────────────────────╯",
+                                    c_error(),
+                                )?;
                             }
                         }
 

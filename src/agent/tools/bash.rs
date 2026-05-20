@@ -133,6 +133,35 @@ async fn check_bash_segments(
     }
     #[cfg(not(feature = "semantic-bash"))]
     {
-        check_perm(permission, ask_tx, "bash", command).await
+        // Best-effort coarse split when tree-sitter isn't compiled in.
+        // Without it, a command like `safe_cmd && rm -rf /` would be
+        // checked as a single string against the bash rules and might
+        // squeak through if `safe_cmd && rm` doesn't match any deny.
+        // Split on the unambiguous compound separators (`&&`, `;`,
+        // `||`) so each segment is checked individually. This won't
+        // catch command substitution or subshells — those need the
+        // tree-sitter feature for correct parsing — but it covers the
+        // common compound case.
+        let segments = command
+            .split(|c| c == ';')
+            .flat_map(|s| s.split("&&"))
+            .flat_map(|s| s.split("||"))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<&str>>();
+        // Flag command substitution / subshell constructs that need a
+        // full parser. Surface as one whole-command check so the user
+        // sees the unfamiliar form before any segment runs.
+        let has_substitution = command.contains("$(")
+            || command.contains('`')
+            || command.contains("<(")
+            || command.contains(">(");
+        if has_substitution {
+            return check_perm(permission, ask_tx, "bash", command).await;
+        }
+        for segment in &segments {
+            check_perm(permission, ask_tx, "bash", segment).await?;
+        }
+        Ok(())
     }
 }

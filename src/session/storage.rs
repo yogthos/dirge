@@ -58,7 +58,22 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", session.id));
     let json = serde_json::to_string_pretty(session)?;
-    std::fs::write(path, json)?;
+    // Atomic write: write to a sibling temp file, fsync, then rename
+    // over the target. A crash mid-write leaves the temp behind but
+    // never a truncated `.json`. The rename is atomic on every OS we
+    // target. Use the same parent dir so rename stays on one filesystem.
+    let tmp = dir.join(format!(".{}.json.tmp", session.id));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        // Best-effort fsync; non-fatal if the platform doesn't support it.
+        let _ = f.sync_all();
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
