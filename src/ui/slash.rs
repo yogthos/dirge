@@ -1050,11 +1050,21 @@ pub async fn handle_slash(
                 .cloned();
             match last_user {
                 Some(msg) => {
-                    // Pop the trailing assistant response (if any) so a
-                    // /retry doesn't leave the failed reply in the
-                    // session — the agent would otherwise see its own
-                    // bad answer as context on the retry.
-                    let _ = undo_last(session);
+                    // Pop messages until we've removed the last user
+                    // message itself — covers assistant replies AND
+                    // system messages (compress summaries, error
+                    // notices) that landed between the user prompt
+                    // and the current state. `undo_last` only handles
+                    // the Assistant/User pair pattern; using it here
+                    // would leave a trailing System message in the
+                    // session and the agent would see it on retry.
+                    while let Some(last) = session.messages.last() {
+                        let was_user = last.role == MessageRole::User;
+                        session.pop_last_message();
+                        if was_user {
+                            break;
+                        }
+                    }
                     input.buffer = msg.content.clone();
                     input.cursor = msg.content.len();
                     render_session(renderer, session, cli, cfg, context)?;

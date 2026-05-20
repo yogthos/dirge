@@ -62,7 +62,21 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     // over the target. A crash mid-write leaves the temp behind but
     // never a truncated `.json`. The rename is atomic on every OS we
     // target. Use the same parent dir so rename stays on one filesystem.
-    let tmp = dir.join(format!(".{}.json.tmp", session.id));
+    //
+    // The tmp filename includes a per-call nonce (pid + nanos) so two
+    // concurrent saves of the same session id don't collide on the
+    // tmp file. Each thread/process writes to its own tmp; the rename
+    // race is harmless (last-writer wins on the target, but neither
+    // tmp is partial because each was fully written before rename).
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let tmp = dir.join(format!(".{}.{}.json.tmp", session.id, nonce));
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;

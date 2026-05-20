@@ -46,11 +46,28 @@ pub struct PermissionConfig {
     pub doom_loop: Option<Action>,
 }
 
+/// Per-session security mode. Selected via `--yolo` / `--accept-all` /
+/// `--restrictive` CLI flags or the `default_permission_mode` config
+/// key. Mode precedence (high to low): `Yolo > Accept > Restrictive >
+/// Standard`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SecurityMode {
+    /// Every rule in `PermissionConfig` is consulted; tools with no
+    /// matching rule fall back to the `*` default action.
     Standard,
+    /// Like `Standard`, but any tool whose rule resolves to `Allow`
+    /// *via the `*` fallback* (no explicit allow rule matched) gets
+    /// upgraded to `Ask`. Explicit allow rules still allow; explicit
+    /// deny rules still deny. The semantic difference from
+    /// `Standard`: "if nothing explicitly approved this, ask the
+    /// user." It does NOT flip every Allow to Ask.
     Restrictive,
+    /// Auto-allows tools whose targets resolve inside the working
+    /// directory; tools touching paths outside `cwd` still consult
+    /// `external_directory` rules. Useful for fast iteration on a
+    /// trusted project.
     Accept,
+    /// Bypasses every check. Use with caution.
     Yolo,
 }
 

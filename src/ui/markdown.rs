@@ -94,6 +94,13 @@ fn render_table(
             widths[i] = widths[i].max(cell.chars().count());
         }
     }
+    // Minimum column width — ragged rows (one row has fewer cells
+    // than `ncols`) would otherwise leave `widths[i] = 0` for the
+    // missing columns, breaking the separator line + right-border
+    // alignment. Guarantee at least 1 char per column.
+    for w in widths.iter_mut() {
+        *w = (*w).max(1);
+    }
     // Cap any single column to avoid one runaway cell blowing the
     // line width. Distribute available width: target inner width =
     // max_width - 4 (for outer `| ` + ` |`), minus 3*(ncols-1) for
@@ -404,8 +411,13 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
-                if in_code_block {
-                    acc.push('\n');
+                if in_table {
+                    // Break inside a table cell would smear the cell
+                    // across multiple lines and misalign the row.
+                    // Markdown spec doesn't allow real newlines in
+                    // table cells — substitute a space so the visible
+                    // content stays on one line.
+                    current_cell.push(' ');
                 } else {
                     acc.push('\n');
                 }

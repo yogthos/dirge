@@ -29,7 +29,10 @@ pub struct PermissionChecker {
 /// classic glob semantics (one segment, doesn't cross `/`). Everything else
 /// is treated as shell/text where `*` means "any chars including /".
 pub(crate) fn is_path_tool_name(tool: &str) -> bool {
-    matches!(tool, "read" | "write" | "edit" | "list_dir")
+    matches!(
+        tool,
+        "read" | "write" | "edit" | "list_dir" | "apply_patch" | "lsp"
+    )
 }
 
 /// Build a Pattern with the right `*` semantics for the given tool.
@@ -291,7 +294,12 @@ impl PermissionChecker {
     }
 
     fn is_path_tool(&self, tool: &str) -> bool {
-        matches!(tool, "read" | "write" | "edit" | "list_dir")
+        // Must match `is_path_tool_name` — these are the tools that
+        // take a filesystem path as their permission input and need
+        // `external_directory` rule consultation. `apply_patch` and
+        // `lsp` are included because both route filesystem-path
+        // strings through `check_perm_path`.
+        is_path_tool_name(tool)
     }
 
     fn is_external_path(&self, path_str: &str) -> bool {
