@@ -34,6 +34,28 @@ pub struct PermissionAllowEntry {
     pub pattern: String,
 }
 
+/// One plugin-appended entry on the session timeline. Data is treated as
+/// opaque by the host — the plugin chose its own format (JSON string,
+/// plain text, whatever) and any registered renderer for `custom_type`
+/// is responsible for turning it into displayable lines. The host's
+/// fallback renderer just dumps the raw data dim.
+///
+/// `seq` is the host-assigned insertion order; combined with `timestamp`
+/// it provides a stable rendering order even when many entries land in
+/// the same second.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginEntry {
+    pub custom_type: String,
+    pub data: String,
+    /// Whether to render this entry in the chat (false = silent;
+    /// useful for persistent state that shouldn't visually clutter).
+    pub display: bool,
+    /// Epoch seconds at the time of append.
+    pub timestamp: i64,
+    /// Monotonic per-session insertion order.
+    pub seq: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: CompactString,
@@ -51,6 +73,16 @@ pub struct Session {
     pub working_dir: CompactString,
     #[serde(default)]
     pub permission_allowlist: Vec<PermissionAllowEntry>,
+    /// Plugin-appended entries (bookmarks, telemetry, custom state)
+    /// that survive session save/load. Defaulted on deserialize so
+    /// pre-P2 session files load without migration.
+    #[serde(default)]
+    pub extra_entries: Vec<PluginEntry>,
+    /// Counter for `PluginEntry::seq`. Defaulted on deserialize for
+    /// backward compat; we initialize from `extra_entries.len()` on
+    /// load so new appends don't collide with existing seq values.
+    #[serde(default)]
+    pub next_entry_seq: u64,
 }
 
 impl Session {
@@ -77,7 +109,32 @@ impl Session {
                 .map(|p| CompactString::new(p.to_string_lossy()))
                 .unwrap_or_default(),
             permission_allowlist: Vec::new(),
+            extra_entries: Vec::new(),
+            next_entry_seq: 0,
         }
+    }
+
+    /// Append a plugin entry to this session. Assigns the next
+    /// monotonic `seq` so renderers can produce a deterministic
+    /// ordering even within a single-second timestamp bucket. Plugins
+    /// reach this via `harness/append-entry` (see PluginManager).
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    pub fn append_plugin_entry(
+        &mut self,
+        custom_type: impl Into<String>,
+        data: impl Into<String>,
+        display: bool,
+    ) -> &PluginEntry {
+        let entry = PluginEntry {
+            custom_type: custom_type.into(),
+            data: data.into(),
+            display,
+            timestamp: chrono::Utc::now().timestamp(),
+            seq: self.next_entry_seq,
+        };
+        self.next_entry_seq = self.next_entry_seq.saturating_add(1);
+        self.extra_entries.push(entry);
+        self.extra_entries.last().expect("just pushed")
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
