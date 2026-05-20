@@ -644,10 +644,11 @@ impl Renderer {
         let cursor_line_idx = full_input[..cursor_line_start].matches('\n').count();
         let cursor_col_in_line = full_cursor - cursor_line_start;
 
-        // Wrap width: content width minus the 2-char prompt prefix that
-        // sits in front of every visible row. Min 1 to avoid div-by-zero in
-        // wrap math on ridiculous terminal sizes.
-        let wrap_width = (cols.saturating_sub(2) as usize).max(1);
+        // Wrap width: content width minus the 3-char prompt prefix
+        // (`▌▌ ` idle, `░▌ `/`▒▌ ` spinner, `▏  ` continuation — all 3
+        // columns) that sits in front of every visible row. Min 1 to
+        // avoid div-by-zero in wrap math on ridiculous terminal sizes.
+        let wrap_width = (cols.saturating_sub(3) as usize).max(1);
 
         // Pre-render each logical line (placeholder expansion etc.) into the
         // displayable form, alongside the cursor's display column on its line.
@@ -778,7 +779,8 @@ impl Renderer {
         // Place the visible cursor on its row at the right column.
         let cursor_row =
             input_top + (cursor_visual_row.saturating_sub(first_visible_visual)) as u16;
-        let cursor_x = (2 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
+        // Match the 3-column prompt prefix used in the loop above.
+        let cursor_x = (3 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
         stdout.execute(MoveTo(cursor_x, cursor_row))?;
 
         if self.panel_visible() {
