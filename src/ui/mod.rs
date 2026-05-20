@@ -2071,6 +2071,11 @@ pub async fn run_interactive(
                 // events keep queuing in their channels — they'll process
                 // after this arm returns.
                 use crate::plugin::{DialogReply, DialogRequest};
+                // Events that arrived during the dialog but didn't match
+                // its accepted keys are stashed here, then pushed back into
+                // user_rx after the dialog ends. Without this, a paste or
+                // unrelated key during a confirm dialog would be lost.
+                let mut deferred: Vec<UserEvent> = Vec::new();
                 match dialog_req {
                     DialogRequest::Confirm { title, question, reply } => {
                         renderer.write_line(
@@ -2090,8 +2095,25 @@ pub async fn run_interactive(
                                             KeyCode::Char('n')
                                             | KeyCode::Char('N')
                                             | KeyCode::Esc => break false,
-                                            _ => {}
+                                            // Treat Ctrl+C as cancel (same
+                                            // as Esc / no), not as
+                                            // "interrupt the agent" — the
+                                            // agent isn't running this code
+                                            // path, the dialog is.
+                                            KeyCode::Char('c')
+                                                if key.modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                break false;
+                                            }
+                                            _ => deferred.push(UserEvent::Key(key)),
                                         }
+                                    } else {
+                                        // Paste, Mouse*, ScrollUp/Down,
+                                        // Resize, etc. Hand them back after
+                                        // the dialog so the main loop arms
+                                        // can handle them as usual.
+                                        deferred.push(ev);
                                     }
                                 }
                             }
@@ -2129,8 +2151,16 @@ pub async fn run_interactive(
                                                 }
                                             }
                                             KeyCode::Esc => break None,
-                                            _ => {}
+                                            KeyCode::Char('c')
+                                                if key.modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                break None;
+                                            }
+                                            _ => deferred.push(UserEvent::Key(key)),
                                         }
+                                    } else {
+                                        deferred.push(ev);
                                     }
                                 }
                             }
@@ -2142,6 +2172,12 @@ pub async fn run_interactive(
                             Color::DarkGrey,
                         )?;
                     }
+                }
+                // Replay deferred events into user_rx so the outer select!
+                // arms see them next iteration. Best-effort: a full channel
+                // (very unlikely, capacity 64) silently drops the tail.
+                for ev in deferred {
+                    let _ = user_tx.send(ev).await;
                 }
                 renderer.draw_bottom(
                     &input,
