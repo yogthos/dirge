@@ -48,6 +48,7 @@ pub struct Cli {
     #[arg(long = "no-tools", help = "Disable all tools")]
     pub no_tools: bool,
 
+    #[cfg(feature = "lsp")]
     #[arg(
         long = "no-lsp",
         help = "Disable LSP integration (no diagnostics on edit/write, no `lsp` agent tool)"
@@ -167,6 +168,7 @@ impl Cli {
         self.no_tools || cfg.no_tools.unwrap_or(false)
     }
 
+    #[cfg(feature = "lsp")]
     pub fn resolve_lsp_enabled(&self, cfg: &config::Config) -> bool {
         if self.no_lsp || self.no_tools {
             return false;

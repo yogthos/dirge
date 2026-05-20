@@ -1,3 +1,4 @@
+#[cfg(feature = "lsp")]
 use std::sync::Arc;
 
 use rig::completion::ToolDefinition;
@@ -5,6 +6,7 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path};
+#[cfg(feature = "lsp")]
 use crate::lsp::manager::{LspManager, TouchMode};
 
 pub struct ReadTool {
@@ -14,6 +16,7 @@ pub struct ReadTool {
     /// When set, the tool fires off a `touch_file` to warm the LSP server
     /// so subsequent edits surface diagnostics quickly. Fire-and-forget:
     /// the read tool does not wait or surface diagnostics in its output.
+    #[cfg(feature = "lsp")]
     pub lsp_manager: Option<Arc<LspManager>>,
 }
 
@@ -24,6 +27,7 @@ impl ReadTool {
             permission,
             ask_tx,
             cache: None,
+            #[cfg(feature = "lsp")]
             lsp_manager: None,
         }
     }
@@ -32,12 +36,13 @@ impl ReadTool {
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
         cache: ToolCache,
-        lsp_manager: Option<Arc<LspManager>>,
+        #[cfg(feature = "lsp")] lsp_manager: Option<Arc<LspManager>>,
     ) -> Self {
         ReadTool {
             permission,
             ask_tx,
             cache: Some(cache),
+            #[cfg(feature = "lsp")]
             lsp_manager,
         }
     }
@@ -122,6 +127,7 @@ impl Tool for ReadTool {
         // Fire-and-forget LSP warmup so the server already has the file
         // open by the time the agent edits it (and we can wait_for_push
         // quickly). No diagnostic surfacing on read.
+        #[cfg(feature = "lsp")]
         if let Some(manager) = self.lsp_manager.clone() {
             let path = std::path::PathBuf::from(&args.path);
             tokio::spawn(async move {

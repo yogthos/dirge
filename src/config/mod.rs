@@ -32,6 +32,7 @@ pub struct ToolsConfig {
 /// - `{ "disabled": true }` to turn off a built-in server entirely.
 /// - any subset of `{ command, extensions, env, initialization, disabled }`
 ///   to override pieces of the default.
+#[cfg(feature = "lsp")]
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct LspServerConfig {
@@ -46,6 +47,7 @@ pub struct LspServerConfig {
 /// `lsp = false` → disable LSP entirely.
 /// `lsp = { server-id = { … } }` → enable defaults, overriding the named
 ///   servers with the provided config.
+#[cfg(feature = "lsp")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum LspConfig {
@@ -53,6 +55,7 @@ pub enum LspConfig {
     Servers(HashMap<String, LspServerConfig>),
 }
 
+#[cfg(feature = "lsp")]
 impl LspConfig {
     /// `true` when LSP should be on. Defaults to enabled.
     pub fn is_enabled(&self) -> bool {
@@ -102,6 +105,7 @@ pub struct Config {
     pub tool_result_max_chars: Option<usize>,
     pub default_prompt: Option<String>,
     pub tools: Option<ToolsConfig>,
+    #[cfg(feature = "lsp")]
     pub lsp: Option<LspConfig>,
     #[cfg(feature = "mcp")]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
@@ -194,7 +198,7 @@ pub fn load() -> Config {
     cfg
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lsp"))]
 mod tests {
     use super::*;
 

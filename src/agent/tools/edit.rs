@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+#[cfg(feature = "lsp")]
 use std::sync::Arc;
 
 use rig::completion::ToolDefinition;
@@ -6,6 +7,7 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, check_perm_path};
+#[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
 
 pub struct EditTool {
@@ -16,6 +18,7 @@ pub struct EditTool {
     /// When set, the tool touches the edited file on the LSP server and
     /// appends any diagnostic block to its output. `None` reproduces the
     /// pre-LSP behaviour.
+    #[cfg(feature = "lsp")]
     lsp_manager: Option<Arc<LspManager>>,
 }
 
@@ -31,6 +34,7 @@ impl EditTool {
             ask_tx,
             plan_file,
             cache: None,
+            #[cfg(feature = "lsp")]
             lsp_manager: None,
         }
     }
@@ -40,13 +44,14 @@ impl EditTool {
         ask_tx: Option<AskSender>,
         plan_file: Option<PathBuf>,
         cache: ToolCache,
-        lsp_manager: Option<Arc<LspManager>>,
+        #[cfg(feature = "lsp")] lsp_manager: Option<Arc<LspManager>>,
     ) -> Self {
         EditTool {
             permission,
             ask_tx,
             plan_file,
             cache: Some(cache),
+            #[cfg(feature = "lsp")]
             lsp_manager,
         }
     }
@@ -212,6 +217,7 @@ impl Tool for EditTool {
             new_content
         };
 
+        #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
         tokio::fs::write(&args.path, &output).await?;
         // File mutated → invalidate cached reads/greps/listings for this turn.
@@ -236,15 +242,18 @@ impl Tool for EditTool {
             ));
         }
 
-        let path = std::path::Path::new(&args.path);
-        result.push_str(
-            &crate::agent::tools::write::append_lsp_block(
-                self.lsp_manager.as_ref(),
-                path,
-                write_at,
-            )
-            .await,
-        );
+        #[cfg(feature = "lsp")]
+        {
+            let path = std::path::Path::new(&args.path);
+            result.push_str(
+                &crate::agent::tools::write::append_lsp_block(
+                    self.lsp_manager.as_ref(),
+                    path,
+                    write_at,
+                )
+                .await,
+            );
+        }
         Ok(result)
     }
 }

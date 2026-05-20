@@ -153,7 +153,7 @@ pub async fn run_interactive(
     plan_tx: Option<PlanSwitchSender>,
     bg_store: Option<crate::agent::tools::background::BackgroundStore>,
     mut lifecycle_rx: Option<crate::agent::tools::background::LifecycleReceiver>,
-    lsp_manager: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -805,6 +805,7 @@ pub async fn run_interactive(
                                                 None,
                                                 None,
                                                 bg_store.clone(),
+                                                                                                #[cfg(feature = "lsp")]
                                                                                                 None,
                                                 sandbox.clone(),
                                                 #[cfg(feature = "mcp")] mcp_manager,
@@ -1282,6 +1283,7 @@ pub async fn run_interactive(
                                         None,
                                         None,
                                         bg_store.clone(),
+                                                                                #[cfg(feature = "lsp")]
                                                                                 None,
                                         sandbox.clone(),
                                         #[cfg(feature = "mcp")] mcp_manager,
@@ -1745,6 +1747,7 @@ pub async fn run_interactive(
                         question_tx.clone(),
                         plan_tx.clone(),
                         bg_store.clone(),
+                        #[cfg(feature = "lsp")]
                         lsp_manager.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]

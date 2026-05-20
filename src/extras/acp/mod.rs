@@ -170,6 +170,7 @@ async fn run_prompt(
         None,
         None,
         None,
+        #[cfg(feature = "lsp")]
         None,
         sandbox,
         #[cfg(feature = "mcp")]

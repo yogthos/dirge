@@ -7,6 +7,7 @@ mod find_files;
 mod glob;
 mod grep;
 mod list_dir;
+#[cfg(feature = "lsp")]
 mod lsp;
 mod memory;
 pub(crate) mod plan;
@@ -30,6 +31,7 @@ pub use find_files::FindFilesTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list_dir::ListDirTool;
+#[cfg(feature = "lsp")]
 pub use lsp::LspTool;
 pub use memory::MemoryTool;
 pub use plan::{PlanEnterTool, PlanExitTool};

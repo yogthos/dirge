@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["ai", "cli", "dev"]
 
 [features]
-default = ['loop', 'git-worktree', 'mcp']
+default = ['loop', 'git-worktree', 'mcp', 'lsp']
 loop = []
 git-worktree = []
 mcp = [
@@ -26,6 +26,7 @@ semantic-ts = ["semantic", "dep:tree-sitter-typescript"]
 semantic-python = ["semantic", "dep:tree-sitter-python"]
 semantic-bash = ["semantic", "dep:tree-sitter-bash"]
 plugin = ["dep:janetrs"]
+lsp = ["dep:lsp-types"]
 
 [dependencies]
 rig = { version = "0.37", features = ["rmcp"] }
@@ -66,7 +67,7 @@ streaming-iterator = { version = "0.1", optional = true }
 janetrs = { version = "0.8", optional = true }
 html2text = "0.17"
 indexmap = "2"
-lsp-types = "0.97"
+lsp-types = { version = "0.97", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

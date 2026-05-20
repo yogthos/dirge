@@ -37,7 +37,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     question_tx: Option<QuestionSender>,
     plan_tx: Option<PlanSwitchSender>,
     bg_store: Option<BackgroundStore>,
-    lsp_manager: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
     sandbox: Sandbox,
     parent_model: Option<AnyModel>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
@@ -141,6 +141,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 permission.clone(),
                 ask_tx.clone(),
                 cache.clone(),
+                #[cfg(feature = "lsp")]
                 lsp_manager.clone(),
             )),
             Box::new(tools::WriteTool::with_cache(
@@ -148,6 +149,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 ask_tx.clone(),
                 plan_file.clone(),
                 cache.clone(),
+                #[cfg(feature = "lsp")]
                 lsp_manager.clone(),
             )),
             Box::new(tools::EditTool::with_cache(
@@ -155,6 +157,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 ask_tx.clone(),
                 plan_file.clone(),
                 cache.clone(),
+                #[cfg(feature = "lsp")]
                 lsp_manager.clone(),
             )),
             Box::new(tools::BashTool::with_cache(
@@ -262,6 +265,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             builder = builder.tools(vec![task_tool, status_tool]);
         }
 
+        #[cfg(feature = "lsp")]
         if let Some(manager) = &lsp_manager {
             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
             let lsp_tool = Box::new(tools::LspTool::new(

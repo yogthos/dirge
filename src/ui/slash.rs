@@ -127,6 +127,7 @@ pub async fn handle_compress(
         None,
         None,
         bg_store.clone(),
+        #[cfg(feature = "lsp")]
         None,
         sandbox.clone(),
         #[cfg(feature = "mcp")]
@@ -189,6 +190,7 @@ pub async fn handle_slash(
                     None,
                     None,
                     bg_store.clone(),
+                    #[cfg(feature = "lsp")]
                     None,
                     sandbox.clone(),
                     #[cfg(feature = "mcp")]
@@ -508,6 +510,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        #[cfg(feature = "lsp")]
                         None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
@@ -619,6 +622,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        #[cfg(feature = "lsp")]
                         None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
@@ -644,6 +648,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        #[cfg(feature = "lsp")]
                         None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
@@ -696,6 +701,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        #[cfg(feature = "lsp")]
                         None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
@@ -849,6 +855,7 @@ pub async fn handle_slash(
                         None,
                         None,
                         bg_store.clone(),
+                        #[cfg(feature = "lsp")]
                         None,
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]

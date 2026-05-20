@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+#[cfg(feature = "lsp")]
 use std::sync::Arc;
+#[cfg(feature = "lsp")]
 use std::time::{Duration, Instant};
 
 use rig::completion::ToolDefinition;
@@ -7,12 +9,15 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path};
+#[cfg(feature = "lsp")]
 use crate::lsp::diagnostic;
+#[cfg(feature = "lsp")]
 use crate::lsp::manager::{LspManager, TouchMode};
 
 /// How long to wait for the LSP server to publish fresh diagnostics after
 /// a write. Matches opencode's `DIAGNOSTICS_FULL_WAIT_TIMEOUT_MS`. Bounded
 /// so a stuck server doesn't hold up the agent's turn.
+#[cfg(feature = "lsp")]
 const DIAGNOSTIC_WAIT: Duration = Duration::from_secs(10);
 
 pub struct WriteTool {
@@ -23,6 +28,7 @@ pub struct WriteTool {
     /// When set, the tool touches the file on the LSP server after writing
     /// and appends any resulting diagnostic block to its output. `None`
     /// reproduces the pre-LSP behaviour exactly.
+    #[cfg(feature = "lsp")]
     lsp_manager: Option<Arc<LspManager>>,
 }
 
@@ -38,6 +44,7 @@ impl WriteTool {
             ask_tx,
             plan_file,
             cache: None,
+            #[cfg(feature = "lsp")]
             lsp_manager: None,
         }
     }
@@ -47,13 +54,14 @@ impl WriteTool {
         ask_tx: Option<AskSender>,
         plan_file: Option<PathBuf>,
         cache: ToolCache,
-        lsp_manager: Option<Arc<LspManager>>,
+        #[cfg(feature = "lsp")] lsp_manager: Option<Arc<LspManager>>,
     ) -> Self {
         WriteTool {
             permission,
             ask_tx,
             plan_file,
             cache: Some(cache),
+            #[cfg(feature = "lsp")]
             lsp_manager,
         }
     }
@@ -106,6 +114,7 @@ impl Tool for WriteTool {
             tokio::fs::create_dir_all(parent).await?;
         }
         let bytes = args.content.len();
+        #[cfg(feature = "lsp")]
         let write_at = Instant::now();
         tokio::fs::write(path, &args.content).await?;
         // File mutated → invalidate cached reads/greps/listings for this turn.
@@ -113,7 +122,9 @@ impl Tool for WriteTool {
             cache.clear();
         }
 
+        #[allow(unused_mut)]
         let mut output = format!("Written {} bytes to {}", bytes, args.path);
+        #[cfg(feature = "lsp")]
         output.push_str(&append_lsp_block(self.lsp_manager.as_ref(), path, write_at).await);
         Ok(output)
     }
@@ -124,6 +135,7 @@ impl Tool for WriteTool {
 /// Errors during touch/wait are intentionally swallowed — diagnostic
 /// surfacing is a side-effect; the write tool's primary contract is
 /// "wrote the file".
+#[cfg(feature = "lsp")]
 pub(crate) async fn append_lsp_block(
     manager: Option<&Arc<LspManager>>,
     path: &Path,
@@ -145,7 +157,7 @@ pub(crate) async fn append_lsp_block(
     diagnostic::build_report_block(path, &diagnostics)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lsp"))]
 mod tests {
     use super::*;
     use crate::agent::tools::cache::ToolCache;

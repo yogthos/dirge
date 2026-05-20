@@ -439,7 +439,7 @@ pub async fn build_agent(
     question_tx: Option<QuestionSender>,
     plan_tx: Option<PlanSwitchSender>,
     bg_store: Option<crate::agent::tools::background::BackgroundStore>,
-    lsp_manager: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -458,6 +458,7 @@ pub async fn build_agent(
                 question_tx.clone(),
                 plan_tx.clone(),
                 bg_store.clone(),
+                #[cfg(feature = "lsp")]
                 lsp_manager.clone(),
                 sandbox.clone(),
                 Some(parent_model.clone()),

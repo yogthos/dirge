@@ -5,6 +5,7 @@ mod context;
 mod event;
 mod extras;
 mod image_util;
+#[cfg(feature = "lsp")]
 mod lsp;
 mod permission;
 mod plugin;
@@ -27,11 +28,33 @@ use session::MessageRole;
 use crate::agent::tools::background::{BackgroundStore, LifecycleReceiver};
 use crate::agent::tools::plan::{PlanSwitchReceiver, PlanSwitchSender};
 use crate::agent::tools::question::{QuestionReceiver, QuestionSender};
+#[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
+#[cfg(feature = "lsp")]
 use crate::lsp::spawn::{ProcessCommand, ProcessSpawner};
-use crate::permission::ask::AskSender;
+use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, SecurityMode};
+
+/// Per-session channels and shared state, threaded through the agent build
+/// chain in place of a ten-position tuple. Cloneable senders + shared state
+/// (`bg_store`, `lsp_manager`, `permission`) survive being moved through
+/// `build_agent`; the receivers (`ask_rx`, `question_rx`, `plan_rx`,
+/// `lifecycle_rx`) are unique-owner and end up consumed by the UI loop.
+#[derive(Default)]
+struct Channels {
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    ask_rx: Option<AskReceiver>,
+    question_tx: Option<QuestionSender>,
+    question_rx: Option<QuestionReceiver>,
+    plan_tx: Option<PlanSwitchSender>,
+    plan_rx: Option<PlanSwitchReceiver>,
+    bg_store: Option<BackgroundStore>,
+    lifecycle_rx: Option<LifecycleReceiver>,
+    #[cfg(feature = "lsp")]
+    lsp_manager: Option<std::sync::Arc<LspManager>>,
+}
 
 fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
     if cli.yolo || cfg.yolo.unwrap_or(false) {
@@ -52,24 +75,9 @@ fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
     }
 }
 
-fn build_channels(
-    cli: &cli::Cli,
-    cfg: &config::Config,
-) -> (
-    Option<PermCheck>,
-    Option<AskSender>,
-    Option<tokio::sync::mpsc::Receiver<crate::permission::ask::AskRequest>>,
-    Option<QuestionSender>,
-    Option<QuestionReceiver>,
-    Option<PlanSwitchSender>,
-    Option<PlanSwitchReceiver>,
-    Option<BackgroundStore>,
-    Option<LifecycleReceiver>,
-    Option<std::sync::Arc<LspManager>>,
-) {
-    let no_tools = cli.resolve_no_tools(cfg);
-    if no_tools {
-        return (None, None, None, None, None, None, None, None, None, None);
+fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
+    if cli.resolve_no_tools(cfg) {
+        return Channels::default();
     }
 
     let perm_config: PermissionConfig = cfg
@@ -88,6 +96,7 @@ fn build_channels(
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
     let bg_store = BackgroundStore::with_ui_sink(lifecycle_tx);
 
+    #[cfg(feature = "lsp")]
     let lsp_manager = if cli.resolve_lsp_enabled(cfg) {
         let worktree = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let commands = compile_lsp_commands(cfg);
@@ -97,23 +106,31 @@ fn build_channels(
         None
     };
 
-    (
-        Some(perm),
-        Some(ask_tx),
-        Some(ask_rx),
-        Some(question_tx),
-        Some(question_rx),
-        Some(plan_tx),
-        Some(plan_rx),
-        Some(bg_store),
-        Some(lifecycle_rx),
+    Channels {
+        permission: Some(perm),
+        ask_tx: Some(ask_tx),
+        ask_rx: Some(ask_rx),
+        question_tx: Some(question_tx),
+        question_rx: Some(question_rx),
+        plan_tx: Some(plan_tx),
+        plan_rx: Some(plan_rx),
+        bg_store: Some(bg_store),
+        lifecycle_rx: Some(lifecycle_rx),
+        #[cfg(feature = "lsp")]
         lsp_manager,
-    )
+    }
 }
 
 /// Compile the spawn commands by starting from `ProcessSpawner::default_commands`
 /// and applying per-server overrides from user config. A `disabled = true`
 /// override removes the entry; any non-empty `command` replaces the default.
+///
+/// Known limitation: `extensions` on the override is currently ignored. The
+/// claimed-extensions list lives in the static `builtin_servers()` registry
+/// (`lsp/server.rs`) — making it instance-overridable requires plumbing a
+/// per-session server set down through `LspManager`. Follow-up; users who
+/// need new extensions today must edit `server.rs`.
+#[cfg(feature = "lsp")]
 fn compile_lsp_commands(cfg: &config::Config) -> std::collections::HashMap<String, ProcessCommand> {
     let mut commands = ProcessSpawner::default_commands();
     let Some(lsp_cfg) = &cfg.lsp else {
@@ -334,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
-    let (
+    let Channels {
         permission,
         ask_tx,
         ask_rx,
@@ -344,8 +361,9 @@ async fn main() -> anyhow::Result<()> {
         plan_rx,
         bg_store,
         lifecycle_rx,
+        #[cfg(feature = "lsp")]
         lsp_manager,
-    ) = build_channels(&cli, &cfg);
+    } = build_channels(&cli, &cfg);
 
     if let Some(perm) = &permission {
         let allowlist: Vec<(String, String)> = session
@@ -371,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
             question_tx.clone(),
             plan_tx.clone(),
             bg_store.clone(),
+            #[cfg(feature = "lsp")]
             lsp_manager.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
@@ -402,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
                 question_tx.clone(),
                 plan_tx.clone(),
                 bg_store.clone(),
+                #[cfg(feature = "lsp")]
                 lsp_manager.clone(),
                 sandbox.clone(),
                 #[cfg(feature = "mcp")]
@@ -423,6 +443,7 @@ async fn main() -> anyhow::Result<()> {
             question_tx.clone(),
             plan_tx.clone(),
             bg_store.clone(),
+            #[cfg(feature = "lsp")]
             lsp_manager.clone(),
             sandbox.clone(),
             #[cfg(feature = "mcp")]
@@ -482,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
             plan_tx,
             bg_store,
             lifecycle_rx,
+            #[cfg(feature = "lsp")]
             lsp_manager,
             sandbox,
             #[cfg(feature = "mcp")]
