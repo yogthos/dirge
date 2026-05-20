@@ -17,6 +17,23 @@ pub enum AgentEvent {
         tokens: u64,
         cost: f64,
     },
+    /// Marks the start of one turn within an agent run. A "turn" is one
+    /// LLM call + any tool calls it dispatched + the tool results
+    /// returning. A pure-text response has exactly one turn (TurnStart 0
+    /// → TurnEnd 0 → Done). A run with tool calls has multiple turns,
+    /// with turn boundaries straddling tool-result/next-assistant
+    /// content. Plugin hook authors (P3) consume these to bracket
+    /// per-turn observability.
+    TurnStart {
+        index: u32,
+    },
+    /// Marks the end of one turn. Fires immediately before the next
+    /// turn's TurnStart, or just before `Done` for the final turn.
+    /// Empty runs (stream ended without any assistant content) emit
+    /// neither TurnStart nor TurnEnd.
+    TurnEnd {
+        index: u32,
+    },
     /// The runner observed an interjection request at a tool-result boundary
     /// and stopped the stream cleanly. Whatever assistant text had streamed
     /// so far is captured in `partial_response`. The UI is expected to

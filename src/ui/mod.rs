@@ -1697,6 +1697,10 @@ pub async fn run_interactive(
                             )?;
                         }
                     }
+                    // Turn boundary events from the runner. The UI doesn't
+                    // surface these directly today; they exist so P3 can
+                    // wire them into plugin hooks (on-turn-start / -end).
+                    AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. } => {}
                 }
                 renderer.draw_bottom(
                     &input,
