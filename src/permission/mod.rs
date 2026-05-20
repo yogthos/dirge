@@ -32,6 +32,16 @@ pub struct PermissionConfig {
     pub find_files: Option<ToolPerm>,
     pub list_dir: Option<ToolPerm>,
     pub write_todo_list: Option<ToolPerm>,
+    /// `apply_patch` — bulk multi-file patch tool. Mutates the
+    /// filesystem like `write`/`edit`; deserves per-pattern rules.
+    pub apply_patch: Option<ToolPerm>,
+    /// `lsp` — language-server queries (definition, references,
+    /// hover, etc.). Reads project files via the language server.
+    pub lsp: Option<ToolPerm>,
+    /// `question` — interactive user-input solicitation tool. Per-
+    /// pattern rules let users restrict which kinds of questions
+    /// the agent can ask.
+    pub question: Option<ToolPerm>,
     pub external_directory: Option<HashMap<String, Action>>,
     pub doom_loop: Option<Action>,
 }

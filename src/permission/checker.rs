@@ -60,6 +60,9 @@ impl PermissionChecker {
             ("find_files", &config.find_files),
             ("list_dir", &config.list_dir),
             ("write_todo_list", &config.write_todo_list),
+            ("apply_patch", &config.apply_patch),
+            ("lsp", &config.lsp),
+            ("question", &config.question),
         ] {
             let Some(tp) = tool_perm else { continue };
             let mut entries = Vec::new();

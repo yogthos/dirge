@@ -64,12 +64,129 @@ fn bullet_prefix(in_blockquote: bool) -> &'static str {
     if in_blockquote { "  ┊ " } else { "  • " }
 }
 
+/// Render a markdown table as `| col | col |` rows with a separator
+/// line below the header. Columns are padded so the right borders
+/// align. Caps each cell's display at the available width so a
+/// long cell doesn't break alignment. No-ops when both header and
+/// rows are empty.
+fn render_table(
+    header: &[String],
+    rows: &[Vec<String>],
+    max_width: usize,
+    out: &mut Vec<LineEntry>,
+) {
+    if header.is_empty() && rows.is_empty() {
+        return;
+    }
+    // Compute per-column max char width.
+    let ncols = header
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if ncols == 0 {
+        return;
+    }
+    let mut widths = vec![0usize; ncols];
+    for (i, cell) in header.iter().enumerate() {
+        widths[i] = widths[i].max(cell.chars().count());
+    }
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    // Cap any single column to avoid one runaway cell blowing the
+    // line width. Distribute available width: target inner width =
+    // max_width - 4 (for outer `| ` + ` |`), minus 3*(ncols-1) for
+    // ` | ` separators. Cells get clipped to fit.
+    let inner = max_width.saturating_sub(2 * 2);
+    let sep_overhead = if ncols > 1 { 3 * (ncols - 1) } else { 0 };
+    let cell_budget = inner.saturating_sub(sep_overhead);
+    let per_col = if ncols > 0 { cell_budget / ncols } else { 0 };
+    for w in widths.iter_mut() {
+        if per_col > 0 && *w > per_col {
+            *w = per_col;
+        }
+    }
+
+    let fit = |cell: &str, w: usize| -> String {
+        let chars: Vec<char> = cell.chars().collect();
+        if chars.len() <= w {
+            let mut s: String = chars.iter().collect();
+            for _ in chars.len()..w {
+                s.push(' ');
+            }
+            s
+        } else if w <= 1 {
+            chars.iter().take(w).collect()
+        } else {
+            let mut s: String = chars.iter().take(w - 1).collect();
+            s.push('…');
+            s
+        }
+    };
+
+    let render_row = |row: &[String], widths: &[usize]| -> String {
+        let mut s = String::with_capacity(max_width);
+        s.push_str("│ ");
+        for i in 0..widths.len() {
+            if i > 0 {
+                s.push_str(" │ ");
+            }
+            let cell = row.get(i).map(String::as_str).unwrap_or("");
+            s.push_str(&fit(cell, widths[i]));
+        }
+        s.push_str(" │");
+        s
+    };
+
+    let sep = {
+        let mut s = String::with_capacity(max_width);
+        s.push('├');
+        for (i, w) in widths.iter().enumerate() {
+            if i > 0 {
+                s.push('┼');
+            }
+            for _ in 0..(w + 2) {
+                s.push('─');
+            }
+        }
+        s.push('┤');
+        s
+    };
+
+    if !header.is_empty() {
+        out.push(LineEntry {
+            text: CompactString::new(&render_row(header, &widths)),
+            color: crate::ui::theme::header(),
+        });
+        out.push(LineEntry {
+            text: CompactString::new(&sep),
+            color: crate::ui::theme::dim(),
+        });
+    }
+    for row in rows {
+        out.push(LineEntry {
+            text: CompactString::new(&render_row(row, &widths)),
+            color: crate::ui::theme::agent(),
+        });
+    }
+    out.push(LineEntry {
+        text: CompactString::new(""),
+        color: crate::ui::theme::agent(),
+    });
+}
+
 pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
     if text.is_empty() {
         return Vec::new();
     }
 
-    let parser = pulldown_cmark::Parser::new(text);
+    // Enable GFM tables so `Tag::Table*` events actually fire.
+    // Without this, table syntax falls back to plain paragraphs and
+    // the table never reaches `render_table`.
+    let mut opts = pulldown_cmark::Options::empty();
+    opts.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    let parser = pulldown_cmark::Parser::new_ext(text, opts);
     let mut result = Vec::new();
     let mut acc = String::new();
 
@@ -78,6 +195,17 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
     let mut in_blockquote = false;
     let mut ordered_list = false;
     let mut list_item_count: u64 = 0;
+    // Table accumulation: pulldown_cmark emits TableHead → (Row × N
+    // cells) for the header row, then more TableRow blocks for body.
+    // We collect cells into `current_cell`, rows into `current_row`,
+    // and the whole table into `table_header` + `table_rows`, then
+    // render with column-aligned padding when the table ends.
+    let mut in_table = false;
+    let mut in_table_head = false;
+    let mut current_cell = String::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut table_header: Vec<String> = Vec::new();
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
 
     for event in parser {
         match event {
@@ -108,10 +236,23 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     list_item_count += 1;
                 }
                 Tag::FootnoteDefinition(_) => {}
-                Tag::Table(_) => {}
-                Tag::TableHead => {}
-                Tag::TableRow => {}
-                Tag::TableCell => {}
+                Tag::Table(_) => {
+                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
+                    acc.clear();
+                    in_table = true;
+                    table_header.clear();
+                    table_rows.clear();
+                }
+                Tag::TableHead => {
+                    in_table_head = true;
+                    current_row.clear();
+                }
+                Tag::TableRow => {
+                    current_row.clear();
+                }
+                Tag::TableCell => {
+                    current_cell.clear();
+                }
                 _ => {}
             },
             Event::End(tag_end) => match tag_end {
@@ -226,21 +367,37 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     });
                 }
                 TagEnd::FootnoteDefinition => {}
-                TagEnd::Table => {}
-                TagEnd::TableHead => {}
-                TagEnd::TableRow => {}
-                TagEnd::TableCell => {}
+                TagEnd::Table => {
+                    render_table(&table_header, &table_rows, max_width, &mut result);
+                    in_table = false;
+                }
+                TagEnd::TableHead => {
+                    table_header = std::mem::take(&mut current_row);
+                    in_table_head = false;
+                }
+                TagEnd::TableRow => {
+                    if !in_table_head {
+                        table_rows.push(std::mem::take(&mut current_row));
+                    }
+                }
+                TagEnd::TableCell => {
+                    current_row.push(std::mem::take(&mut current_cell));
+                }
                 _ => {}
             },
             Event::Text(t) => {
-                if in_code_block {
+                if in_table {
+                    current_cell.push_str(&t);
+                } else if in_code_block {
                     acc.push_str(&t);
                 } else {
                     acc.push_str(&t);
                 }
             }
             Event::Code(t) => {
-                if in_code_block {
+                if in_table {
+                    current_cell.push_str(&t);
+                } else if in_code_block {
                     acc.push_str(&t);
                 } else {
                     acc.push_str(&t);
