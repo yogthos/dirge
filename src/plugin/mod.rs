@@ -2063,7 +2063,14 @@ fn parse_tree_op_line(line: &str) -> Option<TreeOp> {
                 Some(TreeOp::SwitchSession { id_prefix: arg1 })
             }
         }
-        _ => None,
+        // Forward compat: a future plugin shipping an op verb we
+        // don't know yet shouldn't poison the rest of the drain. Log
+        // at WARN so a confused plugin author can spot the typo
+        // instead of silently failing.
+        other => {
+            tracing::warn!(target: "dirge::plugin", op = other, "drain_tree_ops: unknown op verb (skipped)");
+            None
+        }
     }
 }
 

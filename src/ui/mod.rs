@@ -1605,6 +1605,23 @@ pub async fn run_interactive(
                                 plugin_followup = Some(pending);
                             }
                             mgr.store_response(&response);
+                            // Fire on-complete after on-response so
+                            // plugins can react to "turn fully done."
+                            // Previously this hook was in HOOK_NAMES
+                            // (so plugins defining it got auto-aliased)
+                            // but no host site dispatched — silent fail.
+                            match mgr.dispatch("on-complete", "@{}") {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    renderer.write_line(
+                                        &format!("[plugin] on-complete error: {e}"),
+                                        c_error(),
+                                    )?;
+                                }
+                            }
+                            // Clear `harness-response` so the next hook
+                            // doesn't see stale text from this turn.
+                            let _ = mgr.eval("(set harness-response nil)");
                         }
 
                         if !response_buf.is_empty() {
@@ -1956,6 +1973,18 @@ pub async fn run_interactive(
                                     "on-turn-start",
                                     &format!("@{{:index {}}}", index),
                                 );
+                                // Clear tool-hook slots after the turn
+                                // hook runs so a `(harness/block ...)`
+                                // call inside on-turn-start can't bleed
+                                // into the *first* tool of the next
+                                // turn. `dispatch_tool_hook` clears
+                                // slots before tool hooks, but turn
+                                // hooks bypass that path.
+                                let _ = mgr.eval(
+                                    "(do (set harness-block nil) \
+                                         (set harness-mutate-input nil) \
+                                         (set harness-replace-result nil))",
+                                );
                             }
                         }
                         #[cfg(not(feature = "plugin"))]
@@ -1994,6 +2023,15 @@ pub async fn run_interactive(
                                         index,
                                         crate::plugin::escape_janet_string(&current_turn_text),
                                     ),
+                                );
+                                // Same defense as on-turn-start: clear
+                                // tool-hook slots so turn-end can't
+                                // leak block/mutate/replace into the
+                                // next tool call.
+                                let _ = mgr.eval(
+                                    "(do (set harness-block nil) \
+                                         (set harness-mutate-input nil) \
+                                         (set harness-replace-result nil))",
                                 );
                             }
                         }
