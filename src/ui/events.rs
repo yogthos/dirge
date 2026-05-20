@@ -81,7 +81,13 @@ pub fn render_session(
         let cont_indent = " ".repeat(handle.chars().count());
 
         if msg.role == MessageRole::Assistant {
-            let max_width = renderer.line_width();
+            // Wrap chat to the same width tool chambers use so chat
+            // and chamber blocks line up visually. The 8-col handle
+            // prefix is subtracted so wrapped continuation text fits
+            // beneath the handle position.
+            let max_width = renderer
+                .content_width()
+                .saturating_sub(handle.chars().count() + 1);
             let mut styled = markdown::markdown_to_styled(&msg.content, max_width);
             for (i, entry) in styled.iter_mut().enumerate() {
                 if i == 0 {

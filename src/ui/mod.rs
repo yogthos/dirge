@@ -1412,7 +1412,7 @@ pub async fn run_interactive(
                             continue;
                         }
 
-                        let max_width = renderer.line_width();
+                        let max_width = renderer.content_width().saturating_sub(9); // 8-col handle + space
                         let mut styled =
                             crate::ui::markdown::markdown_to_styled(&response_buf, max_width);
 
@@ -1603,7 +1603,7 @@ pub async fn run_interactive(
                         }
 
                         if !response_buf.is_empty() {
-                            let max_width = renderer.line_width();
+                            let max_width = renderer.content_width().saturating_sub(9); // 8-col handle + space
                             let mut styled = crate::ui::markdown::markdown_to_styled(
                                 &response_buf,
                                 max_width,
@@ -1812,7 +1812,7 @@ pub async fn run_interactive(
                         // the conversation history reflects what the user saw,
                         // not a phantom turn that "never happened".
                         if !response_buf.is_empty() {
-                            let max_width = renderer.line_width();
+                            let max_width = renderer.content_width().saturating_sub(9); // 8-col handle + space
                             let mut styled = crate::ui::markdown::markdown_to_styled(
                                 &response_buf,
                                 max_width,

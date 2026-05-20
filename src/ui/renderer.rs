@@ -157,6 +157,22 @@ impl Renderer {
         self.max_line_width()
     }
 
+    /// Target width for chat content. Caps at 120 cols so wide
+    /// terminals don't stretch chambers + chat lines into sprawling
+    /// rivers of text. Matches the cap used by tool chambers.
+    pub fn content_width(&self) -> usize {
+        self.line_width().min(120)
+    }
+
+    /// Left padding in columns to horizontally center the chat
+    /// content area (`content_width`) within the visible chat band
+    /// (`line_width`). Zero when content already fills the band.
+    pub fn content_indent(&self) -> usize {
+        let band = self.line_width();
+        let target = self.content_width();
+        band.saturating_sub(target) / 2
+    }
+
     pub fn buffer_len(&self) -> usize {
         self.buffer.len()
     }
@@ -373,12 +389,23 @@ impl Renderer {
         // `content_cols`). All chat text is clipped here; the remaining
         // columns belong to the divider + panel.
         let content_band = content_cols.saturating_sub(1) as usize;
+        // Left indent in columns to horizontally center chat content
+        // inside the band. We then clip the per-line text to
+        // `content_band - indent` so wide content can't spill into
+        // the divider/panel.
+        let indent = self.content_indent();
+        let line_cap = content_band.saturating_sub(indent);
         for i in 0..visible {
             stdout.execute(MoveTo(0, i as u16))?;
+            // Paint indent spaces (no color) so any stale text on the
+            // left edge from a wider previous line gets wiped.
+            if indent > 0 {
+                write!(stdout, "{}", " ".repeat(indent))?;
+            }
             let text_chars: usize = if start + i < end {
                 let entry = &self.buffer[start + i];
                 let line_idx = start + i;
-                let text: String = entry.text.chars().take(content_band).collect();
+                let text: String = entry.text.chars().take(line_cap).collect();
                 let actual_chars = text.chars().count();
 
                 let is_selected = self.selection_active
@@ -420,9 +447,12 @@ impl Renderer {
                 0
             };
             if self.panel_visible() {
-                // Manually pad to the content band; ClearType::UntilNewLine
-                // would wipe the panel area to our right.
-                let pad = content_band.saturating_sub(text_chars);
+                // Pad to fill the content band so stale chars from
+                // wider previous lines get wiped. With centering,
+                // the written length per row is `indent + text_chars`;
+                // the trailing pad fills `content_band - (indent + text)`.
+                let written = indent + text_chars;
+                let pad = content_band.saturating_sub(written);
                 if pad > 0 {
                     write!(stdout, "{}", " ".repeat(pad))?;
                 }
@@ -728,12 +758,16 @@ impl Renderer {
         let display_chars: Vec<Vec<char>> =
             display_lines.iter().map(|s| s.chars().collect()).collect();
 
+        // Input rows + status row also center under the chat band so
+        // the prompt + status visually align with the chat content
+        // above.
+        let bottom_indent = self.content_indent();
         for row_offset in 0..visible_input_rows {
             let row = input_top + row_offset as u16;
             let vr_idx = first_visible_visual + row_offset;
             stdout.execute(MoveTo(0, row))?;
             write!(stdout, "{}", " ".repeat(cols as usize))?;
-            stdout.execute(MoveTo(0, row))?;
+            stdout.execute(MoveTo(bottom_indent as u16, row))?;
             write!(
                 stdout,
                 "{}",
@@ -763,10 +797,10 @@ impl Renderer {
             write!(stdout, "{}", ResetColor)?;
         }
 
-        // Status row.
+        // Status row — also centered under the chat band.
         stdout.execute(MoveTo(0, status_row))?;
         write!(stdout, "{}", " ".repeat(cols as usize))?;
-        stdout.execute(MoveTo(0, status_row))?;
+        stdout.execute(MoveTo(bottom_indent as u16, status_row))?;
         write!(
             stdout,
             "{}",
@@ -803,7 +837,10 @@ impl Renderer {
         let cursor_row =
             input_top + (cursor_visual_row.saturating_sub(first_visible_visual)) as u16;
         // Match the 3-column prompt prefix used in the loop above.
-        let cursor_x = (3 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
+        // Match the indented prompt (`bottom_indent + 3-col prompt
+        // prefix` + cursor offset within content).
+        let cursor_x =
+            (bottom_indent + 3 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
         stdout.execute(MoveTo(cursor_x, cursor_row))?;
 
         if self.panel_visible() {
