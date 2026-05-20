@@ -1440,17 +1440,27 @@ pub async fn run_interactive(
                         }
                         response_buf.clear();
                         response_start_line = None;
-                        // Tool-call line: rounded chamber header with
-                        // the tool name on the border. Output lines
-                        // below get `│ ` chamber prefixes; the chamber
-                        // is closed with `╰─` after the ToolResult.
+                        // Tool-call line: rounded chamber TOP border
+                        // with the tool name on it. Output lines below
+                        // get `│ ` chamber rows; the chamber is closed
+                        // by `╰────╯` after the ToolResult. Header
+                        // border pads with dashes out to the frame
+                        // width so it visually mates with the closing
+                        // bottom border (matching btop's framed cards).
                         let upper = name.to_ascii_uppercase();
                         let summary = format_tool_call_summary(&name, &args);
                         let trimmed = summary
                             .strip_prefix(&format!("{} ", name))
                             .unwrap_or(&summary);
-                        let line = format!("╭─ {} ─ {}", upper, trimmed);
-                        renderer.write_line(&sanitize_output(&line), c_tool())?;
+                        let pre = format!("╭─ {} ─ {} ", upper, trimmed);
+                        let pre_clean = sanitize_output(&pre).into_string();
+                        let (frame_w, _) = chamber_widths(&renderer);
+                        let pre_len = pre_clean.chars().count();
+                        let dashes = frame_w
+                            .saturating_sub(pre_len + 1) // 1 for closing ╮
+                            .max(0);
+                        let header = format!("{}{}╮", pre_clean, "─".repeat(dashes));
+                        renderer.write_line(&header, c_tool())?;
 
                         // Note: on-tool-start fires from HookedToolDyn now,
                         // around the actual tool invocation. The UI no
@@ -1480,38 +1490,58 @@ pub async fn run_interactive(
                                     .iter()
                                     .position(|l| l.starts_with("--- a/"));
                                 if let Some(pre) = diff_start {
-                                    // Show non-diff prefix in the
-                                    // chamber so it sits visually
-                                    // attached to the tool-call banner.
+                                    let (frame_w, inner) = chamber_widths(&renderer);
+                                    // Pre-diff prose (the edit tool's
+                                    // header line, etc.) renders in
+                                    // the chamber's standard tone.
                                     for l in &lines[..pre] {
                                         if !l.is_empty() {
+                                            let txt = sanitize_output(l).into_string();
                                             renderer.write_line(
-                                                &format!("│ {}", sanitize_output(l)),
+                                                &chamber_row(&txt, inner),
                                                 theme::result(),
                                             )?;
                                         }
                                     }
-                                    // Show colorized diff. Each line gets
-                                    // the `│ ` chamber prefix so the diff
-                                    // sits inside the tool's frame.
+                                    // Colorized diff with opencode-style
+                                    // tinted backgrounds: + lines get a
+                                    // dim-green bg (palette 22), - lines
+                                    // get a dim-red bg (palette 52).
+                                    // Header (`--- ` / `+++ ` / `@@`) and
+                                    // context lines have no bg.
                                     for l in &lines[pre..] {
-                                        let painted = if l.starts_with("--- ") || l.starts_with("+++ ") {
-                                            (Color::Cyan, sanitize_output(l).into_string())
+                                        let txt = sanitize_output(l).into_string();
+                                        if l.starts_with("--- ") || l.starts_with("+++ ") {
+                                            renderer.write_line(
+                                                &chamber_row(&txt, inner),
+                                                Color::Cyan,
+                                            )?;
                                         } else if l.starts_with("@@") {
-                                            (Color::DarkCyan, sanitize_output(l).into_string())
+                                            renderer.write_line(
+                                                &chamber_row(&txt, inner),
+                                                Color::DarkCyan,
+                                            )?;
                                         } else if l.starts_with('+') {
-                                            (Color::Green, sanitize_output(l).into_string())
+                                            renderer.write_line(
+                                                &chamber_row_with_bg(&txt, inner, 22),
+                                                Color::Green,
+                                            )?;
                                         } else if l.starts_with('-') {
-                                            (Color::Red, sanitize_output(l).into_string())
+                                            renderer.write_line(
+                                                &chamber_row_with_bg(&txt, inner, 52),
+                                                Color::Red,
+                                            )?;
                                         } else {
-                                            (theme::dim(), sanitize_output(l).into_string())
-                                        };
-                                        renderer.write_line(
-                                            &format!("│ {}", painted.1),
-                                            painted.0,
-                                        )?;
+                                            renderer.write_line(
+                                                &chamber_row(&txt, inner),
+                                                theme::dim(),
+                                            )?;
+                                        }
                                     }
-                                    renderer.write_line("╰─", theme::dim())?;
+                                    renderer.write_line(
+                                        &chamber_bottom(frame_w),
+                                        theme::dim(),
+                                    )?;
                                 } else {
                                     // No diff section found, show normally
                                     render_tool_output(
@@ -2610,19 +2640,83 @@ fn render_tool_output(
     } else {
         sanitized.chars().take(max_chars).collect()
     };
-    // Tool output renders inside a rounded chamber attached to the
-    // tool-call header (`╭─ NAME ─ args` above). Every line gets a
-    // `│ ` chamber prefix; the chamber is closed by a `╰─` footer
-    // so the eye can scan tool boundaries top-to-bottom.
+    // Tool output renders inside a closed rounded chamber:
+    //   ╭─ READ ─ /path
+    //   │ contents ...                    │
+    //   ╰─────────────────────────────────╯
+    // Lines are padded/truncated to a fixed inner width so the right
+    // border stays aligned across the chamber.
+    let (frame_w, inner) = chamber_widths(renderer);
     for line in body.lines() {
-        renderer.write_line(&format!("│ {}", line), theme::result())?;
+        renderer.write_line(&chamber_row(line, inner), theme::result())?;
     }
     if char_count > max_chars {
         let remaining = char_count - max_chars;
-        renderer.write_line(&format!("│ ░ +{} chars truncated", remaining), theme::dim())?;
+        let note = format!("░ +{} chars truncated", remaining);
+        renderer.write_line(&chamber_row(&note, inner), theme::dim())?;
     }
-    renderer.write_line("╰─", theme::dim())?;
+    renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
     Ok(())
+}
+
+/// Standard tool-chamber widths derived from the renderer's content
+/// area. Capped at 120 so very wide terminals don't produce sprawling
+/// chambers that overwhelm the content.
+fn chamber_widths(renderer: &Renderer) -> (usize, usize) {
+    let term_w = renderer.line_width().max(20);
+    let frame_w = term_w.min(120);
+    let inner = frame_w.saturating_sub(4); // `│ ` + ` │`
+    (frame_w, inner)
+}
+
+/// `╰────────────╯` footer of a tool chamber, sized to `frame_w`.
+fn chamber_bottom(frame_w: usize) -> String {
+    format!("╰{}╯", "─".repeat(frame_w.saturating_sub(2)))
+}
+
+/// `│ content (truncated/padded to inner) │` row of a tool chamber.
+fn chamber_row(content: &str, inner: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let trimmed: String = if chars.len() <= inner {
+        chars.iter().collect()
+    } else if inner == 0 {
+        String::new()
+    } else {
+        let mut out: String = chars[..inner.saturating_sub(1)].iter().collect();
+        out.push('…');
+        out
+    };
+    let pad = inner.saturating_sub(trimmed.chars().count());
+    format!("│ {}{} │", trimmed, " ".repeat(pad))
+}
+
+/// Background-tinted chamber row for diff `+`/`-` lines. Emits raw
+/// SGR `48;5;{bg}` background sequence inside the row so the diff
+/// tint fills the inner width; the left + right border glyphs sit
+/// outside the bg span so they keep the chamber color.
+///
+/// Opencode uses subtly-tinted backgrounds (`tint(bg, green, 0.15)`
+/// etc.) to mark added/removed lines without overwhelming the
+/// scanability. We approximate that with the 256-color palette:
+/// dim green (22) for adds, dim red (52) for removes.
+fn chamber_row_with_bg(content: &str, inner: usize, bg_idx: u8) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let trimmed: String = if chars.len() <= inner {
+        chars.iter().collect()
+    } else if inner == 0 {
+        String::new()
+    } else {
+        let mut out: String = chars[..inner.saturating_sub(1)].iter().collect();
+        out.push('…');
+        out
+    };
+    let pad = inner.saturating_sub(trimmed.chars().count());
+    format!(
+        "│ \x1b[48;5;{}m{}{}\x1b[49m │",
+        bg_idx,
+        trimmed,
+        " ".repeat(pad),
+    )
 }
 
 fn update_search(renderer: &Renderer, query: &str, matches: &mut Vec<usize>, selected: &mut usize) {

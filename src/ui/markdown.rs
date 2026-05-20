@@ -87,17 +87,17 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
                 Tag::Heading { level: _, .. } => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
                     acc.clear();
                     in_heading = true;
                 }
                 Tag::CodeBlock(_kind) => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
                     acc.clear();
                     in_code_block = true;
                 }
                 Tag::BlockQuote(_) => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
                     acc.clear();
                     in_blockquote = true;
                 }
@@ -106,7 +106,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     list_item_count = 0;
                 }
                 Tag::Item => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
                     acc.clear();
                     list_item_count += 1;
                 }
@@ -122,7 +122,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     let color = if in_blockquote {
                         Color::DarkGrey
                     } else {
-                        Color::White
+                        crate::ui::theme::agent()
                     };
                     flush_acc(&acc, color, max_width, &mut result);
                     acc.clear();
@@ -133,7 +133,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     in_heading = false;
                     result.push(LineEntry {
                         text: CompactString::new(""),
-                        color: Color::White,
+                        color: crate::ui::theme::agent(),
                     });
                 }
                 TagEnd::CodeBlock => {
@@ -155,7 +155,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     in_code_block = false;
                     result.push(LineEntry {
                         text: CompactString::new(""),
-                        color: Color::White,
+                        color: crate::ui::theme::agent(),
                     });
                 }
                 TagEnd::BlockQuote(_) => {
@@ -182,14 +182,14 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     in_blockquote = false;
                     result.push(LineEntry {
                         text: CompactString::new(""),
-                        color: Color::White,
+                        color: crate::ui::theme::agent(),
                     });
                 }
                 TagEnd::Item => {
                     let color = if in_blockquote {
                         Color::DarkGrey
                     } else {
-                        Color::White
+                        crate::ui::theme::agent()
                     };
                     let bullet = if ordered_list {
                         format!(" {}. ", list_item_count)
@@ -225,7 +225,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     list_item_count = 0;
                     result.push(LineEntry {
                         text: CompactString::new(""),
-                        color: Color::White,
+                        color: crate::ui::theme::agent(),
                     });
                 }
                 TagEnd::FootnoteDefinition => {}
@@ -257,7 +257,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 }
             }
             Event::Rule => {
-                flush_acc(&acc, Color::White, max_width, &mut result);
+                flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
                 acc.clear();
                 let rule: String = std::iter::repeat('─').take(max_width.min(40)).collect();
                 result.push(LineEntry {
@@ -266,7 +266,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 });
                 result.push(LineEntry {
                     text: CompactString::new(""),
-                    color: Color::White,
+                    color: crate::ui::theme::agent(),
                 });
             }
             Event::Html(t) => {
@@ -297,7 +297,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
         } else if in_heading {
             Color::Cyan
         } else {
-            Color::White
+            crate::ui::theme::agent()
         };
         flush_acc(&acc, color, max_width, &mut result);
     }

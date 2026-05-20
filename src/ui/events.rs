@@ -194,8 +194,16 @@ fn render_banner(renderer: &mut Renderer, provider: &str, model: &str) -> anyhow
 }
 
 pub fn sanitize_output(text: &str) -> CompactString {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars();
+    // Two-pass: first strip orphan SGR mouse reports of the form
+    // `[<digits;digits;digits(M|m)` (no leading escape). These can
+    // leak into tool output when a shell command captures terminal
+    // input bytes, and without this guard they smear `[<65;79;32M…`
+    // through the chamber. Then run the regular ANSI/control-char
+    // sanitizer over the cleaned text.
+    let stripped = strip_orphan_mouse_reports(text);
+
+    let mut result = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             match chars.next() {
@@ -216,4 +224,47 @@ pub fn sanitize_output(text: &str) -> CompactString {
         }
     }
     CompactString::from(result)
+}
+
+/// Strip orphan SGR mouse-report sequences (e.g. `[<65;79;32M`) that
+/// arrive without their leading `\x1b`. Walks the input scanning for
+/// the literal pattern `[<` followed by digits and semicolons ending
+/// in `M` or `m`; matched runs are dropped. Anything else passes
+/// through unchanged.
+fn strip_orphan_mouse_reports(text: &str) -> String {
+    let bytes: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '[' && i + 1 < bytes.len() && bytes[i + 1] == '<' {
+            // Try to match `[<digits;digits;digits(M|m)`.
+            let mut j = i + 2;
+            let mut saw_digit_or_semi = false;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if c.is_ascii_digit() || c == ';' {
+                    saw_digit_or_semi = true;
+                    j += 1;
+                } else if (c == 'M' || c == 'm') && saw_digit_or_semi {
+                    i = j + 1;
+                    break;
+                } else {
+                    // Not a mouse report — pass `[` through and resume
+                    // scanning at the next position.
+                    out.push(bytes[i]);
+                    i += 1;
+                    break;
+                }
+            }
+            if j >= bytes.len() {
+                // Truncated input — pass through what we have.
+                out.push(bytes[i]);
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
 }

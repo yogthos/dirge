@@ -745,13 +745,22 @@ impl Renderer {
             } else {
                 write!(stdout, "{}", prompt_cont)?;
             }
-            write!(stdout, "{}", ResetColor)?;
+            // Switch to the user-input text tone (bright phosphor)
+            // before writing what the user typed, so the prompt
+            // accent and the input text are visually distinct but
+            // both on the green axis.
+            write!(
+                stdout,
+                "{}",
+                SetForegroundColor(self.color(crate::ui::theme::user()))
+            )?;
             if let Some(vr) = visual_rows.get(vr_idx)
                 && let Some(chars) = display_chars.get(vr.logical_line)
             {
                 let slice: String = chars[vr.char_start..vr.char_end].iter().collect();
                 write!(stdout, "{}", slice)?;
             }
+            write!(stdout, "{}", ResetColor)?;
         }
 
         // Status row.
@@ -885,49 +894,57 @@ impl Renderer {
             }
         };
 
-        // Panel top: rounded-corner SYS header with label-on-border,
-        // mirroring the btop reference where every region is wrapped
-        // in `╭─ Label ─╮` frames. This panel has no right border
-        // (it's a vertical strip), so we use a half-frame
-        // `╭─ Label ────`.
+        // Inner width inside the frame's left+right borders.
+        let inner = width.saturating_sub(2);
+        // Helper: format a content row inside a closed pill — left
+        // border, padded content, right border. Truncates content
+        // that overflows so the pill stays a perfect rectangle.
+        let row = |text: &str| -> String {
+            let trimmed = truncate(text, inner);
+            let len = trimmed.chars().count();
+            let pad = inner.saturating_sub(len);
+            format!("│{}{}│", trimmed, " ".repeat(pad))
+        };
+        // Helper: bottom border of a pill (`╰────────╯`).
+        let bottom = || -> String { format!("╰{}╯", "─".repeat(inner)) };
+
+        // Panel top pill: `╭─ DIRGE.SYS ────╮` … `╰──────────╯`.
         let dirge_label = " DIRGE.SYS ";
         let dirge_pre_len = dirge_label.chars().count() + 2;
-        let dirge_dashes = width.saturating_sub(dirge_pre_len);
+        let dirge_dashes = inner.saturating_sub(dirge_label.chars().count() + 1);
+        let _ = dirge_pre_len;
         out.push((
-            format!("╭─{}{}", dirge_label, "─".repeat(dirge_dashes)),
+            format!("╭─{}{}╮", dirge_label, "─".repeat(dirge_dashes)),
             Color::Cyan,
         ));
-        out.push((truncate(&format!("│ {}", d.cwd), width), Color::White));
+        out.push((row(&format!(" {}", d.cwd)), Color::White));
+        out.push((bottom(), Color::Cyan));
 
-        // Section helper: rounded-corner half-frame with the section
-        // name living *on* the border (`╭─ MCP ─────`). The `│`
-        // left-bar continues down the section so each block reads as
-        // a vertical chamber. Empty sections show `│ · (none)` in the
-        // dim phosphor tone rather than grey.
+        // Section helper: closed pill with the section name on the
+        // top border (`╭─ MCP ─────╮ … ╰────────╯`). Every content
+        // row gets a `│ … │` left+right border so the section reads
+        // as a discrete card, matching the btop / cool-retro-term
+        // reference. Empty sections show `· (none)` in the dim
+        // phosphor tone rather than grey.
         let push_section =
             |out: &mut Vec<(String, Color)>, title: &str, items: Vec<(String, Color)>| {
                 out.push((String::new(), Color::Reset));
                 let label = format!(" {} ", title);
-                let pre_len = label.chars().count() + 2;
-                let dashes = width.saturating_sub(pre_len);
-                let header = format!("╭─{}{}", label, "─".repeat(dashes));
-                out.push((truncate(&header, width), Color::Cyan));
+                let pre_len = label.chars().count() + 1;
+                let dashes = inner.saturating_sub(pre_len);
+                let header = format!("╭─{}{}╮", label, "─".repeat(dashes));
+                out.push((header, Color::Cyan));
                 if items.is_empty() {
-                    out.push((truncate("│ · (none)", width), Color::Reset));
+                    out.push((row(" · (none)"), Color::Reset));
                 } else {
                     for (text, color) in items {
-                        // Items already arrive with a leading "  ";
-                        // swap that for "│ " so the chamber bar runs
-                        // continuously down the left edge of the
-                        // section.
-                        let prefixed = if let Some(rest) = text.strip_prefix("  ") {
-                            format!("│ {}", rest)
-                        } else {
-                            format!("│ {}", text)
-                        };
-                        out.push((truncate(&prefixed, width), color));
+                        // Items arrive with a leading "  "; strip it
+                        // and let `row` re-add the chamber prefix.
+                        let content = text.strip_prefix("  ").unwrap_or(&text);
+                        out.push((row(&format!(" {}", content)), color));
                     }
                 }
+                out.push((bottom(), Color::Cyan));
             };
 
         let mcp_items: Vec<(String, Color)> = d
