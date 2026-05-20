@@ -63,47 +63,50 @@ pub fn render_session(
     }
     let total = session.messages.len();
     for (idx, msg) in session.messages.iter().enumerate() {
-        let (badge, line_color) = match msg.role {
-            MessageRole::User => ("▌▌ USR ▏", theme::user()),
-            MessageRole::Assistant => ("▌▌ AI  ▏", theme::agent()),
-            MessageRole::System => ("▌▌ SYS ▏", theme::system()),
+        // IRC-style angle-bracketed handle. All three handles padded
+        // to 8 columns so multi-role chats stay visually aligned.
+        // Continuation lines are indented to that same width so the
+        // handle isn't repeated on every wrap.
+        let (handle, line_color) = match msg.role {
+            MessageRole::User => ("<you>   ", theme::user()),
+            MessageRole::Assistant => ("<dirge> ", theme::agent()),
+            MessageRole::System => ("<sys>   ", theme::system()),
         };
+        let cont_indent = " ".repeat(handle.chars().count());
+
         if msg.role == MessageRole::Assistant {
             let max_width = renderer.line_width();
             let mut styled = markdown::markdown_to_styled(&msg.content, max_width);
-            if !styled.is_empty() {
-                styled[0].text = CompactString::from(format!("{} {}", badge, styled[0].text));
+            for (i, entry) in styled.iter_mut().enumerate() {
+                if i == 0 {
+                    entry.text = CompactString::from(format!("{} {}", handle, entry.text));
+                } else {
+                    entry.text = CompactString::from(format!("{}{}", cont_indent, entry.text));
+                }
             }
             for entry in styled {
                 renderer.write_line(&entry.text, entry.color)?;
             }
         } else {
-            for line in msg.content.lines() {
-                renderer.write_line(&format!("{} {}", badge, line), line_color)?;
+            for (i, line) in msg.content.lines().enumerate() {
+                let prefix = if i == 0 {
+                    handle.to_string()
+                } else {
+                    cont_indent.clone()
+                };
+                renderer.write_line(&format!("{} {}", prefix, line), line_color)?;
             }
         }
-        // Insert a thin gradient turn-divider between messages (but not
-        // after the last one). Visual rhythm hint without dominating.
+        // Thin chamber-bar divider between turns. Single character,
+        // not a full-width gradient — the bar runs flush against the
+        // left margin like an IRC log's timeline.
         if idx + 1 < total {
-            renderer.write_line(&turn_divider(renderer.line_width()), theme::divider())?;
+            renderer.write_line("·", theme::divider())?;
         } else {
             renderer.write_line("", Color::Reset)?;
         }
     }
     Ok(())
-}
-
-/// A thin half-width gradient divider used between chat turns. Subtle
-/// enough not to noise up the scrollback but distinctive enough to
-/// signal a turn boundary at a glance.
-fn turn_divider(term_w: usize) -> String {
-    let w = term_w.min(60).max(20);
-    let mut out = String::with_capacity(w);
-    // Use ░▒ alternation for a phosphor scanline feel.
-    for i in 0..w {
-        out.push(if i % 2 == 0 { '░' } else { '▒' });
-    }
-    out
 }
 
 /// Block-letter "DIRGE" in the ANSI Shadow figlet style. Period-correct
@@ -117,87 +120,77 @@ const DIRGE_BLOCK_ART: &[&str] = &[
     "╚═════╝ ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝",
 ];
 
-/// Welcome banner for the phosphor/plain theme. Renders a chunky
-/// block-letter "DIRGE" wordmark sandwiched between gradient bars,
-/// followed by a status line. Falls back to a single-line text banner
-/// when the terminal is too narrow (< 42 cols) for the ASCII art.
+/// Welcome banner — block-letter "DIRGE" wordmark inside a rounded
+/// frame with the theme/version/provider/model on the bottom border.
+/// Mirrors the btop / cool-retro-term reference: every UI region is a
+/// rounded panel with its label sitting on the border, no heavy
+/// gradient stripes. Falls back to a single-line text banner on
+/// terminals narrower than 50 cols.
 fn render_banner(renderer: &mut Renderer, provider: &str, model: &str) -> anyhow::Result<()> {
     let label = theme::current().label;
     let version = env!("CARGO_PKG_VERSION");
     let term_w = renderer.line_width().max(20);
 
-    // The block art is 38 cols wide; we need ~42 for it to breathe.
-    // Narrow terminals get a one-line text banner instead.
-    if term_w < 42 {
-        let line = format!("▓▒░ DIRGE · {} · v{} ░▒▓", label, version);
-        renderer.write_line(&line, theme::banner_primary())?;
+    if term_w < 50 {
         renderer.write_line(
-            &format!("    provider: {} · model: {}", provider, model),
+            &format!("╭─ DIRGE · {} · v{} ", label, version),
+            theme::banner_primary(),
+        )?;
+        renderer.write_line(
+            &format!("│ provider: {} · model: {}", provider, model),
             theme::banner_secondary(),
         )?;
+        renderer.write_line("╰─", theme::banner_secondary())?;
         renderer.write_line("", Color::Reset)?;
         return Ok(());
     }
 
-    // Gradient bar — runs the full visible width (capped at 78) so the
-    // banner anchors a "screen header" feel without bleeding into the
-    // right-hand panel.
-    let bar_width = term_w.min(78);
-    let gradient = build_gradient_bar(bar_width);
+    // Frame width: cap at 78 so the banner doesn't sprawl on wide
+    // monitors, and so it sits visually proportionate to the chat.
+    let frame_w = term_w.min(78);
+    let inner_w = frame_w.saturating_sub(2);
 
-    renderer.write_line(&gradient, theme::banner_secondary())?;
-    renderer.write_line("", Color::Reset)?;
-    for art_line in DIRGE_BLOCK_ART {
-        renderer.write_line(&format!("   {}", art_line), theme::banner_primary())?;
-    }
-    renderer.write_line("", Color::Reset)?;
-    // Status line in the wordmark's right gutter; centered under the
-    // art for symmetry.
-    let status = format!(
-        "▓▒░ {} · v{} · {} · {} ░▒▓",
-        label, version, provider, model
-    );
-    let pad = bar_width.saturating_sub(status.chars().count()) / 2;
+    // Top border with the wordmark label sitting on it.
+    let top_label = format!(" DIRGE · {} ", label);
+    let top_label_len = top_label.chars().count();
+    let top_filler = inner_w.saturating_sub(top_label_len + 2);
+    let top_left = "─".repeat(2);
+    let top_right = "─".repeat(top_filler);
+    let top_border = format!("╭{}{}{}╮", top_left, top_label, top_right);
+
+    // Bottom border with the status label.
+    let bot_label = format!(" v{} · {} · {} ", version, provider, model);
+    let bot_label_len = bot_label.chars().count();
+    let bot_left = "─".repeat(inner_w.saturating_sub(bot_label_len + 2));
+    let bot_right = "─".repeat(2);
+    let bot_border = format!("╰{}{}{}╯", bot_left, bot_label, bot_right);
+
+    renderer.write_line(&top_border, theme::banner_secondary())?;
+    // Padding row above the art.
     renderer.write_line(
-        &format!("{}{}", " ".repeat(pad), status),
+        &format!("│{}│", " ".repeat(inner_w)),
         theme::banner_secondary(),
     )?;
-    renderer.write_line("", Color::Reset)?;
-    renderer.write_line(&gradient, theme::banner_secondary())?;
+    // Block-letter art, padded on both sides to fill the frame.
+    // The whole line renders in the bright banner_primary tone so the
+    // wordmark glows; the surrounding empty padding rows + borders
+    // stay dim, giving the eye a clear focal point.
+    for art_line in DIRGE_BLOCK_ART {
+        let art_len = art_line.chars().count();
+        let total_pad = inner_w.saturating_sub(art_len);
+        let left = total_pad / 2;
+        let right = total_pad - left;
+        let line = format!("│{}{}{}│", " ".repeat(left), art_line, " ".repeat(right),);
+        renderer.write_line(&line, theme::banner_primary())?;
+    }
+    // Padding row below the art.
+    renderer.write_line(
+        &format!("│{}│", " ".repeat(inner_w)),
+        theme::banner_secondary(),
+    )?;
+    renderer.write_line(&bot_border, theme::banner_secondary())?;
     renderer.write_line("", Color::Reset)?;
     Ok(())
-}
-
-/// Build a `▓▒░░░▒▓` gradient bar exactly `width` chars wide. The
-/// pattern fades from solid to sparse across each end, suggesting CRT
-/// scanline edge dither without doing anything that actually depends
-/// on color depth.
-fn build_gradient_bar(width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let glyphs = ['█', '▓', '▒', '░', ' ', '░', '▒', '▓', '█'];
-    // We want a smooth left-edge gradient that reaches solid blocks in
-    // the middle and fades back out on the right.
-    let mut out = String::with_capacity(width * 3);
-    // Build half-gradients of length min(8, width / 3) and a solid
-    // middle filling the remainder.
-    let half = (width / 3).min(8);
-    let solid = width.saturating_sub(half * 2);
-    for i in 0..half {
-        // Map left edge: 0..half -> indices 3..0 of glyphs (░▒▓█)
-        let glyph_idx = 3usize.saturating_sub((i * 4) / half.max(1));
-        out.push(glyphs[glyph_idx]);
-    }
-    for _ in 0..solid {
-        out.push('█');
-    }
-    for i in 0..half {
-        // Right edge: mirror the left.
-        let glyph_idx = (((i + 1) * 4) / half.max(1)).min(3);
-        out.push(glyphs[5 + glyph_idx]); // skip the space; reach ▒▓█
-    }
-    out
 }
 
 pub fn sanitize_output(text: &str) -> CompactString {

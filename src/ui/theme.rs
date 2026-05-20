@@ -185,6 +185,23 @@ pub fn banner_secondary() -> Color {
     current().banner_secondary
 }
 
+/// Whether the given color should render with the Bold attribute to
+/// fake the CRT phosphor "bloom" effect. Bright phosphor tones glow;
+/// dim secondary tones stay un-bloomed so the two-tone depth in the
+/// reference screenshots is preserved.
+pub fn is_bright(c: Color) -> bool {
+    matches!(
+        c,
+        Color::Green
+            | Color::Red
+            | Color::Yellow
+            | Color::Cyan
+            | Color::Magenta
+            | Color::Blue
+            | Color::White
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

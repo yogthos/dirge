@@ -395,8 +395,22 @@ impl Renderer {
                 if is_selected {
                     write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
                 }
+                // Bold attribute simulates the CRT phosphor bloom: on
+                // most modern terminals it nudges the glyphs to a
+                // heavier weight and a brighter shade of the chosen
+                // color. We apply it to bright tones only (the dim
+                // green / dim grey colors must stay un-bloomed to
+                // preserve the two-tone phosphor depth shown in the
+                // reference btop screenshots).
+                let bloom = crate::ui::theme::is_bright(entry.color);
+                if bloom {
+                    write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                }
                 write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
                 write!(stdout, "{}", text)?;
+                if bloom {
+                    write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                }
                 if is_selected {
                     write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
                 }
@@ -871,36 +885,47 @@ impl Renderer {
             }
         };
 
-        // Top header: gradient bar + SYS banner + cwd. The banner
-        // anchors the panel with the same aesthetic as the welcome
-        // banner so the eye treats both surfaces as one design system.
-        let bar_len = width.saturating_sub(1).max(4);
-        let top_bar: String = std::iter::repeat('▓')
-            .take(bar_len / 3)
-            .chain(std::iter::repeat('▒').take(bar_len / 3))
-            .chain(std::iter::repeat('░').take(bar_len - 2 * (bar_len / 3)))
-            .collect();
-        out.push((top_bar, Color::Cyan));
-        out.push((truncate(&format!(" ▒░ DIRGE.SYS ░▒"), width), Color::Cyan));
-        out.push((truncate(&format!(" {}", d.cwd), width), Color::White));
+        // Panel top: rounded-corner SYS header with label-on-border,
+        // mirroring the btop reference where every region is wrapped
+        // in `╭─ Label ─╮` frames. This panel has no right border
+        // (it's a vertical strip), so we use a half-frame
+        // `╭─ Label ────`.
+        let dirge_label = " DIRGE.SYS ";
+        let dirge_pre_len = dirge_label.chars().count() + 2;
+        let dirge_dashes = width.saturating_sub(dirge_pre_len);
+        out.push((
+            format!("╭─{}{}", dirge_label, "─".repeat(dirge_dashes)),
+            Color::Cyan,
+        ));
+        out.push((truncate(&format!("│ {}", d.cwd), width), Color::White));
 
-        // Section helper: framed header `─[ NAME ]──…` then items.
-        // Empty sections render a single dimmed "  · (none)" line so
-        // the user sees the section is checked-and-empty rather than
-        // missing.
+        // Section helper: rounded-corner half-frame with the section
+        // name living *on* the border (`╭─ MCP ─────`). The `│`
+        // left-bar continues down the section so each block reads as
+        // a vertical chamber. Empty sections show `│ · (none)` in the
+        // dim phosphor tone rather than grey.
         let push_section =
             |out: &mut Vec<(String, Color)>, title: &str, items: Vec<(String, Color)>| {
                 out.push((String::new(), Color::Reset));
-                let pre = format!("─[ {} ]", title);
-                let pre_len = pre.chars().count();
+                let label = format!(" {} ", title);
+                let pre_len = label.chars().count() + 2;
                 let dashes = width.saturating_sub(pre_len);
-                let header = format!("{}{}", pre, "─".repeat(dashes));
+                let header = format!("╭─{}{}", label, "─".repeat(dashes));
                 out.push((truncate(&header, width), Color::Cyan));
                 if items.is_empty() {
-                    out.push((truncate("  · (none)", width), Color::Reset));
+                    out.push((truncate("│ · (none)", width), Color::Reset));
                 } else {
                     for (text, color) in items {
-                        out.push((truncate(&text, width), color));
+                        // Items already arrive with a leading "  ";
+                        // swap that for "│ " so the chamber bar runs
+                        // continuously down the left edge of the
+                        // section.
+                        let prefixed = if let Some(rest) = text.strip_prefix("  ") {
+                            format!("│ {}", rest)
+                        } else {
+                            format!("│ {}", text)
+                        };
+                        out.push((truncate(&prefixed, width), color));
                     }
                 }
             };

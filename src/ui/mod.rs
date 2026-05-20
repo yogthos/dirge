@@ -1039,7 +1039,7 @@ pub async fn run_interactive(
                                 }
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
+                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
                                 match prefix {
@@ -1097,7 +1097,7 @@ pub async fn run_interactive(
                                 }
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
+                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
                                 let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager).await;
@@ -1261,7 +1261,7 @@ pub async fn run_interactive(
                             } else {
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
+                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
 
@@ -1367,7 +1367,7 @@ pub async fn run_interactive(
                             continue;
                         }
                         if !agent_line_started {
-                            renderer.write("< ", Color::DarkMagenta)?;
+                            renderer.write("<dirge> ", Color::DarkMagenta)?;
                             agent_line_started = true;
                         }
                         let safe = sanitize_output(&text);
@@ -1418,7 +1418,7 @@ pub async fn run_interactive(
 
                         if !styled.is_empty() {
                             styled[0].text =
-                                CompactString::from(format!("< {}", styled[0].text));
+                                CompactString::from(format!("<dirge> {}", styled[0].text));
                         }
 
                         if let Some(start) = response_start_line {
@@ -1440,19 +1440,16 @@ pub async fn run_interactive(
                         }
                         response_buf.clear();
                         response_start_line = None;
-                        // Tool-call line: framed BBS-style banner that
-                        // visually demarcates the agent's tool use from
-                        // its prose. `▒░ NAME ░▒ args…` puts the tool
-                        // name on a small gradient pedestal so the eye
-                        // immediately sees what's running.
+                        // Tool-call line: rounded chamber header with
+                        // the tool name on the border. Output lines
+                        // below get `│ ` chamber prefixes; the chamber
+                        // is closed with `╰─` after the ToolResult.
                         let upper = name.to_ascii_uppercase();
                         let summary = format_tool_call_summary(&name, &args);
-                        // Strip the leading "name " that format_tool_call_summary
-                        // produces, since the framed badge already shows it.
                         let trimmed = summary
                             .strip_prefix(&format!("{} ", name))
                             .unwrap_or(&summary);
-                        let line = format!("▒░ {} ░▒ {}", upper, trimmed);
+                        let line = format!("╭─ {} ─ {}", upper, trimmed);
                         renderer.write_line(&sanitize_output(&line), c_tool())?;
 
                         // Note: on-tool-start fires from HookedToolDyn now,
@@ -1489,28 +1486,32 @@ pub async fn run_interactive(
                                     for l in &lines[..pre] {
                                         if !l.is_empty() {
                                             renderer.write_line(
-                                                &format!("▏ {}", sanitize_output(l)),
+                                                &format!("│ {}", sanitize_output(l)),
                                                 theme::result(),
                                             )?;
                                         }
                                     }
-                                    // Show colorized diff
+                                    // Show colorized diff. Each line gets
+                                    // the `│ ` chamber prefix so the diff
+                                    // sits inside the tool's frame.
                                     for l in &lines[pre..] {
-                                        if l.starts_with("--- ") || l.starts_with("+++ ") {
-                                            renderer.write_line(l, Color::Cyan)?;
+                                        let painted = if l.starts_with("--- ") || l.starts_with("+++ ") {
+                                            (Color::Cyan, sanitize_output(l).into_string())
                                         } else if l.starts_with("@@") {
-                                            renderer.write_line(l, Color::DarkCyan)?;
+                                            (Color::DarkCyan, sanitize_output(l).into_string())
                                         } else if l.starts_with('+') {
-                                            renderer.write_line(l, Color::Green)?;
+                                            (Color::Green, sanitize_output(l).into_string())
                                         } else if l.starts_with('-') {
-                                            renderer.write_line(l, Color::Red)?;
+                                            (Color::Red, sanitize_output(l).into_string())
                                         } else {
-                                            renderer.write_line(
-                                                &sanitize_output(l),
-                                                theme::dim(),
-                                            )?;
-                                        }
+                                            (theme::dim(), sanitize_output(l).into_string())
+                                        };
+                                        renderer.write_line(
+                                            &format!("│ {}", painted.1),
+                                            painted.0,
+                                        )?;
                                     }
+                                    renderer.write_line("╰─", theme::dim())?;
                                 } else {
                                     // No diff section found, show normally
                                     render_tool_output(
@@ -1573,14 +1574,14 @@ pub async fn run_interactive(
                             );
                             if !styled.is_empty() {
                                 styled[0].text =
-                                    CompactString::from(format!("< {}", styled[0].text));
+                                    CompactString::from(format!("<dirge> {}", styled[0].text));
                             }
                             if let Some(start) = response_start_line {
                                 renderer.replace_from(start, styled);
                                 renderer.render_viewport()?;
                             }
                         } else if !agent_line_started {
-                            renderer.write("< ", c_agent())?;
+                            renderer.write("<dirge> ", c_agent())?;
                         }
 
                         renderer.write_line("", Color::White)?;
@@ -1747,7 +1748,7 @@ pub async fn run_interactive(
                             for line in combined.lines() {
                                 let safe_line = sanitize_output(line);
                                 renderer
-                                    .write_line(&format!("> {}", safe_line), Color::Green)?;
+                                    .write_line(&format!("<you>   {}", safe_line), theme::user())?;
                             }
                             renderer.write_line("", Color::White)?;
 
@@ -1782,7 +1783,7 @@ pub async fn run_interactive(
                             );
                             if !styled.is_empty() {
                                 styled[0].text =
-                                    CompactString::from(format!("< {}", styled[0].text));
+                                    CompactString::from(format!("<dirge> {}", styled[0].text));
                             }
                             if let Some(start) = response_start_line {
                                 renderer.replace_from(start, styled);
@@ -1829,7 +1830,7 @@ pub async fn run_interactive(
                             let combined = queued.join("\n\n");
                             for line in combined.lines() {
                                 let safe_line = sanitize_output(line);
-                                renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
+                                renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
                             }
                             renderer.write_line("", Color::White)?;
 
@@ -1987,21 +1988,22 @@ pub async fn run_interactive(
                 // independent of terminal width; the chat area
                 // requires at least 60 cols anyway.
                 const BOX_W: usize = 64;
-                let top_label = "╔══[ ⚠ ALERT · PERMISSION ]";
-                let top_pad = BOX_W.saturating_sub(top_label.chars().count() + 1);
-                let bot_bar = "═".repeat(BOX_W.saturating_sub(2));
+                let pre = "╭─ ⚠ ALERT · PERMISSION ";
+                let pre_len = pre.chars().count();
+                let top_fill = BOX_W.saturating_sub(pre_len + 1);
+                let bot_bar = "─".repeat(BOX_W.saturating_sub(2));
                 renderer.write_line(
-                    &format!("{}{}╗", top_label, "═".repeat(top_pad)),
+                    &format!("{}{}╮", pre, "─".repeat(top_fill)),
                     c_perm(),
                 )?;
-                renderer.write_line(&format!("║ tool : {}", ask_req.tool), c_perm())?;
-                renderer.write_line(&format!("║ args : {}", ask_req.input), c_perm())?;
-                renderer.write_line(&format!("╠{}╣", bot_bar), c_perm())?;
+                renderer.write_line(&format!("│ tool : {}", ask_req.tool), c_perm())?;
+                renderer.write_line(&format!("│ args : {}", ask_req.input), c_perm())?;
+                renderer.write_line(&format!("├{}┤", bot_bar), c_perm())?;
                 renderer.write_line(
-                    "║  (y) allow once   (a) allow always   (n) deny   (ESC) abort",
+                    "│ [y] allow once  [a] allow always  [n] deny  [ESC] abort",
                     c_perm(),
                 )?;
-                renderer.write_line(&format!("╚{}╝", bot_bar), c_perm())?;
+                renderer.write_line(&format!("╰{}╯", bot_bar), c_perm())?;
 
                 let decision = loop {
                     tokio::select! {
@@ -2608,19 +2610,18 @@ fn render_tool_output(
     } else {
         sanitized.chars().take(max_chars).collect()
     };
-    // Prefix every output line with `▏ ` so the tool's text reads
-    // like a chamber attached to the tool-call banner above. Empty
-    // lines still get the prefix so the chamber stays continuous.
+    // Tool output renders inside a rounded chamber attached to the
+    // tool-call header (`╭─ NAME ─ args` above). Every line gets a
+    // `│ ` chamber prefix; the chamber is closed by a `╰─` footer
+    // so the eye can scan tool boundaries top-to-bottom.
     for line in body.lines() {
-        renderer.write_line(&format!("▏ {}", line), theme::result())?;
+        renderer.write_line(&format!("│ {}", line), theme::result())?;
     }
     if char_count > max_chars {
         let remaining = char_count - max_chars;
-        renderer.write_line(
-            &format!("▏ ░░ +{} chars truncated ░░", remaining),
-            theme::dim(),
-        )?;
+        renderer.write_line(&format!("│ ░ +{} chars truncated", remaining), theme::dim())?;
     }
+    renderer.write_line("╰─", theme::dim())?;
     Ok(())
 }
 
