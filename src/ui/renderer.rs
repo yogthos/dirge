@@ -72,8 +72,12 @@ pub struct Renderer {
     input_rows: u16,
     monochrome: bool,
     pub selection_active: bool,
-    pub selection_start: Option<usize>,
-    pub selection_end: Option<usize>,
+    /// Selection anchor as `(buffer_line_index, char_offset_in_line)`.
+    /// Char offset is in *chars* (not bytes) so multi-byte UTF-8 glyphs
+    /// behave the same as ASCII. `(line, line_len)` is a valid past-the-
+    /// end position used when dragging past the line's right edge.
+    pub selection_start: Option<(usize, usize)>,
+    pub selection_end: Option<(usize, usize)>,
     panel_mode: PanelMode,
     /// Most-recently set panel snapshot. The UI rebuilds and pushes this
     /// before each redraw so render_viewport/draw_bottom can repaint the
@@ -242,6 +246,24 @@ impl Renderer {
         rows.saturating_sub(self.input_rows + 1)
     }
 
+    /// Map a screen `(row, col)` to a `(line_idx, char_col)` anchor for
+    /// granular selection. `col` is the absolute terminal column; we
+    /// subtract `content_indent()` to get the char offset within the
+    /// rendered line, clamped to the line's char count so dragging
+    /// past the right edge anchors at the end-of-line.
+    pub fn buffer_pos_at(&self, row: u16, col: u16) -> Option<(usize, usize)> {
+        let line_idx = self.buffer_line_at_row(row)?;
+        let entry = self.buffer.get(line_idx)?;
+        let line_len = entry.text.chars().count();
+        let indent = self.content_indent() as u16;
+        let char_col = if col < indent {
+            0
+        } else {
+            (col - indent) as usize
+        };
+        Some((line_idx, char_col.min(line_len)))
+    }
+
     pub fn buffer_line_at_row(&self, row: u16) -> Option<usize> {
         let (_, rows) = self.terminal_size();
         let visible = rows.saturating_sub(self.input_rows + 1) as usize;
@@ -266,18 +288,42 @@ impl Renderer {
     }
 
     pub fn selected_text(&self) -> Option<String> {
+        // Normalize (start, end) so start <= end in row-major order:
+        // earlier row wins; same row → earlier column wins.
         let (start, end) = match (self.selection_start, self.selection_end) {
-            (Some(s), Some(e)) if s <= e => (s, e),
+            (Some(s), Some(e)) if (s.0, s.1) <= (e.0, e.1) => (s, e),
             (Some(s), Some(e)) => (e, s),
             _ => return None,
         };
         let mut result = String::new();
-        for i in start..=end {
-            if let Some(entry) = self.buffer.get(i) {
-                if !result.is_empty() {
-                    result.push('\n');
+        if start.0 == end.0 {
+            // Single-row selection: substring from start.1 to end.1.
+            if let Some(entry) = self.buffer.get(start.0) {
+                let chars: Vec<char> = entry.text.chars().collect();
+                let lo = start.1.min(chars.len());
+                let hi = end.1.min(chars.len());
+                if lo < hi {
+                    result.extend(&chars[lo..hi]);
                 }
-                result.push_str(&entry.text);
+            }
+        } else {
+            // Multi-row: tail of start row, full middle rows, head of end row.
+            if let Some(entry) = self.buffer.get(start.0) {
+                let chars: Vec<char> = entry.text.chars().collect();
+                let lo = start.1.min(chars.len());
+                result.extend(&chars[lo..]);
+            }
+            for i in (start.0 + 1)..end.0 {
+                result.push('\n');
+                if let Some(entry) = self.buffer.get(i) {
+                    result.push_str(&entry.text);
+                }
+            }
+            result.push('\n');
+            if let Some(entry) = self.buffer.get(end.0) {
+                let chars: Vec<char> = entry.text.chars().collect();
+                let hi = end.1.min(chars.len());
+                result.extend(&chars[..hi]);
             }
         }
         if result.is_empty() {
@@ -421,43 +467,79 @@ impl Renderer {
             let text_chars: usize = if start + i < end {
                 let entry = &self.buffer[start + i];
                 let line_idx = start + i;
-                let text: String = entry.text.chars().take(line_cap).collect();
-                let actual_chars = text.chars().count();
+                let chars: Vec<char> = entry.text.chars().take(line_cap).collect();
+                let actual_chars = chars.len();
 
-                let is_selected = self.selection_active
+                // Resolve the per-row selection span as char indices
+                // `[sel_lo, sel_hi)` within this row's `chars` slice.
+                // None when this row has no selected chars.
+                let sel_span: Option<(usize, usize)> = if self.selection_active
                     && self.selection_start.is_some()
                     && self.selection_end.is_some()
-                    && {
-                        let s = self.selection_start.unwrap();
-                        let e = self.selection_end.unwrap();
-                        let lo = s.min(e);
-                        let hi = s.max(e);
-                        line_idx >= lo && line_idx <= hi
+                {
+                    let s = self.selection_start.unwrap();
+                    let e = self.selection_end.unwrap();
+                    // Normalize so `lo` comes before `hi` in row-major
+                    // order: earlier row wins; same row → earlier col.
+                    let (lo, hi) = if (s.0, s.1) <= (e.0, e.1) {
+                        (s, e)
+                    } else {
+                        (e, s)
                     };
+                    if line_idx < lo.0 || line_idx > hi.0 {
+                        None
+                    } else {
+                        let from = if line_idx == lo.0 { lo.1 } else { 0 };
+                        let to = if line_idx == hi.0 {
+                            hi.1.min(actual_chars)
+                        } else {
+                            actual_chars
+                        };
+                        if from < to { Some((from, to)) } else { None }
+                    }
+                } else {
+                    None
+                };
 
-                if is_selected {
-                    write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
-                }
-                // Bold attribute simulates the CRT phosphor bloom: on
-                // most modern terminals it nudges the glyphs to a
-                // heavier weight and a brighter shade of the chosen
-                // color. We apply it to bright tones only (the dim
-                // green / dim grey colors must stay un-bloomed to
-                // preserve the two-tone phosphor depth shown in the
-                // reference btop screenshots).
                 let bloom = crate::ui::theme::is_bright(entry.color);
-                if bloom {
-                    write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                // Paint the row in up to three runs: pre-selection,
+                // selected (reverse-video), post-selection. When no
+                // selection touches this row, we just paint the whole
+                // run once.
+                let paint_run = |stdout: &mut std::io::Stdout,
+                                 slice: &[char],
+                                 reverse: bool|
+                 -> io::Result<()> {
+                    if slice.is_empty() {
+                        return Ok(());
+                    }
+                    if reverse {
+                        write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
+                    }
+                    if bloom {
+                        write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                    }
+                    write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
+                    let s: String = slice.iter().collect();
+                    write!(stdout, "{}", s)?;
+                    if bloom {
+                        write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                    }
+                    if reverse {
+                        write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
+                    }
+                    write!(stdout, "{}", ResetColor)?;
+                    Ok(())
+                };
+
+                match sel_span {
+                    None => paint_run(&mut stdout, &chars, false)?,
+                    Some((from, to)) => {
+                        paint_run(&mut stdout, &chars[..from], false)?;
+                        paint_run(&mut stdout, &chars[from..to], true)?;
+                        paint_run(&mut stdout, &chars[to..], false)?;
+                    }
                 }
-                write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
-                write!(stdout, "{}", text)?;
-                if bloom {
-                    write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-                }
-                if is_selected {
-                    write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
-                }
-                write!(stdout, "{}", ResetColor)?;
                 actual_chars
             } else {
                 0
@@ -1376,8 +1458,8 @@ mod tests {
             r.scroll_line_up();
         }
         r.selection_active = true;
-        r.selection_start = Some(15);
-        r.selection_end = Some(20);
+        r.selection_start = Some((15, 0));
+        r.selection_end = Some((20, 5));
 
         for i in 0..7 {
             r.push_buffer_line(LineEntry {
@@ -1387,8 +1469,8 @@ mod tests {
         }
 
         // Selection indices are absolute and remain untouched.
-        assert_eq!(r.selection_start, Some(15));
-        assert_eq!(r.selection_end, Some(20));
+        assert_eq!(r.selection_start, Some((15, 0)));
+        assert_eq!(r.selection_end, Some((20, 5)));
     }
 
     // Boundary: a tiny buffer where appending pushes scroll_offset past
@@ -1431,6 +1513,87 @@ mod tests {
         r.commit_partial();
 
         assert_eq!(view_start(&r), pinned_start);
+    }
+
+    // --- granular selection ----------------------------------------------
+
+    fn fresh_with_text(lines: &[&str]) -> Renderer {
+        let mut r = Renderer::new().unwrap();
+        for s in lines {
+            r.buffer.push(LineEntry {
+                text: CompactString::new(s),
+                color: Color::White,
+            });
+        }
+        r
+    }
+
+    /// Same-row selection extracts the substring between start.1 and
+    /// end.1 (char-indexed, exclusive end).
+    #[test]
+    fn selected_text_single_row_substring() {
+        let mut r = fresh_with_text(&["hello world"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 6));
+        r.selection_end = Some((0, 11));
+        assert_eq!(r.selected_text(), Some("world".to_string()));
+    }
+
+    /// Reverse drag (end before start) still yields the same substring —
+    /// `selected_text` normalizes to row-major order.
+    #[test]
+    fn selected_text_reverse_drag_normalizes() {
+        let mut r = fresh_with_text(&["hello world"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 11));
+        r.selection_end = Some((0, 6));
+        assert_eq!(r.selected_text(), Some("world".to_string()));
+    }
+
+    /// Multi-row selection takes the tail of the start row, the full
+    /// middle rows, and the head of the end row.
+    #[test]
+    fn selected_text_multi_row_spans_lines() {
+        let mut r = fresh_with_text(&["first line", "middle", "last line"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 6)); // "line"
+        r.selection_end = Some((2, 4)); // "last"
+        assert_eq!(r.selected_text(), Some("line\nmiddle\nlast".to_string()));
+    }
+
+    /// Same-row empty selection (start == end) returns None — nothing
+    /// selected yet, just a click.
+    #[test]
+    fn selected_text_empty_selection_returns_none() {
+        let mut r = fresh_with_text(&["hello"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 3));
+        r.selection_end = Some((0, 3));
+        assert!(r.selected_text().is_none());
+    }
+
+    /// Multi-byte UTF-8: char indices ignore byte width. `é` and `🦀`
+    /// each count as 1 char, not their byte widths.
+    #[test]
+    fn selected_text_handles_unicode() {
+        let mut r = fresh_with_text(&["café 🦀 rust"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 0));
+        r.selection_end = Some((0, 6)); // "café 🦀"
+        assert_eq!(r.selected_text(), Some("café 🦀".to_string()));
+    }
+
+    /// `buffer_pos_at` clamps char_col to the line's length so dragging
+    /// past the right edge anchors at end-of-line rather than
+    /// silently extending past visible content.
+    #[test]
+    fn buffer_pos_at_clamps_past_eol() {
+        let r = fresh_with_text(&["short"]);
+        // With one buffer line and scroll_offset=0,
+        // `buffer_line_at_row` returns Some(0) for row 0 (start = 0
+        // after saturating, idx = row).
+        let pos = r.buffer_pos_at(0, 999);
+        assert_eq!(pos, Some((0, 5)));
     }
 
     // --- wrap_input -------------------------------------------------------

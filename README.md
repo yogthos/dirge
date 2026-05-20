@@ -243,6 +243,7 @@ Example plugins in [`plugins/`](plugins/):
 | `local_openai.janet` | `harness/register-provider` declaring vLLM/Ollama/LMStudio local endpoints |
 | `session_tree.janet` | `harness/set-label` + `harness/new-session` — `/label` and `/fresh` slash commands |
 | `turn_timer/` | Multi-file plugin — state, hooks, and a `/timer-stats` command split across three files in a single directory |
+| `response_inspector.janet` | `on-response` hook — pattern-match the LLM's reply, post notifications, and return a steering string appended to the next turn's system prompt |
 
 ## LSP integration
 

@@ -618,32 +618,34 @@ pub async fn run_interactive(
                         )?;
                         continue;
                     }
-                    UserEvent::MouseDown { row, col: _ } => {
+                    UserEvent::MouseDown { row, col } => {
                         if row < renderer.visible_lines() as u16
-                            && let Some(idx) = renderer.buffer_line_at_row(row) {
-                                renderer.selection_active = true;
-                                renderer.selection_start = Some(idx);
-                                renderer.selection_end = Some(idx);
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                    is_running,
-                                )?;
-                            }
+                            && let Some(pos) = renderer.buffer_pos_at(row, col)
+                        {
+                            renderer.selection_active = true;
+                            renderer.selection_start = Some(pos);
+                            renderer.selection_end = Some(pos);
+                            renderer.render_viewport()?;
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                is_running,
+                            )?;
+                        }
                         continue;
                     }
-                    UserEvent::MouseDrag { row, col: _ } => {
+                    UserEvent::MouseDrag { row, col } => {
                         if renderer.selection_active
-                            && let Some(idx) = renderer.buffer_line_at_row(row) {
-                                renderer.selection_end = Some(idx);
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                    is_running,
-                                )?;
-                            }
+                            && let Some(pos) = renderer.buffer_pos_at(row, col)
+                        {
+                            renderer.selection_end = Some(pos);
+                            renderer.render_viewport()?;
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                is_running,
+                            )?;
+                        }
                         continue;
                     }
                     UserEvent::Paste(text) => {
@@ -668,10 +670,10 @@ pub async fn run_interactive(
                         )?;
                         continue;
                     }
-                    UserEvent::MouseUp { row, col: _ } => {
+                    UserEvent::MouseUp { row, col } => {
                         if renderer.selection_active {
-                            if let Some(idx) = renderer.buffer_line_at_row(row) {
-                                renderer.selection_end = Some(idx);
+                            if let Some(pos) = renderer.buffer_pos_at(row, col) {
+                                renderer.selection_end = Some(pos);
                             }
                             if let Some(text) = renderer.selected_text() {
                                 copy_to_clipboard(&text);
