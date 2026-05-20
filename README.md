@@ -223,6 +223,9 @@ When built with `--features plugin`, dirge embeds the [Janet](https://janet-lang
 | `on-tool-end` | After tool completes | `{:output "..."}` |
 | `on-error` | Error occurred | `{:error "..."}` |
 | `on-complete` | Agent turn finishes | (no context — use on-response) |
+| `on-turn-start` | Start of one LLM call cycle within a run | `{:index N}` |
+| `on-message-update` | Every ~16 streamed tokens within a turn | `{:index N :partial "text-so-far"}` |
+| `on-turn-end` | After the turn's tool results return | `{:index N :message "full text"}` |
 
 ### Harness APIs
 
@@ -277,6 +280,7 @@ Example plugins in `plugins/`:
 | `prefix_lang.janet` | `harness/replace-prompt` for input transform |
 | `confirm_destructive.janet` | `harness/confirm` gating bash danger commands |
 | `select_persona.janet` | `harness/select` + `/persona` to pick a response style |
+| `turn_timing.janet` | `on-turn-start`/`on-turn-end` measuring per-turn elapsed time |
 
 ### Workflow plugin
 
