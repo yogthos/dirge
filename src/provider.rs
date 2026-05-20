@@ -145,6 +145,29 @@ fn provider_env_var(kind: ProviderKind) -> &'static str {
     }
 }
 
+/// Auto-detect provider from environment variables when none is explicitly configured.
+/// Returns the provider name string (e.g. "deepseek") for the first matching env var.
+pub fn auto_detect_provider() -> Option<&'static str> {
+    let candidates: &[(&str, &str)] = &[
+        ("DEEPSEEK_API_KEY", "deepseek"),
+        ("OPENAI_API_KEY", "openai"),
+        ("ANTHROPIC_API_KEY", "anthropic"),
+        ("GEMINI_API_KEY", "gemini"),
+        ("GLM_API_KEY", "glm"),
+        ("OLLAMA_API_KEY", "ollama"),
+        ("OPENROUTER_API_KEY", "openrouter"),
+    ];
+    for (env_var, provider_name) in candidates {
+        if std::env::var(env_var)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return Some(provider_name);
+        }
+    }
+    None
+}
+
 fn resolve_api_key(
     kind: ProviderKind,
     api_key_env_override: Option<&str>,
@@ -529,5 +552,60 @@ pub async fn build_agent(
         AnyModel::Glm(m) => build_inner!(m, Glm),
         AnyModel::Ollama(m) => build_inner!(m, Ollama),
         AnyModel::Custom(m) => build_inner!(m, Custom),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clean_env() {
+        for var in &[
+            "DEEPSEEK_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GLM_API_KEY",
+            "OLLAMA_API_KEY",
+            "OPENROUTER_API_KEY",
+        ] {
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    #[test]
+    fn auto_detect_returns_none_when_no_vars_set() {
+        clean_env();
+        assert_eq!(auto_detect_provider(), None);
+    }
+
+    #[test]
+    fn auto_detect_finds_deepseek_when_key_set() {
+        clean_env();
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-test-123") };
+        assert_eq!(auto_detect_provider(), Some("deepseek"));
+    }
+
+    #[test]
+    fn auto_detect_finds_openai_when_key_set() {
+        clean_env();
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-456") };
+        assert_eq!(auto_detect_provider(), Some("openai"));
+    }
+
+    #[test]
+    fn auto_detect_skips_empty_var() {
+        clean_env();
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "") };
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-789") };
+        assert_eq!(auto_detect_provider(), Some("openai"));
+    }
+
+    #[test]
+    fn auto_detect_returns_first_match_in_order() {
+        clean_env();
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-ds") };
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-oai") };
+        assert_eq!(auto_detect_provider(), Some("deepseek"));
     }
 }
