@@ -94,6 +94,54 @@ const HARNESS_INIT: &str = r#"
                 "info")]
       (set harness-notif-list
            (string harness-notif-list lvl "\t" msg "\n")))))
+
+# Plugin entries on the session timeline. Plugins call
+# (harness/append-entry type data &opt display) to record
+# bookmarks, telemetry, or custom state that should survive
+# session save/load. The data is treated as opaque by the host
+# (any registered renderer for `type` formats it); other plugins
+# can use plain text, JSON, etc.
+#
+# Stored as `type\tdata\tdisplay\n` per entry; data is escaped so
+# embedded tabs / newlines / backslashes don't break parsing.
+(var harness-entries-buf "")
+(defn- harness/-escape [s]
+  (->> s
+       (string/replace-all "\\" "\\\\")
+       (string/replace-all "\t" "\\t")
+       (string/replace-all "\n" "\\n")))
+(defn harness/append-entry [type data &opt display]
+  (when (and (string? type) (string? data))
+    (let [d (if (nil? display) "1" (if display "1" "0"))]
+      (set harness-entries-buf
+           (string harness-entries-buf
+                   (harness/-escape type) "\t"
+                   (harness/-escape data) "\t"
+                   d "\n")))))
+
+# Registered renderer functions per plugin entry type.
+# (harness/register-renderer "bookmark" "fn-name") records a
+# (type, fn-name) pair the host looks up when displaying entries
+# of that type. Stored as `type|fn\n` (same convention as
+# harness-cmd-list).
+(var harness-renderer-list "")
+(defn harness/register-renderer [type fn-name]
+  (when (and (string? type) (string? fn-name))
+    (set harness-renderer-list
+         (string harness-renderer-list type "|" fn-name "\n"))))
+
+# Output buffer for a renderer invocation. The host clears it
+# before calling the renderer, then reads back the accumulated
+# `color\ttext\n` lines. Plugins call (harness/render color text)
+# from inside their renderer to emit each output line.
+(var harness-render-buf "")
+(defn harness/render [color text]
+  (when (and (or (string? color) (keyword? color) (symbol? color))
+             (string? text))
+    (set harness-render-buf
+         (string harness-render-buf
+                 (string color) "\t"
+                 (harness/-escape text) "\n"))))
 "#;
 
 /// Janet-side aliases that defer the actual blocking work to the
