@@ -1,18 +1,21 @@
-//! Bottom-left ASCII avatar.
+//! Inline ASCII avatar.
 //!
-//! A tiny 3-row × 5-col face that lives in the left margin (cols
-//! 0..5) of the bottom three terminal rows. It updates based on what
-//! the agent is doing — thinking, speaking, running a tool, erroring,
-//! resting — to give the chat a personable focal point and visible
-//! activity feedback even when no tokens are streaming yet.
+//! A tiny single-row face that lives on the input row, centered in the
+//! left margin between the screen edge and the input prompt. Updates
+//! based on what the agent is doing — thinking, speaking, running a
+//! tool, erroring, resting — to give the chat a personable focal
+//! point and visible activity feedback even when no tokens are
+//! streaming yet.
 //!
-//! Designed to fit inside the chat band's centering indent so it
-//! never overlaps with chat content or the input prompt.
+//! Single-row so it never gets caught in chat scroll: chat content
+//! lives on rows 0..input_top-1, the avatar lives on input_top
+//! beside the prompt, and `crossterm::ScrollUp` operations don't
+//! touch the input row.
 
 use crossterm::style::Color;
 
 /// What the agent is currently doing. The renderer picks an ascii
-/// face per state and draws it at the bottom-left of the screen.
+/// face per state and draws it next to the input prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 pub enum AvatarState {
@@ -53,67 +56,53 @@ impl AvatarState {
 
 /// Width of the avatar in terminal columns.
 pub const AVATAR_W: usize = 5;
-/// Height of the avatar in terminal rows.
-pub const AVATAR_H: usize = 3;
 
-/// Return three lines of ascii art for the given state + animation
-/// tick. The `tick` boolean alternates between two slightly different
-/// poses per state so the avatar visibly animates (eyes / mouth)
-/// without going overboard.
-pub fn art(state: AvatarState, tick: bool) -> [&'static str; AVATAR_H] {
+/// Return the ASCII face for the given state + animation tick. `tick`
+/// alternates between two slightly different poses (blinking eyes,
+/// shifting mouth) so the avatar visibly animates while the agent
+/// runs without being noisy.
+pub fn art(state: AvatarState, tick: bool) -> &'static str {
     use AvatarState::*;
     match state {
         Idle => {
             if tick {
-                [" ,-, ", "(o o)", " \\_/ "]
+                "(o o)"
             } else {
-                [" ,-, ", "(- -)", " \\_/ "]
+                "(- -)"
             }
         }
         Thinking => {
             if tick {
-                ["  ?  ", "(o ·)", " \\_/ "]
+                "(o .)"
             } else {
-                ["  ?  ", "(· o)", " \\_/ "]
+                "(. o)"
             }
         }
         Speaking => {
             if tick {
-                [" ,-, ", "(o o)", " \\o/ "]
+                "(o o)"
             } else {
-                [" ,-, ", "(o o)", " \\O/ "]
+                "(o O)"
             }
         }
-        Reading => {
-            if tick {
-                [" ,-, ", "[@ @]", " \\_/ "]
-            } else {
-                [" ,-, ", "[@ @]", " \\.. "]
-            }
-        }
+        Reading => "[@ @]",
         Writing => {
             if tick {
-                [" ,-, ", "(>_<)", " \\_/ "]
+                "(>_<)"
             } else {
-                [" ,-, ", "(-_-)", " \\_/ "]
+                "(-_-)"
             }
         }
-        Bash => {
-            if tick {
-                ["[___]", "[$_$]", "[___]"]
-            } else {
-                ["[___]", "[$ $]", "[___]"]
-            }
-        }
-        Alert => ["  !  ", "(O_O)", " /!\\ "],
-        Error => [" ,-, ", "(x_x)", " /v\\ "],
-        Done => [" ,-, ", "(^_^)", " \\_/ "],
+        Bash => "[$_$]",
+        Alert => "(O_O)",
+        Error => "(x_x)",
+        Done => "(^_^)",
     }
 }
 
-/// Color the avatar should render in for the given state. Default is
-/// the active theme's agent tone; alerts and errors override to the
-/// loud yellow/red of the theme so the user notices.
+/// Color the avatar should render in for the given state. Errors and
+/// alerts override to the theme's perm / error tones; everything else
+/// uses the agent tone so it visually belongs to the chat.
 pub fn color(state: AvatarState) -> Color {
     use AvatarState::*;
     match state {
@@ -128,10 +117,10 @@ pub fn color(state: AvatarState) -> Color {
 mod tests {
     use super::*;
 
-    /// Every state must produce three lines exactly `AVATAR_W` cols
-    /// wide. A typo'd asymmetry would visually wobble the face.
+    /// Every face must be exactly `AVATAR_W` cols wide so the avatar's
+    /// position is stable across state transitions.
     #[test]
-    fn every_state_has_uniform_dimensions() {
+    fn every_state_has_uniform_width() {
         let states = [
             AvatarState::Idle,
             AvatarState::Thinking,
@@ -145,19 +134,15 @@ mod tests {
         ];
         for state in states {
             for tick in [false, true] {
-                let lines = art(state, tick);
-                assert_eq!(lines.len(), AVATAR_H, "{:?} wrong row count", state);
-                for (i, line) in lines.iter().enumerate() {
-                    assert_eq!(
-                        line.chars().count(),
-                        AVATAR_W,
-                        "{:?} tick={} row {} is {:?}",
-                        state,
-                        tick,
-                        i,
-                        line,
-                    );
-                }
+                let face = art(state, tick);
+                assert_eq!(
+                    face.chars().count(),
+                    AVATAR_W,
+                    "{:?} tick={} is {:?}",
+                    state,
+                    tick,
+                    face,
+                );
             }
         }
     }
@@ -170,7 +155,7 @@ mod tests {
         assert_eq!(AvatarState::from_tool_name("edit"), AvatarState::Writing);
         assert_eq!(AvatarState::from_tool_name("write"), AvatarState::Writing);
         assert_eq!(AvatarState::from_tool_name("bash"), AvatarState::Bash);
-        // Unknown tools fall back to Reading (observational default).
+        // Unknown tools fall back to Reading.
         assert_eq!(
             AvatarState::from_tool_name("mcp_some_tool"),
             AvatarState::Reading

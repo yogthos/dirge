@@ -905,38 +905,38 @@ impl Renderer {
     /// centering indent is too narrow (`< AVATAR_W + 1`) to fit the
     /// avatar without overlapping chat content.
     fn draw_avatar(&self, stdout: &mut io::Stdout, input_top: u16) -> io::Result<()> {
-        use crate::ui::avatar::{AVATAR_H, AVATAR_W, art, color};
-        // Need at least AVATAR_W + 1 cols of indent so the avatar
-        // doesn't bleed into chat content. Also need at least AVATAR_H
-        // rows of vertical headroom above the input.
+        use crate::ui::avatar::{AVATAR_W, art, color};
+        // Single-row avatar painted on the *input* row, horizontally
+        // centered in the left margin between col 0 and the input
+        // prompt. Single-row + on the input row means the avatar
+        // never gets caught in `ensure_room`'s `ScrollUp(1)` — the
+        // input row sits below the scroll region, so the avatar
+        // doesn't smear into the scrollback when chat grows.
         let indent = self.content_indent();
-        if indent < AVATAR_W + 1 {
+        if indent < AVATAR_W + 2 {
+            // Not enough margin to fit the avatar with breathing
+            // room around the input prompt's left edge.
             return Ok(());
         }
-        if input_top < AVATAR_H as u16 {
-            return Ok(());
-        }
-        let lines = art(self.avatar_state, self.avatar_tick);
+        let face = art(self.avatar_state, self.avatar_tick);
         let painted = self.color(color(self.avatar_state));
-        let top_row = input_top - AVATAR_H as u16;
-        for (i, line) in lines.iter().enumerate() {
-            stdout.execute(MoveTo(0, top_row + i as u16))?;
-            // Hide cursor while painting so it doesn't drag across.
-            // Wipe the 5-col patch first, then write the face.
-            write!(stdout, "{}", " ".repeat(AVATAR_W))?;
-            stdout.execute(MoveTo(0, top_row + i as u16))?;
-            write!(stdout, "{}", SetForegroundColor(painted))?;
-            // Bold attribute for the phosphor bloom, matching the
-            // chat content rules.
-            if crate::ui::theme::is_bright(color(self.avatar_state)) {
-                write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
-            }
-            write!(stdout, "{}", line)?;
-            if crate::ui::theme::is_bright(color(self.avatar_state)) {
-                write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-            }
-            write!(stdout, "{}", ResetColor)?;
+        // Center within [0, indent): x = (indent - AVATAR_W) / 2
+        let x = ((indent - AVATAR_W) / 2) as u16;
+        // Wipe the full margin (cols 0..indent) first so a face from
+        // a previous state doesn't leave fossils when its position
+        // shifts (e.g. theme change, indent recomputed on resize).
+        stdout.execute(MoveTo(0, input_top))?;
+        write!(stdout, "{}", " ".repeat(indent))?;
+        stdout.execute(MoveTo(x, input_top))?;
+        write!(stdout, "{}", SetForegroundColor(painted))?;
+        if crate::ui::theme::is_bright(color(self.avatar_state)) {
+            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
         }
+        write!(stdout, "{}", face)?;
+        if crate::ui::theme::is_bright(color(self.avatar_state)) {
+            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+        }
+        write!(stdout, "{}", ResetColor)?;
         Ok(())
     }
 

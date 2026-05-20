@@ -119,11 +119,71 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         || lower.contains("timed out")
         || lower.contains("request timeout")
         || lower.contains("server error")
+        // Mid-stream decode failures from reqwest/rig — the connection
+        // returned bytes but they didn't deserialize into the expected
+        // JSON envelope. Almost always transient (network blip,
+        // truncated chunked response, provider hiccup), so it should
+        // be retried like any other network error rather than surfacing
+        // as a hard "Other" failure.
+        || lower.contains("error decoding response body")
+        || lower.contains("invalid response body")
+        || lower.contains("decode error")
     {
         return ErrorKind::Network;
     }
 
     ErrorKind::Other
+}
+
+/// Map a raw error message to a one-line user-facing explanation
+/// that names *what* failed and *what to try next*. Used by the agent
+/// runner when surfacing errors to the chat — beats dumping a stack
+/// of `CompletionError: ProviderError: Http client error: …` at the
+/// user.
+///
+/// The original message is appended in parentheses as the cause so
+/// the user (and any bug reports) still have the underlying details.
+pub fn user_facing_error(msg: &str, attempts: usize) -> String {
+    let kind = classify_error(msg);
+    let lower = msg.to_lowercase();
+
+    let (headline, hint) = match kind {
+        ErrorKind::Auth => (
+            "authentication failed talking to the LLM provider",
+            "check your API key env var (e.g. OPENROUTER_API_KEY) and provider config",
+        ),
+        ErrorKind::RateLimit => (
+            "provider rate-limited the request",
+            "wait a moment and retry, or switch to a different model via /model",
+        ),
+        ErrorKind::ContextLength => (
+            "conversation exceeds the model's context window",
+            "run /compress to summarize older turns and try again",
+        ),
+        ErrorKind::Network if lower.contains("error decoding response body") => (
+            "lost the response stream from the provider (truncated or malformed body)",
+            "usually transient — retry. If it persists the provider may be having issues or returning non-JSON (HTML error pages, plaintext)",
+        ),
+        ErrorKind::Network => (
+            "network error reaching the LLM provider",
+            "check connectivity / firewall / proxy; the request will retry automatically",
+        ),
+        ErrorKind::Other => (
+            "the LLM provider returned an error we didn't recognize",
+            "see the cause below; consider /model to try a different provider",
+        ),
+    };
+
+    let attempts_note = if attempts > 1 {
+        format!(" (after {} attempt(s))", attempts)
+    } else {
+        String::new()
+    };
+
+    format!(
+        "{}{}\n  ↳ hint: {}\n  ↳ cause: {}",
+        headline, attempts_note, hint, msg
+    )
 }
 
 #[cfg(test)]
@@ -158,6 +218,45 @@ mod tests {
             classify_error("503 service unavailable"),
             ErrorKind::Network
         );
+        // Reqwest decode failure mid-stream — rig surfaces it as
+        // `CompletionError: ProviderError: Http client error: error
+        // decoding response body`. Should be retried like any other
+        // transient network blip rather than surfacing as Other.
+        assert_eq!(
+            classify_error(
+                "CompletionError: ProviderError: Http client error: error decoding response body"
+            ),
+            ErrorKind::Network
+        );
+        assert_eq!(classify_error("decode error: EOF"), ErrorKind::Network);
+    }
+
+    /// `user_facing_error` produces a multi-line message with headline,
+    /// hint, and cause. The cause must contain the original raw
+    /// message so debug context isn't lost.
+    #[test]
+    fn user_facing_error_includes_cause() {
+        let raw = "CompletionError: ProviderError: Http client error: error decoding response body";
+        let pretty = user_facing_error(raw, 1);
+        assert!(pretty.contains("lost the response stream"));
+        assert!(pretty.contains("hint:"));
+        assert!(pretty.contains("cause:"));
+        assert!(pretty.contains(raw));
+    }
+
+    /// Auth errors get a distinct headline pointing at the API key.
+    #[test]
+    fn user_facing_error_classifies_auth() {
+        let pretty = user_facing_error("401 unauthorized", 1);
+        assert!(pretty.contains("authentication failed"));
+        assert!(pretty.contains("API key"));
+    }
+
+    /// Context-length errors point at /compress.
+    #[test]
+    fn user_facing_error_classifies_context_length() {
+        let pretty = user_facing_error("maximum context length exceeded", 1);
+        assert!(pretty.contains("/compress"));
     }
 
     #[test]

@@ -331,23 +331,23 @@ where
 
             let kind = recovery::classify_error(&msg);
 
-            // Auth and unknown errors surface immediately
+            // Auth and unknown errors surface immediately with a
+            // user-friendly headline + hint + cause breakdown.
             if kind == ErrorKind::Auth || kind == ErrorKind::Other {
+                let friendly = recovery::user_facing_error(&msg, attempts + 1);
                 let _ = event_tx
-                    .send(AgentEvent::Error(CompactString::new(msg)))
+                    .send(AgentEvent::Error(CompactString::new(friendly)))
                     .await;
                 break;
             }
 
-            // Context-length errors: not retryable without compaction
-            // Surface a helpful error hinting at /compress
+            // Context-length errors aren't retryable without
+            // compaction — the friendly formatter already points the
+            // user at /compress.
             if kind == ErrorKind::ContextLength {
-                let hint = format!(
-                    "{} — try /compress to compact the conversation, then retry",
-                    msg
-                );
+                let friendly = recovery::user_facing_error(&msg, attempts + 1);
                 let _ = event_tx
-                    .send(AgentEvent::Error(CompactString::new(hint)))
+                    .send(AgentEvent::Error(CompactString::new(friendly)))
                     .await;
                 break;
             }
@@ -357,7 +357,11 @@ where
             // without retrying — events already streamed live, so the user
             // sees what got done.
             if outcome.had_tool_calls {
-                let err = format!("{} (tool side effects already applied, not retrying)", msg);
+                let friendly = recovery::user_facing_error(&msg, attempts + 1);
+                let err = format!(
+                    "{}\n  ↳ note: tool side effects already applied; not retrying.",
+                    friendly,
+                );
                 let _ = event_tx
                     .send(AgentEvent::Error(CompactString::new(err)))
                     .await;
@@ -365,7 +369,8 @@ where
             }
 
             if !policy.should_retry(attempts, kind) {
-                let retry_msg = format!("{} (retries exhausted)", msg);
+                let friendly = recovery::user_facing_error(&msg, attempts + 1);
+                let retry_msg = format!("{}\n  ↳ note: retries exhausted.", friendly);
                 let _ = event_tx
                     .send(AgentEvent::Error(CompactString::new(retry_msg)))
                     .await;
