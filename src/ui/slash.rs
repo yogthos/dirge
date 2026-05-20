@@ -18,6 +18,7 @@ use crate::session::{MessageRole, Session};
 use crate::ui::events::{format_time, render_session};
 use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
+use crate::ui::tree::{self, short_id};
 
 const C_AGENT: Color = Color::White;
 const C_RESULT: Color = Color::DarkGrey;
@@ -28,26 +29,23 @@ pub fn undo_last(session: &mut Session) -> usize {
     if len == 0 {
         return 0;
     }
+    // Route through `pop_last_message` so the tree + message_store
+    // stay in sync — P4c made direct .messages.pop() incorrect for
+    // branched sessions.
     if session.messages[len - 1].role == MessageRole::Assistant {
-        let tokens = session.messages[len - 1].estimated_tokens;
-        session.total_estimated_tokens = session.total_estimated_tokens.saturating_sub(tokens);
-        session.messages.pop();
+        session.pop_last_message();
         if session
             .messages
             .last()
             .is_some_and(|m| m.role == MessageRole::User)
         {
-            let tokens = session.messages.last().unwrap().estimated_tokens;
-            session.total_estimated_tokens = session.total_estimated_tokens.saturating_sub(tokens);
-            session.messages.pop();
+            session.pop_last_message();
             return 2;
         }
         return 1;
     }
     if session.messages[len - 1].role == MessageRole::User {
-        let tokens = session.messages[len - 1].estimated_tokens;
-        session.total_estimated_tokens = session.total_estimated_tokens.saturating_sub(tokens);
-        session.messages.pop();
+        session.pop_last_message();
         return 1;
     }
     0
@@ -797,8 +795,113 @@ pub async fn handle_slash(
             session.messages.clear();
             session.total_estimated_tokens = 0;
             session.compactions.clear();
+            // Drop branch state too so a fresh /clear truly starts over.
+            // Without this, /tree would still show the cleared messages
+            // as a dead-end branch.
+            session.message_store.clear();
+            session.tree.entries.clear();
+            session.tree.leaf_id = None;
             crate::agent::tools::modified::clear_modified();
             render_session(renderer, session, cli, cfg, context)?;
+        }
+        "/tree" => {
+            // No-arg: print an ASCII view of the tree.
+            // <id-prefix>: switch the active branch to the leaf matching
+            //              the given id prefix (no need to type full UUID).
+            session.ensure_tree_initialized();
+            session.ensure_message_store_initialized();
+            let arg = parts.get(1).copied().unwrap_or("").trim();
+            if arg.is_empty() {
+                if session.tree.entries.is_empty() {
+                    renderer.write_line("(empty session)", C_AGENT)?;
+                } else {
+                    for line in tree::render_tree(session) {
+                        renderer.write_line(&line, C_RESULT)?;
+                    }
+                }
+            } else {
+                match tree::resolve_id_prefix(session, arg) {
+                    Ok(id) => {
+                        if let Err(e) = session.switch_to_leaf(&id) {
+                            renderer.write_line(&format!("switch failed: {}", e), C_ERROR)?;
+                        } else {
+                            render_session(renderer, session, cli, cfg, context)?;
+                            renderer.write_line(
+                                &format!("switched to leaf {}", short_id(&id)),
+                                C_AGENT,
+                            )?;
+                        }
+                    }
+                    Err(e) => renderer.write_line(&format!("/tree: {}", e), C_ERROR)?,
+                }
+            }
+        }
+        "/fork" => {
+            // /fork [id-prefix] — branch off from the parent of the
+            // chosen message, and pop the original prompt back into
+            // the editor so the user can re-edit and retry.
+            // Default target: the most recent user message on the
+            // current branch (i.e. "redo last prompt").
+            session.ensure_tree_initialized();
+            session.ensure_message_store_initialized();
+            let arg = parts.get(1).copied().unwrap_or("").trim();
+            let target_id = if arg.is_empty() {
+                // Default to the last User message on the current path.
+                let last_user = session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| m.id.clone());
+                match last_user {
+                    Some(id) => Ok(id),
+                    None => Err("no user message on current branch".to_string()),
+                }
+            } else {
+                tree::resolve_id_prefix(session, arg)
+            };
+            match target_id {
+                Ok(id) => match session.fork_at(&id) {
+                    Ok(original) => {
+                        input.set_text(&original.content);
+                        render_session(renderer, session, cli, cfg, context)?;
+                        renderer.write_line(
+                            &format!(
+                                "forked at {} — original prompt restored to editor",
+                                short_id(&id)
+                            ),
+                            C_AGENT,
+                        )?;
+                    }
+                    Err(e) => renderer.write_line(&format!("/fork: {}", e), C_ERROR)?,
+                },
+                Err(e) => renderer.write_line(&format!("/fork: {}", e), C_ERROR)?,
+            }
+        }
+        "/clone" => {
+            // /clone <id-prefix> — make the chosen entry the leaf
+            // without restoring its content into the editor. Useful
+            // for jumping to a labeled bookmark or comparing branches.
+            session.ensure_tree_initialized();
+            session.ensure_message_store_initialized();
+            let arg = parts.get(1).copied().unwrap_or("").trim();
+            if arg.is_empty() {
+                renderer.write_line("usage: /clone <id-prefix>", C_ERROR)?;
+            } else {
+                match tree::resolve_id_prefix(session, arg) {
+                    Ok(id) => match session.clone_at(&id) {
+                        Ok(()) => {
+                            render_session(renderer, session, cli, cfg, context)?;
+                            renderer.write_line(
+                                &format!("cloned path through {}", short_id(&id)),
+                                C_AGENT,
+                            )?;
+                        }
+                        Err(e) => renderer.write_line(&format!("/clone: {}", e), C_ERROR)?,
+                    },
+                    Err(e) => renderer.write_line(&format!("/clone: {}", e), C_ERROR)?,
+                }
+            }
         }
         "/panel" => {
             use crate::ui::renderer::PanelMode;
@@ -968,7 +1071,22 @@ pub async fn handle_slash(
                     C_RESULT,
                 );
             }
-            renderer.write_line("  /clear                 clear screen", C_RESULT)?;
+            renderer.write_line(
+                "  /clear                 clear screen + reset tree",
+                C_RESULT,
+            )?;
+            renderer.write_line(
+                "  /tree                  show the session tree (use /tree <id-prefix> to switch branches)",
+                C_RESULT,
+            )?;
+            renderer.write_line(
+                "  /fork [id-prefix]      branch off at the chosen message (default: last user message)",
+                C_RESULT,
+            )?;
+            renderer.write_line(
+                "  /clone <id-prefix>     switch to the branch ending at the chosen entry",
+                C_RESULT,
+            )?;
             renderer.write_line(
                 "  /panel [on|off|auto]   toggle right-hand info panel",
                 C_RESULT,

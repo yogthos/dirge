@@ -8,6 +8,7 @@ mod status;
 #[cfg(feature = "plugin")]
 mod streaming;
 mod terminal;
+mod tree;
 
 use std::collections::VecDeque;
 

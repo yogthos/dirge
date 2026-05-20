@@ -177,6 +177,15 @@ pub struct Session {
     /// empty but messages aren't.
     #[serde(default)]
     pub tree: SessionTree,
+    /// Content store for every `SessionMessage` ever appended to this
+    /// session, keyed by message id. `messages` is the projection of
+    /// the *current* branch's path; `message_store` keeps content
+    /// alive for branches the user isn't currently viewing so
+    /// `switch_to_leaf` can re-derive the path. Defaulted on
+    /// deserialize for backward compat; `ensure_message_store_initialized`
+    /// populates it from `messages` for legacy session files.
+    #[serde(default)]
+    pub message_store: HashMap<CompactString, SessionMessage>,
 }
 
 impl Session {
@@ -206,6 +215,19 @@ impl Session {
             extra_entries: Vec::new(),
             next_entry_seq: 0,
             tree: SessionTree::default(),
+            message_store: HashMap::new(),
+        }
+    }
+
+    /// Populate `message_store` from `messages` for legacy session
+    /// files that were saved before P4c added the per-id content map.
+    /// Idempotent.
+    pub fn ensure_message_store_initialized(&mut self) {
+        if !self.message_store.is_empty() {
+            return;
+        }
+        for msg in &self.messages {
+            self.message_store.insert(msg.id.clone(), msg.clone());
         }
     }
 
@@ -255,24 +277,27 @@ impl Session {
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
-        // Make sure the tree mirrors any messages that were loaded
-        // from a pre-P4b session file BEFORE we append the new one —
-        // otherwise the rebuild would also re-insert this new
-        // message with the wrong parent.
+        // Make sure tree + store mirror any messages that were loaded
+        // from a pre-P4b/P4c session file BEFORE we append the new
+        // one — otherwise the rebuild would re-insert this new message
+        // with the wrong parent.
         self.ensure_tree_initialized();
+        self.ensure_message_store_initialized();
         let tokens = Self::estimate_tokens(content);
         let id = new_message_id();
         let timestamp = chrono::Utc::now().timestamp();
         // Capture the parent NOW, before we touch the leaf — first
         // message in a fresh session has parent=None.
         let parent = self.tree.leaf_id.clone();
-        self.messages.push(SessionMessage {
+        let msg = SessionMessage {
             role,
             content: CompactString::new(content),
             estimated_tokens: tokens,
             id: id.clone(),
             timestamp,
-        });
+        };
+        self.messages.push(msg.clone());
+        self.message_store.insert(id.clone(), msg);
         // Mirror into the tree as a node extending from the previous
         // leaf. The first message in a fresh session gets parent=None.
         self.tree.entries.insert(
@@ -287,6 +312,153 @@ impl Session {
         self.tree.leaf_id = Some(id);
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(tokens);
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+    }
+
+    /// Pop the most recent message off the current branch. Used by
+    /// `/undo`. Removes from `messages`, `message_store`, and the
+    /// tree (entry + leaf rewind). Returns the popped message so the
+    /// caller can compute the token rebate.
+    ///
+    /// Tree pruning: a popped node is only removed from `tree.entries`
+    /// if no other node lists it as a parent — that way an active
+    /// fork's children stay reachable. In the linear case it's
+    /// always safe to remove.
+    pub fn pop_last_message(&mut self) -> Option<SessionMessage> {
+        self.ensure_tree_initialized();
+        self.ensure_message_store_initialized();
+        let msg = self.messages.pop()?;
+        // Move leaf back to the popped node's parent.
+        let parent = self
+            .tree
+            .entries
+            .get(&msg.id)
+            .and_then(|n| n.parent.clone());
+        self.tree.leaf_id = parent;
+        // Only prune the node if nothing else (e.g. a forked branch)
+        // refers to it as a parent.
+        let still_referenced = self
+            .tree
+            .entries
+            .values()
+            .any(|n| n.parent.as_ref() == Some(&msg.id));
+        if !still_referenced {
+            self.tree.entries.remove(&msg.id);
+            self.message_store.remove(&msg.id);
+        }
+        self.total_estimated_tokens = self
+            .total_estimated_tokens
+            .saturating_sub(msg.estimated_tokens);
+        self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        Some(msg)
+    }
+
+    /// Switch the active branch to the one ending at `new_leaf_id`.
+    /// Rebuilds the `messages` cache by walking from the new leaf
+    /// back to root via `tree.entries` and looking up each node's
+    /// content in `message_store`.
+    ///
+    /// Returns Err if `new_leaf_id` isn't in the tree, or if any
+    /// node along the path is missing from `message_store` (which
+    /// would indicate corruption). On error, leaves the session
+    /// state untouched.
+    pub fn switch_to_leaf(&mut self, new_leaf_id: &CompactString) -> Result<(), String> {
+        self.ensure_tree_initialized();
+        self.ensure_message_store_initialized();
+        if !self.tree.entries.contains_key(new_leaf_id) {
+            return Err(format!("unknown entry id: {}", new_leaf_id));
+        }
+        // Walk back to root, collecting IDs.
+        let mut chain: Vec<CompactString> = Vec::new();
+        let mut cursor: Option<CompactString> = Some(new_leaf_id.clone());
+        while let Some(id) = cursor {
+            let node = self
+                .tree
+                .entries
+                .get(&id)
+                .ok_or_else(|| format!("broken parent link to missing node {}", id))?;
+            cursor = node.parent.clone();
+            chain.push(id);
+        }
+        chain.reverse();
+        // Validate every node has content before we mutate.
+        for id in &chain {
+            if !self.message_store.contains_key(id) {
+                return Err(format!("missing content for node {}", id));
+            }
+        }
+        // Now rebuild messages + recompute estimated tokens.
+        let new_messages: Vec<SessionMessage> = chain
+            .iter()
+            .map(|id| self.message_store[id].clone())
+            .collect();
+        let new_total: u64 = new_messages.iter().map(|m| m.estimated_tokens).sum();
+        self.messages = new_messages;
+        self.total_estimated_tokens = new_total;
+        self.tree.leaf_id = Some(new_leaf_id.clone());
+        self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        Ok(())
+    }
+
+    /// Fork the session at `entry_id`. Sets the active leaf to that
+    /// entry's *parent* — i.e. position the user just before the
+    /// chosen message so the next add_message creates a divergent
+    /// branch. Returns the message content (so the UI can restore
+    /// it into the input editor for re-editing).
+    ///
+    /// Mirrors pi's `ctx.fork(entryId, { position: "before" })`.
+    pub fn fork_at(&mut self, entry_id: &CompactString) -> Result<SessionMessage, String> {
+        self.ensure_tree_initialized();
+        self.ensure_message_store_initialized();
+        let node = self
+            .tree
+            .entries
+            .get(entry_id)
+            .ok_or_else(|| format!("unknown entry id: {}", entry_id))?;
+        let parent = node.parent.clone();
+        let original = self
+            .message_store
+            .get(entry_id)
+            .cloned()
+            .ok_or_else(|| format!("missing content for entry {}", entry_id))?;
+        match parent {
+            Some(parent_id) => {
+                self.switch_to_leaf(&parent_id)?;
+            }
+            None => {
+                // Forking at the root: empty current branch entirely.
+                self.messages.clear();
+                self.total_estimated_tokens = 0;
+                self.tree.leaf_id = None;
+                self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+            }
+        }
+        Ok(original)
+    }
+
+    /// Clone the path through `entry_id`: switch the active leaf to
+    /// that entry without removing or restoring anything else.
+    /// Mirrors pi's `ctx.fork(entryId, { position: "at" })`.
+    pub fn clone_at(&mut self, entry_id: &CompactString) -> Result<(), String> {
+        self.switch_to_leaf(entry_id)
+    }
+
+    /// Set or clear a label on a tree node. Used by the future
+    /// `harness/set-label` (P4d) and by `/bookmark`-style commands.
+    #[allow(dead_code)]
+    pub fn set_label(
+        &mut self,
+        entry_id: &CompactString,
+        label: Option<String>,
+    ) -> Result<(), String> {
+        self.ensure_tree_initialized();
+        let node = self
+            .tree
+            .entries
+            .get_mut(entry_id)
+            .ok_or_else(|| format!("unknown entry id: {}", entry_id))?;
+        node.label = label;
+        self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        Ok(())
     }
 
     pub fn needs_compaction(&self, reserve_tokens: u64) -> bool {
@@ -323,8 +495,7 @@ impl Session {
         };
 
         // Collect the IDs of the messages we're about to drop so we
-        // can prune them from the tree too. Keep the tree consistent
-        // with the messages cache.
+        // can prune them from the tree and store too.
         let dropped_ids: Vec<CompactString> = self.messages[..first_kept_index]
             .iter()
             .map(|m| m.id.clone())
@@ -332,14 +503,16 @@ impl Session {
 
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
-        self.messages.insert(0, summary_msg);
+        self.messages.insert(0, summary_msg.clone());
 
-        // Mirror into the tree: remove dropped nodes, insert the new
-        // summary node as the new root, and re-parent the first
-        // kept node to point at the summary.
+        // Mirror into the tree + store: remove dropped nodes, insert
+        // the new summary node as the new root, and re-parent the
+        // first kept node to point at the summary.
         self.ensure_tree_initialized();
+        self.ensure_message_store_initialized();
         for id in &dropped_ids {
             self.tree.entries.remove(id);
+            self.message_store.remove(id);
         }
         let new_root = TreeNode {
             id: summary_id.clone(),
@@ -348,6 +521,7 @@ impl Session {
             label: None,
         };
         self.tree.entries.insert(summary_id.clone(), new_root);
+        self.message_store.insert(summary_id.clone(), summary_msg);
         // The new "first kept" message (index 1 in the cache, after
         // the summary at index 0) becomes the summary's child. If
         // every prior message was dropped, the summary is also the
@@ -602,5 +776,187 @@ mod tests {
         s.ensure_tree_initialized();
         assert_eq!(s.tree.entries.len(), snapshot);
         assert_eq!(s.tree.leaf_id, snapshot_leaf);
+    }
+
+    // --- P4c: message store + branch operations -----------------------
+
+    /// `add_message` populates the message_store keyed by id so
+    /// every message's content survives branch switches.
+    #[test]
+    fn add_message_populates_message_store() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "hello");
+        s.add_message(MessageRole::Assistant, "world");
+        assert_eq!(s.message_store.len(), 2);
+        let first_id = s.messages[0].id.clone();
+        assert_eq!(s.message_store[&first_id].content, "hello");
+    }
+
+    /// `pop_last_message` removes from messages, store, and the tree
+    /// (since no other branch refers to the popped node yet).
+    #[test]
+    fn pop_last_message_removes_from_all_three() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "a");
+        s.add_message(MessageRole::Assistant, "b");
+        let popped_id = s.messages[1].id.clone();
+        let popped = s.pop_last_message().unwrap();
+        assert_eq!(popped.content, "b");
+        assert_eq!(s.messages.len(), 1);
+        assert!(!s.message_store.contains_key(&popped_id));
+        assert!(!s.tree.entries.contains_key(&popped_id));
+        // Leaf moved back.
+        assert_eq!(s.tree.leaf_id.as_ref(), Some(&s.messages[0].id));
+    }
+
+    /// Forking at an entry that has another active child preserves
+    /// the original branch's content in the store, so the user can
+    /// `switch_to_leaf` back to it later.
+    #[test]
+    fn fork_at_preserves_original_branch_content() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "ask-1");
+        s.add_message(MessageRole::Assistant, "ans-1");
+        let original_leaf = s.tree.leaf_id.clone().unwrap();
+        // Fork at the assistant message — moves leaf to its parent (the
+        // user message), so the next add_message creates a sibling
+        // branch starting from that user message.
+        let assistant_id = s.messages[1].id.clone();
+        let user_id = s.messages[0].id.clone();
+        let original_msg = s.fork_at(&assistant_id).unwrap();
+        assert_eq!(original_msg.content, "ans-1");
+        // Active path is just the user message now.
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.tree.leaf_id, Some(user_id.clone()));
+        // Tree still contains the original assistant node (preserved
+        // for switch-back).
+        assert!(s.tree.entries.contains_key(&assistant_id));
+        assert!(s.message_store.contains_key(&assistant_id));
+
+        // Add a new assistant reply — creates a sibling.
+        s.add_message(MessageRole::Assistant, "ans-2-alternate");
+        let new_leaf = s.tree.leaf_id.clone().unwrap();
+        assert_ne!(new_leaf, original_leaf);
+        // user_id has two children now.
+        let children: Vec<_> = s
+            .tree
+            .entries
+            .values()
+            .filter(|n| n.parent.as_ref() == Some(&user_id))
+            .collect();
+        assert_eq!(children.len(), 2);
+    }
+
+    /// `switch_to_leaf` rebuilds the messages cache from the new
+    /// branch's path, with token accounting recomputed.
+    #[test]
+    fn switch_to_leaf_rebuilds_messages_and_tokens() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        s.add_message(MessageRole::Assistant, "a-original");
+        let original_leaf = s.tree.leaf_id.clone().unwrap();
+        let user_id = s.messages[0].id.clone();
+        s.fork_at(&s.messages[1].id.clone()).unwrap();
+        s.add_message(MessageRole::Assistant, "a-alternate-and-much-longer");
+        let alt_leaf = s.tree.leaf_id.clone().unwrap();
+        let alt_tokens = s.total_estimated_tokens;
+
+        // Switch back to the original branch.
+        s.switch_to_leaf(&original_leaf).unwrap();
+        assert_eq!(s.messages.len(), 2);
+        assert_eq!(s.messages[1].content, "a-original");
+        assert_eq!(s.tree.leaf_id, Some(original_leaf.clone()));
+        let original_tokens = s.total_estimated_tokens;
+
+        // Switch back to the alternate.
+        s.switch_to_leaf(&alt_leaf).unwrap();
+        assert_eq!(s.messages.len(), 2);
+        assert_eq!(s.messages[1].content, "a-alternate-and-much-longer");
+        assert_eq!(s.total_estimated_tokens, alt_tokens);
+        assert_ne!(original_tokens, alt_tokens);
+        // user_id is still common ancestor.
+        assert_eq!(s.messages[0].id, user_id);
+    }
+
+    /// Switching to an unknown leaf surfaces an error without
+    /// touching session state.
+    #[test]
+    fn switch_to_unknown_leaf_returns_err() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "msg");
+        let original_leaf = s.tree.leaf_id.clone();
+        let bogus = CompactString::new("nonexistent-id");
+        let err = s.switch_to_leaf(&bogus).unwrap_err();
+        assert!(err.contains("nonexistent-id"), "got: {err}");
+        // State unchanged.
+        assert_eq!(s.tree.leaf_id, original_leaf);
+    }
+
+    /// `clone_at` is `switch_to_leaf` semantically — the active path
+    /// becomes the path through the chosen entry, but no editor
+    /// restore happens (the caller decides about UI state).
+    #[test]
+    fn clone_at_is_switch_to_leaf() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        s.add_message(MessageRole::Assistant, "a-original");
+        let original = s.tree.leaf_id.clone().unwrap();
+        s.fork_at(&s.messages[1].id.clone()).unwrap();
+        s.add_message(MessageRole::Assistant, "a-alternate");
+        // clone_at the original leaf reactivates that branch.
+        s.clone_at(&original).unwrap();
+        assert_eq!(s.tree.leaf_id, Some(original));
+        assert_eq!(s.messages[1].content, "a-original");
+    }
+
+    /// `set_label` annotates a tree node with a bookmark string.
+    /// Read back via `tree.entries[id].label`.
+    #[test]
+    fn set_label_attaches_to_node() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "milestone");
+        let id = s.messages[0].id.clone();
+        s.set_label(&id, Some("checkpoint-1".to_string())).unwrap();
+        assert_eq!(s.tree.entries[&id].label.as_deref(), Some("checkpoint-1"));
+        // Clearing the label sets it back to None.
+        s.set_label(&id, None).unwrap();
+        assert_eq!(s.tree.entries[&id].label, None);
+    }
+
+    /// Legacy session JSON with messages but no message_store
+    /// populates the store on first ensure call. Critical backward
+    /// compat — users have existing sessions on disk.
+    #[test]
+    fn ensure_message_store_initialized_backfills_from_messages() {
+        let legacy = r#"{
+            "id": "abc",
+            "name": "",
+            "messages": [
+                {"role": "user", "content": "a", "estimated_tokens": 1,
+                 "id": "msg-1", "timestamp": 100},
+                {"role": "assistant", "content": "b", "estimated_tokens": 1,
+                 "id": "msg-2", "timestamp": 101}
+            ],
+            "compactions": [],
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "total_tokens": 0,
+            "total_cost": 0.0,
+            "total_estimated_tokens": 2,
+            "context_window": 0,
+            "model": "x",
+            "provider": "p",
+            "working_dir": ""
+        }"#;
+        let mut s: Session = serde_json::from_str(legacy).unwrap();
+        assert!(s.message_store.is_empty());
+        s.ensure_message_store_initialized();
+        assert_eq!(s.message_store.len(), 2);
+        assert_eq!(
+            s.message_store
+                .get(&CompactString::new("msg-1"))
+                .map(|m| m.content.as_str()),
+            Some("a")
+        );
     }
 }

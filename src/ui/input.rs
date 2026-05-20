@@ -323,6 +323,15 @@ impl InputEditor {
     /// raw. If the same content was already pasted and is still represented
     /// by a placeholder, expand that placeholder inline instead (so a second
     /// paste of the same content reveals the body).
+    /// Replace the entire buffer with `text` and move the cursor to
+    /// the end. Used by `/fork` to restore the original user prompt
+    /// into the editor for re-editing.
+    pub fn set_text(&mut self, text: &str) {
+        self.buffer = CompactString::new(text);
+        self.cursor = self.buffer.len();
+        self.pastes.clear();
+    }
+
     pub fn handle_paste(&mut self, text: &str) {
         // The file picker (`@query`) maintains its own filter state. A paste
         // landing here would write marker bytes into the buffer that the
