@@ -255,6 +255,30 @@ Create `~/.config/dirge/plugins/my-plugin.janet`:
               "\n- Authentication bypass"))))
 ```
 
+## LSP integration
+
+When built with the `lsp` feature (on by default), dirge attaches Language Server Protocol clients to your project and surfaces compile-time diagnostics directly in the agent's tool output. After every `write` or `edit`, the LSP server gets a `didChange`, waits for a fresh diagnostic publish, and any ERRORs land in the tool result as a `<diagnostics file="...">` block — so the agent corrects compile errors on the same turn instead of writing broken code and discovering it later via `cargo check`.
+
+| Tool | Effect |
+|------|--------|
+| `read`  | Fire-and-forget `didOpen` so the server has the file in memory by the time the agent edits it. No diagnostic block in `read` output. |
+| `write` | After write: `didChange` + wait for diagnostics + append errors-block. |
+| `edit`  | Same as `write`. |
+| `lsp`   | Agent-facing tool that exposes `definition`, `references`, `hover`, `documentSymbol`, `workspaceSymbol`, `implementation`, `prepareCallHierarchy`, `incomingCalls`, `outgoingCalls`. 1-based coordinates. |
+
+Built-in server set:
+
+| Server id | Binary | Extensions |
+|-----------|--------|------------|
+| `rust` | `rust-analyzer` | `.rs` |
+| `typescript` | `typescript-language-server --stdio` | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` |
+| `pyright` | `pyright-langserver --stdio` | `.py`, `.pyi` |
+| `clojure-lsp` | `clojure-lsp` | `.clj`, `.cljs`, `.cljc`, `.edn`, `.bb` |
+
+Workspace root resolution is per-server: rust-analyzer walks past nested member crates to the workspace `Cargo.toml` declaring `[workspace]`; typescript stops at the nearest `package.json`/`tsconfig.json` and yields to deno when a `deno.json` is closer; pyright looks for `pyproject.toml`/`setup.py`/etc.; clojure-lsp looks for `deps.edn`/`project.clj`/`shadow-cljs.edn`/`bb.edn`/`.clj-kondo`.
+
+Disable: `--no-lsp` flag or `{ "lsp": false }` in the config. Per-server overrides (custom command, env, init options) live in the config — see [CONFIG.md](CONFIG.md).
+
 ## Semantic code tools
 
 When built with `--features "semantic,semantic-ts,semantic-python"`, dirge gains AST-powered code analysis:

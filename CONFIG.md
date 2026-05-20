@@ -122,6 +122,62 @@ adds a default Exa Web Search MCP server at `https://mcp.exa.ai/mcp` with the
 `x-api-key` header set to `EXA_API_KEY` when that environment variable is set.
 Set `"mcp_servers": {}` to disable all MCP servers.
 
+## LSP configuration
+
+When compiled with the `lsp` feature (default-on), dirge spawns language
+servers on demand to surface compile errors in tool output. The `lsp` config
+key accepts three forms:
+
+```json
+// Default-on, built-in commands for rust/typescript/pyright/clojure-lsp.
+{ "lsp": true }
+
+// Off entirely. Same as the --no-lsp CLI flag.
+{ "lsp": false }
+
+// Default-on with per-server overrides.
+{
+  "lsp": {
+    "rust": {
+      "command": ["rust-analyzer"],
+      "env": { "RA_LOG": "rust_analyzer=debug" },
+      "initialization": { "cargo": { "buildScripts": { "enable": true } } }
+    },
+    "typescript": { "disabled": true }
+  }
+}
+```
+
+Per-server fields (all optional):
+
+| Field            | Type             | Description |
+| ---------------- | ---------------- | ----------- |
+| `command`        | string[]         | argv to launch the server. Replaces the built-in default. |
+| `extensions`     | string[]         | *Reserved.* Currently ignored — see "Known limitations" below. |
+| `env`            | object           | extra env vars for the child process. |
+| `initialization` | object           | sent as `initializationOptions` in the LSP `initialize` request. |
+| `disabled`       | boolean          | `true` removes the server entirely. |
+
+CLI flag: `--no-lsp` (overrides the config; same effect as `lsp: false`).
+
+### Built-in server commands
+
+| Server id     | Default command                              |
+| ------------- | -------------------------------------------- |
+| `rust`        | `rust-analyzer`                              |
+| `typescript`  | `typescript-language-server --stdio`         |
+| `pyright`     | `pyright-langserver --stdio`                 |
+| `clojure-lsp` | `clojure-lsp`                                |
+
+Servers are spawned lazily on first file touch and cached per `(workspace_root, server_id)` pair. Concurrent agent tool calls for the same file deduplicate so dirge never races two `rust-analyzer` processes against one workspace.
+
+### Known limitations
+
+- The `extensions` override is currently ignored. The claimed-extensions list lives in the static `builtin_servers()` registry at `src/lsp/server.rs`. Adding new extensions today requires editing that file. Follow-up.
+- v1 has four built-in servers. Additional servers can be added by extending `builtin_servers()` + `ProcessSpawner::default_commands()` in source.
+
+For an end-to-end smoke test against a real `rust-analyzer` process, see [`docs/LSP_MANUAL_TEST.md`](docs/LSP_MANUAL_TEST.md).
+
 ## ACP (Agent Communication Protocol) configuration
 
 When compiled with the `acp` feature, dirge can act as an ACP agent server.
