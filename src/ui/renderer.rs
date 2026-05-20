@@ -908,6 +908,13 @@ impl Renderer {
             stdout.execute(MoveTo(0, row))?;
             write!(stdout, "{}", " ".repeat(cols as usize))?;
             stdout.execute(MoveTo(bottom_indent as u16, row))?;
+            // Bold-glow the prompt indicator + input text so they
+            // match the chat above. Without this the bottom area
+            // looked dimmer than the chat that scrolled past it.
+            let accent_bloom = crate::ui::theme::is_bright(crate::ui::theme::accent());
+            if accent_bloom {
+                write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+            }
             write!(
                 stdout,
                 "{}",
@@ -919,10 +926,17 @@ impl Renderer {
             } else {
                 write!(stdout, "{}", prompt_cont)?;
             }
+            if accent_bloom {
+                write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+            }
             // Switch to the user-input text tone (bright phosphor)
             // before writing what the user typed, so the prompt
             // accent and the input text are visually distinct but
             // both on the green axis.
+            let user_bloom = crate::ui::theme::is_bright(crate::ui::theme::user());
+            if user_bloom {
+                write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+            }
             write!(
                 stdout,
                 "{}",
@@ -933,6 +947,9 @@ impl Renderer {
             {
                 let slice: String = chars[vr.char_start..vr.char_end].iter().collect();
                 write!(stdout, "{}", slice)?;
+            }
+            if user_bloom {
+                write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
             }
             write!(stdout, "{}", ResetColor)?;
         }

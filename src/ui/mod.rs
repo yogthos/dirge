@@ -2106,6 +2106,26 @@ pub async fn run_interactive(
                 // nested inside it.
                 close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
                 renderer.set_avatar_state(avatar::AvatarState::Alert);
+                // Force a bottom-row repaint so the avatar updates to
+                // the Alert face immediately, before the user reads
+                // the prompt and reaches for a key. Without this, the
+                // avatar still showed the in-flight tool's face
+                // (Reading/Writing/Bash) until the next keystroke.
+                renderer.draw_bottom(
+                    &input,
+                    &with_queue(
+                        StatusLine::render(
+                            session,
+                            is_running,
+                            0,
+                            loop_label.as_deref(),
+                            context.current_prompt_name.as_deref(),
+                            perm_mode().as_deref(),
+                        ),
+                        interjection_queue.len(),
+                    ),
+                    is_running,
+                )?;
 
                 // Framed permission prompt. The double-bar border +
                 // ALERT wordmark visually arrests the eye — this is
@@ -2929,7 +2949,7 @@ fn update_search(renderer: &Renderer, query: &str, matches: &mut Vec<usize>, sel
 }
 
 fn draw_search_bar(query: &str, matches: &[usize], selected: usize) -> std::io::Result<()> {
-    use crossterm::style::{ResetColor, SetForegroundColor};
+    use crossterm::style::{Attribute, ResetColor, SetAttribute, SetForegroundColor};
     use crossterm::terminal::{Clear, ClearType};
     use std::io::Write;
 
@@ -2942,9 +2962,19 @@ fn draw_search_bar(query: &str, matches: &[usize], selected: usize) -> std::io::
     };
     let bar = format!("Search: {} [{}]", query, indicator);
     crossterm::execute!(stdout, Clear(ClearType::CurrentLine))?;
+    // Bold-glow on accent so the search bar reads consistently with
+    // the rest of the chat. Without Bold it was visibly duller than
+    // surrounding content.
+    let bloom = theme::is_bright(theme::accent());
+    if bloom {
+        crossterm::execute!(stdout, SetAttribute(Attribute::Bold))?;
+    }
     crossterm::execute!(stdout, SetForegroundColor(theme::accent()))?;
     write!(stdout, "\r\n")?;
     write!(stdout, "{}", bar)?;
+    if bloom {
+        crossterm::execute!(stdout, SetAttribute(Attribute::NormalIntensity))?;
+    }
     crossterm::execute!(stdout, ResetColor)?;
     Ok(())
 }
