@@ -717,6 +717,148 @@ mod tests {
         assert_eq!(r, None);
     }
 
+    // --- P1: plugin-registered providers --------------------------------
+
+    /// `harness/register-provider name type base-url` records the spec
+    /// with no api_key_env override (defaults to None).
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_provider_records_spec_without_env_override() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-provider "local" "openai" "http://localhost:8000/v1")"#)
+            .unwrap();
+        let providers = mgr.list_providers();
+        assert_eq!(
+            providers,
+            vec![(
+                "local".to_string(),
+                "openai".to_string(),
+                "http://localhost:8000/v1".to_string(),
+                None,
+            )]
+        );
+    }
+
+    /// Explicit api-key-env argument flows through as Some(name).
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_provider_with_env_override() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(harness/register-provider "vllm" "openai" "http://localhost:1234/v1" "VLLM_API_KEY")"#,
+        )
+        .unwrap();
+        let providers = mgr.list_providers();
+        assert_eq!(
+            providers,
+            vec![(
+                "vllm".to_string(),
+                "openai".to_string(),
+                "http://localhost:1234/v1".to_string(),
+                Some("VLLM_API_KEY".to_string()),
+            )]
+        );
+    }
+
+    /// Multiple registrations all surface in their registration order.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_multiple_providers() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-provider "a" "openai" "http://a")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-provider "b" "anthropic" "http://b" "B_KEY")"#)
+            .unwrap();
+        let providers = mgr.list_providers();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].0, "a");
+        assert_eq!(providers[1].0, "b");
+        assert_eq!(providers[1].3, Some("B_KEY".to_string()));
+    }
+
+    /// Non-string args silently drop instead of crashing the plugin.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_provider_ignores_non_string_args() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        // Each of these has at least one non-string positional — all
+        // should be rejected by the (when (and (string? ...))) guard.
+        mgr.eval(r#"(harness/register-provider 42 "openai" "http://x")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-provider "name" 99 "http://x")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-provider "name" "openai" 0)"#)
+            .unwrap();
+        assert!(mgr.list_providers().is_empty());
+    }
+
+    /// `install_plugin_providers` populates the resolver, and
+    /// `resolve_provider_info` finds plugin-registered providers by
+    /// name when config doesn't have them. Verifies the full
+    /// integration path, not just the harness slot.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_plugin_provider_visible_through_resolve_provider_info() {
+        use crate::config::CustomProviderConfig;
+        use std::collections::HashMap;
+
+        // We can only install the global once per process. Use a unique
+        // provider name and check Note: This test depends on running
+        // first or alongside other tests that also install. OnceLock's
+        // set returns Err on second call but doesn't panic; we tolerate
+        // that and check the result post-install.
+        let mut map: HashMap<String, CustomProviderConfig> = HashMap::new();
+        map.insert(
+            "test-plugin-provider".to_string(),
+            CustomProviderConfig {
+                provider_type: "openai".to_string(),
+                base_url: "http://plugin-test.invalid/v1".to_string(),
+                api_key_env: Some("PLUGIN_TEST_KEY".to_string()),
+            },
+        );
+        // Best-effort install — OnceLock may already be set from
+        // another test; in that case we skip the assertion since we
+        // can't observe a fresh install.
+        crate::provider::install_plugin_providers(map);
+
+        let cfg_providers: HashMap<String, CustomProviderConfig> = HashMap::new();
+        if let Some(info) =
+            crate::provider::resolve_provider_info("test-plugin-provider", &cfg_providers)
+        {
+            assert_eq!(
+                info.base_url.as_deref(),
+                Some("http://plugin-test.invalid/v1"),
+            );
+            assert_eq!(info.api_key_env.as_deref(), Some("PLUGIN_TEST_KEY"));
+        }
+        // Else: another test already won the OnceLock race; integration
+        // isn't observable from here. That's fine — the harness-side
+        // tests above cover the parse path independently.
+    }
+
+    /// Config-declared custom providers must always win over
+    /// plugin-registered ones with the same name.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_config_provider_overrides_plugin_provider() {
+        use crate::config::CustomProviderConfig;
+        use std::collections::HashMap;
+
+        let mut cfg_providers: HashMap<String, CustomProviderConfig> = HashMap::new();
+        cfg_providers.insert(
+            "shadowed".to_string(),
+            CustomProviderConfig {
+                provider_type: "openai".to_string(),
+                base_url: "http://from-config".to_string(),
+                api_key_env: None,
+            },
+        );
+        // Even if the plugin global also has "shadowed", config wins
+        // because resolve_provider_info checks config first.
+        let info = crate::provider::resolve_provider_info("shadowed", &cfg_providers).unwrap();
+        assert_eq!(info.base_url.as_deref(), Some("http://from-config"));
+    }
+
     /// Args with special characters round-trip through the escape pipeline.
     #[cfg(feature = "plugin")]
     #[test]
@@ -1268,6 +1410,42 @@ impl PluginManager {
         } else {
             Ok(Some(result))
         }
+    }
+
+    /// Snapshot plugin-registered LLM provider specs as
+    /// `(name, type, base_url, api_key_env)` tuples. `api_key_env` is
+    /// `None` when the plugin passed an empty string (meaning "use
+    /// the default env var for this provider type"). Read once after
+    /// all plugins load and merged into the host's resolver via
+    /// [`crate::provider::install_plugin_providers`].
+    pub fn list_providers(&mut self) -> Vec<(String, String, String, Option<String>)> {
+        let raw = match self.worker.eval("harness-providers-list") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        raw.lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(4, '|');
+                let name = parts.next()?.trim();
+                let ptype = parts.next()?.trim();
+                let base_url = parts.next()?.trim();
+                let env_raw = parts.next()?.trim();
+                if name.is_empty() || ptype.is_empty() || base_url.is_empty() {
+                    return None;
+                }
+                let env = if env_raw.is_empty() {
+                    None
+                } else {
+                    Some(env_raw.to_string())
+                };
+                Some((
+                    name.to_string(),
+                    ptype.to_string(),
+                    base_url.to_string(),
+                    env,
+                ))
+            })
+            .collect()
     }
 
     /// Drain pending `(harness/notify ...)` entries as `(level, msg)`

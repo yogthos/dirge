@@ -367,6 +367,31 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        // After all plugins have loaded, harvest the providers each
+        // registered via `harness/register-provider` and install them
+        // into the global provider resolver. Config-declared
+        // custom_providers still take precedence on name collision.
+        let plugin_providers: std::collections::HashMap<String, config::CustomProviderConfig> = {
+            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            mgr.list_providers()
+                .into_iter()
+                .map(|(name, ptype, base_url, api_key_env)| {
+                    (
+                        name,
+                        config::CustomProviderConfig {
+                            provider_type: ptype,
+                            base_url,
+                            api_key_env,
+                        },
+                    )
+                })
+                .collect()
+        };
+        if !plugin_providers.is_empty() {
+            let n = provider::install_plugin_providers(plugin_providers);
+            eprintln!("  registered {} plugin provider(s)", n);
+        }
     }
 
     #[cfg(feature = "acp")]

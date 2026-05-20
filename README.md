@@ -270,6 +270,14 @@ Janet scripts access harness capabilities through built-in functions:
 (harness/register-renderer "bookmark" "render-bookmark-fn")
 (defn render-bookmark-fn [data]
   (harness/render "cyan" (string "★ " data)))
+
+# Custom LLM provider registration (P1):
+#   Plugins can declare an OpenAI-compatible (or any rig-supported)
+#   provider at startup. Config-declared custom_providers win on
+#   name collision.
+(harness/register-provider "local-openai" "openai"
+                            "http://localhost:8000/v1"
+                            "LOCAL_OPENAI_API_KEY")
 ```
 
 Plugins live in `~/.config/dirge/plugins/*.janet` (global) or
@@ -289,6 +297,7 @@ Example plugins in `plugins/`:
 | `select_persona.janet` | `harness/select` + `/persona` to pick a response style |
 | `turn_timing.janet` | `on-turn-start`/`on-turn-end` measuring per-turn elapsed time |
 | `bookmark.janet` | `harness/append-entry` + `harness/register-renderer` — typed entries with custom rendering |
+| `local_openai.janet` | `harness/register-provider` declaring vLLM/Ollama/LMStudio local endpoints |
 
 ### Workflow plugin
 

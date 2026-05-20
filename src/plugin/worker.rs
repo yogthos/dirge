@@ -158,6 +158,20 @@ const HARNESS_INIT: &str = r#"
          (string harness-render-buf
                  (string color) "\t"
                  (harness/-escape text) "\n"))))
+
+# Plugin-registered LLM providers (P1). Plugins call
+# (harness/register-provider name type base-url &opt api-key-env)
+# at load time to make a custom provider available alongside the
+# ones in config. Stored as `name|type|base-url|api-key-env\n`
+# so the host's list_providers can parse with a single
+# Janet -> Rust round-trip after all plugins finish loading.
+(var harness-providers-list "")
+(defn harness/register-provider [name type base-url &opt api-key-env]
+  (when (and (string? name) (string? type) (string? base-url))
+    (let [env (if (and api-key-env (string? api-key-env)) api-key-env "")]
+      (set harness-providers-list
+           (string harness-providers-list
+                   name "|" type "|" base-url "|" env "\n")))))
 "#;
 
 /// Janet-side aliases that defer the actual blocking work to the

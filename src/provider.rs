@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use rig::agent::Agent;
 use rig::client::CompletionClient;
@@ -68,6 +69,8 @@ pub fn resolve_provider_info(
     name: &str,
     custom_providers: &HashMap<String, CustomProviderConfig>,
 ) -> Option<ProviderInfo> {
+    // Config-declared custom providers win on name collision —
+    // user intent always trumps plugin defaults.
     if let Some(custom) = custom_providers.get(name) {
         let kind = parse_provider(&custom.provider_type)?;
         return Some(ProviderInfo {
@@ -76,12 +79,45 @@ pub fn resolve_provider_info(
             api_key_env: custom.api_key_env.clone(),
         });
     }
+    // Then plugin-registered providers from `harness/register-provider`.
+    // Installed once at startup after plugin load; never mutated again
+    // in this process.
+    if let Some(custom) = plugin_provider(name) {
+        let kind = parse_provider(&custom.provider_type)?;
+        return Some(ProviderInfo {
+            kind,
+            base_url: Some(custom.base_url),
+            api_key_env: custom.api_key_env,
+        });
+    }
     let kind = parse_provider(name)?;
     Some(ProviderInfo {
         kind,
         base_url: None,
         api_key_env: None,
     })
+}
+
+/// Process-global map of plugin-registered providers, populated once
+/// after plugin load. Stored separately from `cfg.custom_providers`
+/// so a `/reload` (future) can swap plugin providers without
+/// disturbing the user's persistent config.
+static PLUGIN_PROVIDERS: OnceLock<HashMap<String, CustomProviderConfig>> = OnceLock::new();
+
+/// Install the plugin-registered provider map. Only the first call
+/// wins (OnceLock semantics) — sufficient for current behavior where
+/// plugins re-register every startup and never change at runtime.
+/// Returns the installed-or-already-installed map size so callers
+/// can log a confirmation.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+pub fn install_plugin_providers(map: HashMap<String, CustomProviderConfig>) -> usize {
+    let size = map.len();
+    let _ = PLUGIN_PROVIDERS.set(map);
+    size
+}
+
+fn plugin_provider(name: &str) -> Option<CustomProviderConfig> {
+    PLUGIN_PROVIDERS.get().and_then(|m| m.get(name).cloned())
 }
 
 fn provider_env_var(kind: ProviderKind) -> &'static str {
