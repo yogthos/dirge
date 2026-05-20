@@ -63,18 +63,22 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     // never a truncated `.json`. The rename is atomic on every OS we
     // target. Use the same parent dir so rename stays on one filesystem.
     //
-    // The tmp filename includes a per-call nonce (pid + nanos) so two
-    // concurrent saves of the same session id don't collide on the
-    // tmp file. Each thread/process writes to its own tmp; the rename
-    // race is harmless (last-writer wins on the target, but neither
-    // tmp is partial because each was fully written before rename).
+    // The tmp filename includes a per-call nonce (pid + nanos +
+    // monotonic counter) so two concurrent saves of the same session
+    // id don't collide on the tmp file. The counter is the
+    // load-bearing piece — two threads firing in the same nanosecond
+    // still get distinct counter values, eliminating same-process
+    // collisions. The rename race remains harmless (last writer wins
+    // on the target; each tmp is fully written before rename).
+    static SAVE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0),
+        SAVE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
     let tmp = dir.join(format!(".{}.{}.json.tmp", session.id, nonce));
     {

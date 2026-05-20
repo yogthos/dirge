@@ -94,7 +94,20 @@ pub fn read_file(dir: &Path, path: &str) -> Result<String, String> {
     if !resolved.is_file() {
         return Err(format!("Memory '{}' not found", path));
     }
-    std::fs::read_to_string(&resolved).map_err(|e| format!("Failed to read memory: {e}"))
+    // 1 MB cap with truncation marker — same reasoning as the skill
+    // size cap. Memories are meant to be terse notes; multi-MB
+    // memories almost certainly need a different storage mechanism
+    // (and would explode LLM context if loaded raw).
+    const MEMORY_MAX_BYTES: usize = 1024 * 1024;
+    let raw =
+        std::fs::read_to_string(&resolved).map_err(|e| format!("Failed to read memory: {e}"))?;
+    if raw.len() > MEMORY_MAX_BYTES {
+        let mut truncated: String = raw.chars().take(MEMORY_MAX_BYTES).collect();
+        truncated.push_str("\n\n…[truncated: memory exceeds 1 MB cap]");
+        Ok(truncated)
+    } else {
+        Ok(raw)
+    }
 }
 
 pub fn write_file(dir: &Path, path: &str, content: &str) -> Result<(), String> {

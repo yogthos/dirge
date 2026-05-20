@@ -38,9 +38,21 @@ pub enum ProviderKind {
 }
 
 pub fn default_model_for(provider_name: &str) -> &'static str {
+    // Per-provider sensible defaults. Without per-provider defaults
+    // an unspecified `--model` against OpenAI/Anthropic/Gemini/Ollama
+    // would pass `deepseek/deepseek-v4-flash` and the API would reject
+    // with a confusing 404. Each provider gets a current-as-of-2026
+    // first-class model id; OpenRouter keeps the multi-vendor prefix
+    // form since that's what its API expects.
     match parse_provider(provider_name) {
+        Some(ProviderKind::OpenAI) => "gpt-4o",
+        Some(ProviderKind::Anthropic) => "claude-sonnet-4-6",
+        Some(ProviderKind::Gemini) => "gemini-2.0-flash",
         Some(ProviderKind::DeepSeek) => "deepseek-v4-pro",
         Some(ProviderKind::Glm) => "glm-4",
+        Some(ProviderKind::Ollama) => "llama3",
+        // OpenRouter + Custom + unknown — keep the historical default
+        // since OpenRouter wants the `vendor/model` form.
         _ => "deepseek/deepseek-v4-flash",
     }
 }

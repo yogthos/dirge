@@ -44,6 +44,22 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
                 if !skill_md.is_file() {
                     continue;
                 }
+                // Cap skill content at 1 MB. A skill is meant to be a
+                // short markdown instructions file; multi-MB skills
+                // would blow up LLM context. If users have legitimate
+                // need for larger skills, they should compress and
+                // bump this cap deliberately.
+                const SKILL_MAX_BYTES: u64 = 1024 * 1024;
+                if let Ok(meta) = std::fs::metadata(&skill_md)
+                    && meta.len() > SKILL_MAX_BYTES
+                {
+                    eprintln!(
+                        "warning: skipping skill {:?} ({} bytes > 1 MB cap)",
+                        skill_md,
+                        meta.len(),
+                    );
+                    continue;
+                }
                 if let Ok(content) = std::fs::read_to_string(&skill_md) {
                     if let Some(skill) = parse_skill(&content, &path) {
                         map.entry(skill.name.clone()).or_insert(skill);

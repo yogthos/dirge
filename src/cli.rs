@@ -104,14 +104,11 @@ pub struct Cli {
     )]
     pub acp_enabled: bool,
 
-    #[cfg(feature = "acp")]
-    #[arg(long = "acp-host", help = "ACP TCP bind host [default: stdio mode]")]
-    pub acp_host: Option<String>,
-
-    #[cfg(feature = "acp")]
-    #[arg(long = "acp-port", help = "ACP TCP bind port [default: 7243]")]
-    pub acp_port: Option<u16>,
-
+    // Note: --acp-host / --acp-port are intentionally NOT exposed.
+    // The current ACP implementation only supports stdio transport
+    // (see `src/extras/acp/mod.rs`). The historical config keys still
+    // deserialize for backward compatibility but are ignored. If TCP
+    // ACP support is added in the future, restore these flags then.
     #[cfg(feature = "loop")]
     #[arg(long = "loop-prompt", help = "Prompt for each loop iteration")]
     pub loop_prompt: Option<String>,

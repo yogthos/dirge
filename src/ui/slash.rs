@@ -1058,10 +1058,20 @@ pub async fn handle_slash(
                     // the Assistant/User pair pattern; using it here
                     // would leave a trailing System message in the
                     // session and the agent would see it on retry.
+                    //
+                    // Bound the loop at the current message count so
+                    // a corrupt session that somehow lacks user msgs
+                    // (despite the `last_user.is_some()` check above)
+                    // can't infinite-loop on `pop` returning None.
+                    let mut guard = session.messages.len();
                     while let Some(last) = session.messages.last() {
                         let was_user = last.role == MessageRole::User;
                         session.pop_last_message();
                         if was_user {
+                            break;
+                        }
+                        guard = guard.saturating_sub(1);
+                        if guard == 0 {
                             break;
                         }
                     }

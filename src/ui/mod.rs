@@ -1019,7 +1019,16 @@ pub async fn run_interactive(
                         if let Some(text) = input.handle_key(key) {
                             #[cfg(feature = "loop")]
                             if loop_state.as_ref().is_some_and(|ls| ls.active) && !text.starts_with('/') {
-                                renderer.write_line("loop active: /loop stop to cancel", c_error())?;
+                                // Queue the message instead of dropping it.
+                                // The next loop iteration's prompt-build path
+                                // already drains `interjection_queue` and
+                                // prepends queued messages, so this is the
+                                // natural place to land mid-loop user input.
+                                interjection_queue.push_back(text.to_string());
+                                renderer.write_line(
+                                    "loop active — message queued (will send after current iteration; /loop stop to cancel)",
+                                    c_agent(),
+                                )?;
                                 renderer.draw_bottom(
                                     &input,
                                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -1686,8 +1695,24 @@ pub async fn run_interactive(
                                     "╭─ ⚠ AUTO-COMPACT FAILED ─────────────────────────────╮",
                                     c_error(),
                                 )?;
+                                // Cap the cause length so a sprawling
+                                // multi-line error doesn't blow out the
+                                // box's visual rhythm. The full error
+                                // is still in the agent's recovery
+                                // path; this is for the user-facing
+                                // hint only.
+                                let cause = {
+                                    let s = e.to_string().replace('\n', " ");
+                                    if s.chars().count() > 64 {
+                                        let mut out: String = s.chars().take(63).collect();
+                                        out.push('…');
+                                        out
+                                    } else {
+                                        s
+                                    }
+                                };
                                 renderer.write_line(
-                                    &format!("│ cause: {}", e),
+                                    &format!("│ cause: {}", cause),
                                     c_error(),
                                 )?;
                                 renderer.write_line(

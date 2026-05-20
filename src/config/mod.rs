@@ -182,6 +182,24 @@ pub fn load() -> Config {
         })
     };
 
+    // Validate `custom_providers` at load time so a typo in
+    // `provider_type` surfaces immediately instead of failing at
+    // first agent call with a cryptic "unknown provider" deep in the
+    // call stack.
+    if let Some(providers) = cfg.custom_providers.as_ref() {
+        for (name, p) in providers {
+            if crate::provider::parse_provider(&p.provider_type).is_none() {
+                eprintln!(
+                    "error: custom provider {:?} has invalid provider_type {:?}.\n\
+                     Must be one of: openrouter, openai, anthropic, gemini,\n\
+                     deepseek, glm, ollama, custom.",
+                    name, p.provider_type,
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     #[cfg(feature = "mcp")]
     if cfg.mcp_servers.is_none() {
         let mut headers = HashMap::new();
