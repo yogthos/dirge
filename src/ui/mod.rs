@@ -5,6 +5,8 @@ pub(crate) mod picker;
 mod renderer;
 mod slash;
 mod status;
+#[cfg(feature = "plugin")]
+mod streaming;
 mod terminal;
 
 use std::collections::VecDeque;
@@ -295,6 +297,17 @@ pub async fn run_interactive(
     let mut agent_interject: Option<mpsc::UnboundedSender<()>> = None;
     let mut agent_line_started = false;
     let mut response_buf = String::new();
+    // Per-turn streaming state for the plugin hooks. The batcher
+    // collects tokens since the last `on-message-update` dispatch so
+    // we don't round-trip into Janet for every single token; the
+    // turn-text buffer accumulates the entire turn for the closing
+    // `on-turn-end` event. Reset at each TurnStart.
+    #[cfg(feature = "plugin")]
+    let mut token_batcher = crate::ui::streaming::TokenBatcher::default();
+    #[cfg(feature = "plugin")]
+    let mut current_turn_text = String::new();
+    #[cfg(feature = "plugin")]
+    let mut current_turn_index: u32 = 0;
     let mut response_start_line: Option<usize> = None;
     let mut show_reasoning = true;
     let mut was_reasoning = false;
@@ -1222,6 +1235,29 @@ pub async fn run_interactive(
                         let safe = sanitize_output(&text);
                         response_buf.push_str(&safe);
 
+                        // Stream this token into the per-turn batcher
+                        // and accumulator. When the batcher crosses its
+                        // threshold, dispatch `on-message-update` with
+                        // the cumulative text so far. The batcher's
+                        // batch covers only the *new* tokens since the
+                        // last update; current_turn_text is the *full*
+                        // turn text for the closing on-turn-end event.
+                        #[cfg(feature = "plugin")]
+                        if let Some(pm) = plugin_manager {
+                            current_turn_text.push_str(&text);
+                            if token_batcher.push(&text).is_some() {
+                                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                                let _ = mgr.dispatch(
+                                    "on-message-update",
+                                    &format!(
+                                        "@{{:index {} :partial \"{}\"}}",
+                                        current_turn_index,
+                                        crate::plugin::escape_janet_string(&current_turn_text),
+                                    ),
+                                );
+                            }
+                        }
+
                         if response_buf.is_empty() {
                             continue;
                         }
@@ -1697,10 +1733,66 @@ pub async fn run_interactive(
                             )?;
                         }
                     }
-                    // Turn boundary events from the runner. The UI doesn't
-                    // surface these directly today; they exist so P3 can
-                    // wire them into plugin hooks (on-turn-start / -end).
-                    AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. } => {}
+                    AgentEvent::TurnStart { index } => {
+                        #[cfg(feature = "plugin")]
+                        {
+                            // New turn — reset per-turn streaming state.
+                            // Without the reset, current_turn_text would
+                            // accumulate across all turns and the index
+                            // tracked here would drift from the runner's.
+                            token_batcher.reset();
+                            current_turn_text.clear();
+                            current_turn_index = index;
+                            if let Some(pm) = plugin_manager {
+                                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                                let _ = mgr.dispatch(
+                                    "on-turn-start",
+                                    &format!("@{{:index {}}}", index),
+                                );
+                            }
+                        }
+                        #[cfg(not(feature = "plugin"))]
+                        let _ = index;
+                    }
+                    AgentEvent::TurnEnd { index } => {
+                        #[cfg(feature = "plugin")]
+                        {
+                            if let Some(pm) = plugin_manager {
+                                // Flush any tokens that didn't reach the
+                                // batcher threshold so the final partial
+                                // update gets delivered.
+                                if let Some(tail) = token_batcher.flush_remaining() {
+                                    // tail is the *new* tokens since the
+                                    // last update; current_turn_text now
+                                    // covers them since we pushed at the
+                                    // same time as the batcher.
+                                    let _ = tail;
+                                    let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                                    let _ = mgr.dispatch(
+                                        "on-message-update",
+                                        &format!(
+                                            "@{{:index {} :partial \"{}\"}}",
+                                            index,
+                                            crate::plugin::escape_janet_string(
+                                                &current_turn_text
+                                            ),
+                                        ),
+                                    );
+                                }
+                                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                                let _ = mgr.dispatch(
+                                    "on-turn-end",
+                                    &format!(
+                                        "@{{:index {} :message \"{}\"}}",
+                                        index,
+                                        crate::plugin::escape_janet_string(&current_turn_text),
+                                    ),
+                                );
+                            }
+                        }
+                        #[cfg(not(feature = "plugin"))]
+                        let _ = index;
+                    }
                 }
                 renderer.draw_bottom(
                     &input,
