@@ -786,4 +786,89 @@ mod tests {
         assert_eq!(r, "");
         helper.join().unwrap();
     }
+
+    // --- R2: FFI edge cases ---------------------------------------------
+
+    /// R2: read_string_arg accepts Janet keywords (call sites can use
+    /// `(harness/confirm :title "q")` instead of double-quoted strings).
+    /// Caught by an integration test through harness/confirm since the
+    /// cfn is the only caller; if read_string_arg ever stops accepting
+    /// keywords this test fails.
+    #[test]
+    fn confirm_accepts_keyword_title() {
+        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
+            Some(DialogRequest::Confirm {
+                title,
+                question,
+                reply,
+            }) => {
+                assert_eq!(title, "warn");
+                assert_eq!(question, "really?");
+                let _ = reply.send(DialogReply::Confirm(true));
+            }
+            other => panic!("unexpected: {other:?}"),
+        });
+        // Keyword first arg — read_string_arg's is_kw branch handles it.
+        let r = worker
+            .eval(r#"(harness/__confirm :warn "really?")"#)
+            .unwrap();
+        assert_eq!(r, "true");
+        helper.join().unwrap();
+    }
+
+    /// R2: read_string_array_arg returns None for an empty array, and
+    /// the select cfn surfaces that as Janet nil. Janet-side
+    /// harness/select already short-circuits on `(indexed? opts)`, so
+    /// we hit the cfn via __select directly.
+    #[test]
+    fn select_with_empty_options_returns_nil() {
+        let (mut worker, _dialog_rx) = Worker::try_spawn().unwrap();
+        // Empty array should never even emit a dialog request.
+        let r = worker.eval(r#"(harness/__select "pick" [])"#).unwrap();
+        assert_eq!(r, "nil");
+    }
+
+    /// R2: read_string_array_arg works with tuples too (not just
+    /// arrays). Janet array literals `["a"]` are arrays; quoted forms
+    /// `'("a")` produce tuples. Both should be accepted.
+    #[test]
+    fn select_accepts_tuple_options() {
+        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
+            Some(DialogRequest::Select { options, reply, .. }) => {
+                assert_eq!(options, vec!["alpha".to_string(), "beta".to_string()]);
+                let _ = reply.send(DialogReply::Select(Some("alpha".to_string())));
+            }
+            other => panic!("unexpected: {other:?}"),
+        });
+        // Use a quoted tuple instead of an array literal.
+        let r = worker
+            .eval(r#"(harness/__select "pick" '("alpha" "beta"))"#)
+            .unwrap();
+        assert!(r.contains("alpha"), "got {r:?}");
+        helper.join().unwrap();
+    }
+
+    /// R2: wrap_string handles multibyte UTF-8 correctly. The byte
+    /// length is the Janet string's allocation; an off-by-one here
+    /// would either truncate emoji or read past the slice.
+    #[test]
+    fn select_returns_multibyte_option_through_wrap_string() {
+        let (mut worker, mut dialog_rx) = Worker::try_spawn().unwrap();
+        let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
+            Some(DialogRequest::Select { reply, .. }) => {
+                // Emoji + CJK + Cyrillic — all multibyte UTF-8.
+                let _ = reply.send(DialogReply::Select(Some("🦀漢字Привет".to_string())));
+            }
+            other => panic!("unexpected: {other:?}"),
+        });
+        let r = worker.eval(r#"(harness/select "pick" ["x"])"#).unwrap();
+        // Janet stringification preserves the raw UTF-8 bytes; the
+        // result should contain all three multibyte sequences intact.
+        assert!(r.contains("🦀"), "lost emoji: {r:?}");
+        assert!(r.contains("漢字"), "lost CJK: {r:?}");
+        assert!(r.contains("Привет"), "lost Cyrillic: {r:?}");
+        helper.join().unwrap();
+    }
 }
