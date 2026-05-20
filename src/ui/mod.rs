@@ -2030,19 +2030,37 @@ pub async fn run_interactive(
                 // independent of terminal width; the chat area
                 // requires at least 60 cols anyway.
                 const BOX_W: usize = 64;
+                let inner = BOX_W.saturating_sub(2);
                 let pre = "╭─ ⚠ ALERT · PERMISSION ";
                 let pre_len = pre.chars().count();
                 let top_fill = BOX_W.saturating_sub(pre_len + 1);
-                let bot_bar = "─".repeat(BOX_W.saturating_sub(2));
+                let bot_bar = "─".repeat(inner);
+                // Helper: format one row as `│ content (padded) │`
+                // so every row of the alert closes on the right edge.
+                let row = |content: &str| -> String {
+                    let chars: Vec<char> = content.chars().collect();
+                    let trimmed: String = if chars.len() <= inner.saturating_sub(2) {
+                        chars.iter().collect()
+                    } else if inner <= 2 {
+                        String::new()
+                    } else {
+                        let cap = inner.saturating_sub(3);
+                        let mut out: String = chars[..cap].iter().collect();
+                        out.push('…');
+                        out
+                    };
+                    let pad = inner.saturating_sub(trimmed.chars().count() + 1);
+                    format!("│ {}{}│", trimmed, " ".repeat(pad))
+                };
                 renderer.write_line(
                     &format!("{}{}╮", pre, "─".repeat(top_fill)),
                     c_perm(),
                 )?;
-                renderer.write_line(&format!("│ tool : {}", ask_req.tool), c_perm())?;
-                renderer.write_line(&format!("│ args : {}", ask_req.input), c_perm())?;
+                renderer.write_line(&row(&format!("tool : {}", ask_req.tool)), c_perm())?;
+                renderer.write_line(&row(&format!("args : {}", ask_req.input)), c_perm())?;
                 renderer.write_line(&format!("├{}┤", bot_bar), c_perm())?;
                 renderer.write_line(
-                    "│ [y] allow once  [a] allow always  [n] deny  [ESC] abort",
+                    &row("[y] allow once  [a] allow always  [n] deny  [ESC] abort"),
                     c_perm(),
                 )?;
                 renderer.write_line(&format!("╰{}╯", bot_bar), c_perm())?;
@@ -2665,11 +2683,58 @@ fn close_tool_chamber_if_open(
     last_tool_name: &mut Option<String>,
 ) -> anyhow::Result<()> {
     if last_tool_name.is_some() {
-        let (frame_w, _) = chamber_widths(renderer);
+        let (frame_w, inner) = chamber_widths(renderer);
+        // Abnormal close: this helper is only called when the tool's
+        // chamber is closing without a `ToolResult` (permission
+        // denied, interjected mid-execution, agent error, fresh tool
+        // call before the previous one finished). Surface that with
+        // a CRT-static "no signal" row so the empty chamber isn't a
+        // mute box. Two textured rows + one labelled row inside the
+        // chamber give it a distinct shape from a normal output
+        // chamber.
+        renderer.write_line(&static_row(inner, 0), theme::dim())?;
+        renderer.write_line(
+            &chamber_row_centered("░▒▓  NO OUTPUT  ▓▒░", inner),
+            theme::dim(),
+        )?;
+        renderer.write_line(
+            &chamber_row_centered("tool denied · aborted · no result", inner),
+            theme::dim(),
+        )?;
+        renderer.write_line(&static_row(inner, 1), theme::dim())?;
         renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
         *last_tool_name = None;
     }
     Ok(())
+}
+
+/// Produce a "CRT signal noise" row inside a chamber: a deterministic
+/// `░▒▓` glyph mix padded to inner width. The `seed` selects between
+/// two pre-baked patterns so top vs bottom static rows differ slightly
+/// — the eye reads it as continuous noise rather than a duplicated row.
+fn static_row(inner: usize, seed: usize) -> String {
+    let glyphs = [
+        ['░', '▒', '░', '▓', '░', '▒', '▒', '░', '▓', '▒'],
+        ['▒', '░', '▓', '░', '▒', '▓', '░', '▒', '░', '▓'],
+    ];
+    let pattern = &glyphs[seed % 2];
+    // Body fills `inner` chars (the chamber inner is already the
+    // padded content width); the `│ ` and ` │` borders sit outside.
+    let body: String = (0..inner).map(|i| pattern[i % pattern.len()]).collect();
+    format!("│{}│", body)
+}
+
+/// `│   <content centered to inner>   │` — pad text on both sides so
+/// it sits horizontally centered within the chamber inner width.
+fn chamber_row_centered(content: &str, inner: usize) -> String {
+    let len = content.chars().count();
+    if len + 2 >= inner {
+        return chamber_row(content, inner);
+    }
+    let pad = inner.saturating_sub(len + 2);
+    let left = pad / 2;
+    let right = pad - left;
+    format!("│ {}{}{} │", " ".repeat(left), content, " ".repeat(right))
 }
 
 fn render_tool_output(

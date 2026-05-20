@@ -225,9 +225,15 @@ impl Tool for EditTool {
             result.push_str(&format!(" ({} replacements)", match_positions.len()));
         }
 
+        // Always emit a diff. The earlier 20-line cap was meant to
+        // keep LLM context lean, but in practice it silently hid
+        // useful diffs for any non-trivial edit. Bump to 200 lines
+        // per side which covers the vast majority of real edits;
+        // edits larger than that are likely refactors where the
+        // "edit + diff" pattern isn't the right tool anyway.
         let old_lines = args.old_text.lines().count();
         let new_lines = args.new_text.lines().count();
-        if old_lines <= 20 && new_lines <= 20 {
+        if old_lines <= 200 && new_lines <= 200 {
             result.push_str(&Self::show_diff(
                 &args.path,
                 &content,

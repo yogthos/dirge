@@ -1042,10 +1042,16 @@ impl Renderer {
             .collect();
         push_section(&mut out, "TODOS", todo_items);
 
+        // Modified-files panel section: filename matters more than the
+        // path prefix, so truncate from the *left* (`…foo/bar.rs`)
+        // rather than the right. Available content width inside the
+        // chamber row is roughly `inner - 2` (the `  ` indent inside
+        // the `│ … │` borders).
+        let mod_max = inner.saturating_sub(2);
         let mod_items: Vec<(String, Color)> = d
             .modified
             .iter()
-            .map(|p| (format!("  {}", p), Color::White))
+            .map(|p| (format!("  {}", left_truncate(p, mod_max)), Color::White))
             .collect();
         push_section(&mut out, "MODIFIED", mod_items);
 
@@ -1121,6 +1127,26 @@ pub(crate) fn wrap_input(
     }
 
     (rows, cursor_visual_row, cursor_visual_col)
+}
+
+/// Truncate a string from the LEFT so the tail survives when content
+/// overflows. Useful for paths where the filename matters more than
+/// the prefix: `…clj/yourname/foo.rs` reads better than `src/clj/…`.
+/// Returns the input verbatim when `s` fits in `max` chars.
+fn left_truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    // Reserve 1 char for the leading `…`; keep the last `max-1` chars.
+    let start = chars.len() - (max - 1);
+    let mut out = String::with_capacity(max);
+    out.push('…');
+    out.extend(&chars[start..]);
+    out
 }
 
 pub fn copy_to_clipboard(text: &str) {
