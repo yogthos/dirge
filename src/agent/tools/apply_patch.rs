@@ -76,11 +76,24 @@ fn apply_create(path: &str, content: &str) -> Result<String, String> {
 fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, String> {
     let original = std::fs::read_to_string(path).map_err(|e| format!("read failed: {}", e))?;
 
-    if !original.contains(old_text) {
+    // CRLF normalization to match `edit.rs`. The LLM almost always
+    // generates `\n` in `old_text` even when the file is CRLF on
+    // disk; without normalization the literal substring match fails.
+    // We normalize a working copy for matching but preserve the
+    // original's line endings on the write-back.
+    let crlf = original.contains("\r\n");
+    let normalized = if crlf {
+        original.replace("\r\n", "\n")
+    } else {
+        original.clone()
+    };
+    let needle = old_text.replace("\r\n", "\n");
+
+    if !normalized.contains(&needle) {
         return Err(format!("text not found in {}", path));
     }
 
-    let matches: Vec<_> = original.match_indices(old_text).collect();
+    let matches: Vec<_> = normalized.match_indices(&needle).collect();
     if matches.len() > 1 {
         return Err(format!(
             "text matches {} locations in {} — provide more context to make unique",
@@ -89,8 +102,20 @@ fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, St
         ));
     }
 
-    let updated = original.replacen(old_text, new_text, 1);
-    std::fs::write(path, &updated).map_err(|e| format!("write failed: {}", e))?;
+    let replacement = if crlf {
+        new_text.replace("\r\n", "\n")
+    } else {
+        new_text.to_string()
+    };
+    let updated_normalized = normalized.replacen(&needle, &replacement, 1);
+    // Restore CRLF line endings on write-back so we don't silently
+    // re-format the user's file.
+    let to_write = if crlf {
+        updated_normalized.replace('\n', "\r\n")
+    } else {
+        updated_normalized
+    };
+    std::fs::write(path, &to_write).map_err(|e| format!("write failed: {}", e))?;
     Ok(format!("updated {}", path))
 }
 
@@ -206,9 +231,6 @@ impl Tool for ApplyPatchTool {
 
             match result {
                 Ok(msg) => {
-                    if let Some(ref cache) = self.cache {
-                        cache.clear();
-                    }
                     // Record the touched path(s) for the info panel. Rename
                     // adds the *new* path; delete still records the path the
                     // user/agent operated on so the panel reflects the action.
@@ -233,6 +255,14 @@ impl Tool for ApplyPatchTool {
                     break;
                 }
             }
+        }
+
+        // Clear the cache once after the batch instead of once per op.
+        // Per-op clearing was correct but wasteful — a 5-op batch
+        // would clear 5 times. Subsequent tool calls within the same
+        // turn now see a single clean cache.
+        if let Some(ref cache) = self.cache {
+            cache.clear();
         }
 
         Ok(results.join("\n"))

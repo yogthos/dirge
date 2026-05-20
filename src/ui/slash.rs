@@ -1050,8 +1050,14 @@ pub async fn handle_slash(
                 .cloned();
             match last_user {
                 Some(msg) => {
+                    // Pop the trailing assistant response (if any) so a
+                    // /retry doesn't leave the failed reply in the
+                    // session — the agent would otherwise see its own
+                    // bad answer as context on the retry.
+                    let _ = undo_last(session);
                     input.buffer = msg.content.clone();
                     input.cursor = msg.content.len();
+                    render_session(renderer, session, cli, cfg, context)?;
                     renderer.write_line("edit last message and press Enter to retry", c_agent())?;
                 }
                 None => {

@@ -646,8 +646,20 @@ impl Renderer {
                     if indent > 0 {
                         write!(stdout, "{}", " ".repeat(indent))?;
                     }
+                    // Bold-glow for bright tones so streamed text
+                    // reads the same as the post-redraw render_viewport
+                    // path. Without this, streaming chunks look flat
+                    // until the next full repaint shifts them to the
+                    // bright/bold weight.
+                    let bloom = crate::ui::theme::is_bright(color);
+                    if bloom {
+                        write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                    }
                     write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                     writeln!(stdout, "{}", chunk)?;
+                    if bloom {
+                        write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                    }
                     write!(stdout, "{}", ResetColor)?;
                     self.lines = self.lines.saturating_add(1);
                     self.col = 0;
@@ -701,8 +713,15 @@ impl Renderer {
                     let r = self.content_row();
                     stdout.execute(MoveTo(indent + self.col, r))?;
                     if !segment.is_empty() {
+                        let bloom = crate::ui::theme::is_bright(color);
+                        if bloom {
+                            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                        }
                         write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                         write!(stdout, "{}", segment)?;
+                        if bloom {
+                            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                        }
                         write!(stdout, "{}", ResetColor)?;
                     }
                     writeln!(stdout)?;
@@ -731,8 +750,15 @@ impl Renderer {
                         let mut stdout = io::stdout();
                         let r = self.content_row();
                         stdout.execute(MoveTo(indent + self.col, r))?;
+                        let bloom = crate::ui::theme::is_bright(color);
+                        if bloom {
+                            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                        }
                         write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                         write!(stdout, "{}", chunk)?;
+                        if bloom {
+                            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                        }
                         write!(stdout, "{}", ResetColor)?;
                         self.col = self.col.saturating_add(chunk.chars().count() as u16);
                     }
