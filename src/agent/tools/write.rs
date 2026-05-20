@@ -8,7 +8,9 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path, is_plan_file};
+use crate::agent::tools::{
+    AskSender, PermCheck, ToolError, WriteArgs, check_perm_path, is_plan_file,
+};
 #[cfg(feature = "lsp")]
 use crate::lsp::diagnostic;
 #[cfg(feature = "lsp")]
