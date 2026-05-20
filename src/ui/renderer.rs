@@ -828,7 +828,12 @@ impl Renderer {
         let (cols, _) = self.terminal_size();
         let panel_x = cols.saturating_sub(PANEL_WIDTH);
         let divider_x = panel_x.saturating_sub(1);
-        let width = PANEL_WIDTH as usize;
+        // Effective panel content width = PANEL_WIDTH - 1 so we never
+        // write to the terminal's absolute last column. On most
+        // terminals, writing the bottom-right cell triggers an
+        // implicit scroll-up — that shifts the panel content up by a
+        // row each redraw and eats the DIRGE.SYS frame's top border.
+        let width = (PANEL_WIDTH as usize).saturating_sub(1);
         let last_row = rows.saturating_sub(1); // status row — leave alone
 
         // Build the rendered lines first so we know how many we have, then
@@ -893,6 +898,15 @@ impl Renderer {
                 t
             }
         };
+
+        // Top padding rows. Same reasoning as the chat banner — without
+        // these the DIRGE.SYS frame's `╭───╮` sits flush against the
+        // terminal's row 0 and reads as cut off; some terminals also
+        // shift the panel up by a row when the bottom-right cell is
+        // touched, eating the top frame entirely. The padding gives
+        // both visual breathing room and a buffer against that.
+        out.push((String::new(), Color::Reset));
+        out.push((String::new(), Color::Reset));
 
         // Inner width inside the frame's left+right borders.
         let inner = width.saturating_sub(2);

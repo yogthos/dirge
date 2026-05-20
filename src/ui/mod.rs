@@ -1433,6 +1433,12 @@ pub async fn run_interactive(
                     }
                     AgentEvent::ToolCall { name, args } => {
                         was_reasoning = false;
+                        // If a previous tool's chamber never closed
+                        // (errored without a ToolResult, etc.), close
+                        // it before opening the new one. Without this
+                        // the new `╭─ NAME ─ args` lands inside the
+                        // stale chamber.
+                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
                         last_tool_name = Some(name.to_string());
                         if agent_line_started {
                             renderer.write_line("", Color::White)?;
@@ -1800,7 +1806,7 @@ pub async fn run_interactive(
                     }
                     AgentEvent::Interjected { partial_response, tokens } => {
                         was_reasoning = false;
-                        last_tool_name = None;
+                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
 
                         // Finalize whatever assistant text streamed so far so
                         // the conversation history reflects what the user saw,
@@ -1882,7 +1888,7 @@ pub async fn run_interactive(
                     }
                     AgentEvent::Error(e) => {
                         was_reasoning = false;
-                        last_tool_name = None;
+                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
                         let safe = sanitize_output(&e);
                         renderer.write_line(&format!("error: {}", safe), c_error())?;
 
@@ -2011,6 +2017,12 @@ pub async fn run_interactive(
                     agent_line_started = false;
                 }
 
+                // If a tool chamber is open (the in-flight tool that
+                // triggered this permission check), close it first so
+                // the alert renders outside the chamber rather than
+                // nested inside it.
+                close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+
                 // Framed permission prompt. The double-bar border +
                 // ALERT wordmark visually arrests the eye — this is
                 // the single most important UX moment and the user
@@ -2038,8 +2050,8 @@ pub async fn run_interactive(
                 let decision = loop {
                     tokio::select! {
                         Some(ev) = user_rx.recv() => {
-                            if let UserEvent::Key(key) = ev {
-                                match key.code {
+                            match ev {
+                                UserEvent::Key(key) => match key.code {
                                     KeyCode::Char('y') => break UserDecision::AllowOnce,
                                     KeyCode::Char('a') => {
                                         let pattern = suggest_pattern(&ask_req.tool, &ask_req.input);
@@ -2051,7 +2063,21 @@ pub async fn run_interactive(
                                     }
                                     KeyCode::Char('n') | KeyCode::Esc => break UserDecision::Deny,
                                     _ => {}
+                                },
+                                // Keep scroll responsive while the
+                                // alert is up — previously these
+                                // events were dropped on the floor
+                                // inside this loop, locking the chat
+                                // viewport.
+                                UserEvent::ScrollUp => {
+                                    renderer.scroll_line_up();
+                                    renderer.render_viewport()?;
                                 }
+                                UserEvent::ScrollDown => {
+                                    renderer.scroll_line_down();
+                                    renderer.render_viewport()?;
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -2626,6 +2652,24 @@ fn suggest_pattern(tool: &str, input: &str) -> String {
         }
         _ => "*".to_string(),
     }
+}
+
+/// Close the in-flight tool chamber if one is open. Used at every
+/// site that fires without going through `render_tool_output` (which
+/// closes the chamber itself): permission alerts, agent errors,
+/// interjections, fresh `ToolCall` events when the previous chamber
+/// wasn't terminated by a `ToolResult`. Idempotent — calling twice
+/// emits one bottom border at most.
+fn close_tool_chamber_if_open(
+    renderer: &mut Renderer,
+    last_tool_name: &mut Option<String>,
+) -> anyhow::Result<()> {
+    if last_tool_name.is_some() {
+        let (frame_w, _) = chamber_widths(renderer);
+        renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+        *last_tool_name = None;
+    }
+    Ok(())
 }
 
 fn render_tool_output(
