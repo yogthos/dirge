@@ -231,6 +231,18 @@ impl Session {
         self.tree.leaf_id = prev;
     }
 
+    /// Run both back-compat initializers as a unit. Use this instead
+    /// of calling `ensure_message_store_initialized` and
+    /// `ensure_tree_initialized` separately — they're individually
+    /// idempotent but the combined invariant ("tree + store both
+    /// reflect `messages`") is what every mutation actually depends
+    /// on. A panic between two separate calls would leave the
+    /// session half-initialized; this helper does both in one shot.
+    pub fn ensure_back_compat_initialized(&mut self) {
+        self.ensure_message_store_initialized();
+        self.ensure_tree_initialized();
+    }
+
     /// Append a plugin entry to this session. Assigns the next
     /// monotonic `seq` so renderers can produce a deterministic
     /// ordering even within a single-second timestamp bucket. Plugins
@@ -259,8 +271,7 @@ impl Session {
         // from a pre-P4b/P4c session file BEFORE we append the new
         // one — otherwise the rebuild would re-insert this new message
         // with the wrong parent.
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         let tokens = Self::estimate_tokens(content);
         let id = new_message_id();
         let timestamp = chrono::Utc::now().timestamp();
@@ -302,8 +313,7 @@ impl Session {
     /// fork's children stay reachable. In the linear case it's
     /// always safe to remove.
     pub fn pop_last_message(&mut self) -> Option<SessionMessage> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         let msg = self.messages.pop()?;
         // Move leaf back to the popped node's parent.
         let parent = self
@@ -340,8 +350,7 @@ impl Session {
     /// would indicate corruption). On error, leaves the session
     /// state untouched.
     pub fn switch_to_leaf(&mut self, new_leaf_id: &CompactString) -> Result<(), String> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         if !self.tree.entries.contains_key(new_leaf_id) {
             return Err(format!("unknown entry id: {}", new_leaf_id));
         }
@@ -385,8 +394,7 @@ impl Session {
     ///
     /// Mirrors pi's `ctx.fork(entryId, { position: "before" })`.
     pub fn fork_at(&mut self, entry_id: &CompactString) -> Result<SessionMessage, String> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         let node = self
             .tree
             .entries
@@ -530,8 +538,7 @@ impl Session {
         // Mirror into the tree + store: remove dropped nodes, insert
         // the new summary node as the new root, and re-parent the
         // first kept node to point at the summary.
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         for id in &dropped_ids {
             self.tree.entries.remove(id);
             self.message_store.remove(id);

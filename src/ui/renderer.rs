@@ -873,22 +873,26 @@ impl Renderer {
         // prefix` + cursor offset within content).
         let cursor_x =
             (bottom_indent + 3 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
-        stdout.execute(MoveTo(cursor_x, cursor_row))?;
+
+        // Hide the cursor BEFORE painting panel + avatar — those paints
+        // execute many `MoveTo` calls and the hardware cursor would
+        // visibly flicker across the right-hand panel while iterating
+        // its rows. Hidden cursor stays invisible until the final Show
+        // below puts it back at the input prompt.
+        stdout.execute(Hide)?;
 
         if self.panel_visible() {
             self.draw_panel(&mut stdout, rows)?;
-            // draw_panel moves the cursor — return it to the input.
-            stdout.execute(MoveTo(cursor_x, cursor_row))?;
         }
-
         // Paint the avatar in the bottom-left margin (cols 0..AVATAR_W,
         // rows just above the input row). Only painted when the
         // centering indent leaves room — on narrow terminals where
         // the chat band already starts at col 0, there's no margin to
         // put a face into.
         self.draw_avatar(&mut stdout, input_top)?;
-        // The avatar paint moves the cursor — return it to the input
-        // position for the visible Show below.
+
+        // Place the cursor at the input position; the Show below will
+        // make it visible exactly there.
         stdout.execute(MoveTo(cursor_x, cursor_row))?;
 
         // draw_bottom is the only place the visible cursor belongs (at the

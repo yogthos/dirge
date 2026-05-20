@@ -1051,6 +1051,7 @@ pub async fn run_interactive(
                                                 let msg = format!("I ran: $ {}\n\nOutput:\n{}", cmd, output);
                                                 let history = crate::agent::runner::convert_history(session);
                                                 session.add_message(MessageRole::User, &msg);
+                                renderer.set_avatar_state(avatar::AvatarState::Idle);
                                                 let runner = agent.clone().spawn_runner(
                                                     crate::agent::tools::background::prepend_pending_notifications(&msg, bg_store.as_ref()),
                                                     history,
@@ -1145,6 +1146,7 @@ pub async fn run_interactive(
                                             );
                                             let history = crate::agent::runner::convert_history(session);
                                             session.add_message(MessageRole::User, &prompt);
+                                            renderer.set_avatar_state(avatar::AvatarState::Idle);
                                             let runner = agent.clone().spawn_runner(
                                                 crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
                                                 history,
@@ -1342,6 +1344,7 @@ pub async fn run_interactive(
                                 is_running = true;
 
                                 session.add_message(MessageRole::User, &text);
+                                renderer.set_avatar_state(avatar::AvatarState::Idle);
                             }
                         }
                         renderer.draw_bottom(
