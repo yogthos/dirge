@@ -79,6 +79,11 @@ pub struct Renderer {
     /// before each redraw so render_viewport/draw_bottom can repaint the
     /// panel along with the rest of the screen.
     panel_data: PanelData,
+    /// What the agent is doing — drives the bottom-left ASCII avatar.
+    avatar_state: crate::ui::avatar::AvatarState,
+    /// Animation flip; toggled by `tick_avatar()` so the avatar's
+    /// eyes / mouth alternate between two poses per state.
+    avatar_tick: bool,
 }
 
 impl Renderer {
@@ -98,7 +103,18 @@ impl Renderer {
             selection_end: None,
             panel_mode: PanelMode::Auto,
             panel_data: PanelData::default(),
+            avatar_state: crate::ui::avatar::AvatarState::Idle,
+            avatar_tick: false,
         })
+    }
+
+    /// Update the avatar state and trigger a repaint of the bottom-left
+    /// pixels. Cheap when the state hasn't changed — only the existing
+    /// 3-row × 5-col patch is re-drawn.
+    pub fn set_avatar_state(&mut self, state: crate::ui::avatar::AvatarState) {
+        if self.avatar_state != state {
+            self.avatar_state = state;
+        }
     }
 
     pub fn set_panel_mode(&mut self, mode: PanelMode) {
@@ -754,6 +770,7 @@ impl Renderer {
         // pulse — readable without becoming distracting.
         let prompt_main = if is_running {
             self.spinner_tick = !self.spinner_tick;
+            self.avatar_tick = !self.avatar_tick;
             // Two-state spinner using ░/▒ blocks so the eye registers
             // motion at slow refresh rates.
             if self.spinner_tick {
@@ -864,12 +881,62 @@ impl Renderer {
             stdout.execute(MoveTo(cursor_x, cursor_row))?;
         }
 
+        // Paint the avatar in the bottom-left margin (cols 0..AVATAR_W,
+        // rows just above the input row). Only painted when the
+        // centering indent leaves room — on narrow terminals where
+        // the chat band already starts at col 0, there's no margin to
+        // put a face into.
+        self.draw_avatar(&mut stdout, input_top)?;
+        // The avatar paint moves the cursor — return it to the input
+        // position for the visible Show below.
+        stdout.execute(MoveTo(cursor_x, cursor_row))?;
+
         // draw_bottom is the only place the visible cursor belongs (at the
         // user's input position). Other renderer paths (render_viewport,
         // write, write_line) keep the cursor hidden so streaming output
         // doesn't drag the hardware cursor across the chat area.
         stdout.execute(Show)?;
         stdout.flush()?;
+        Ok(())
+    }
+
+    /// Paint the bottom-left ASCII avatar at cols `0..AVATAR_W`, in the
+    /// three rows just above `input_top`. Skipped when the chat band's
+    /// centering indent is too narrow (`< AVATAR_W + 1`) to fit the
+    /// avatar without overlapping chat content.
+    fn draw_avatar(&self, stdout: &mut io::Stdout, input_top: u16) -> io::Result<()> {
+        use crate::ui::avatar::{AVATAR_H, AVATAR_W, art, color};
+        // Need at least AVATAR_W + 1 cols of indent so the avatar
+        // doesn't bleed into chat content. Also need at least AVATAR_H
+        // rows of vertical headroom above the input.
+        let indent = self.content_indent();
+        if indent < AVATAR_W + 1 {
+            return Ok(());
+        }
+        if input_top < AVATAR_H as u16 {
+            return Ok(());
+        }
+        let lines = art(self.avatar_state, self.avatar_tick);
+        let painted = self.color(color(self.avatar_state));
+        let top_row = input_top - AVATAR_H as u16;
+        for (i, line) in lines.iter().enumerate() {
+            stdout.execute(MoveTo(0, top_row + i as u16))?;
+            // Hide cursor while painting so it doesn't drag across.
+            // Wipe the 5-col patch first, then write the face.
+            write!(stdout, "{}", " ".repeat(AVATAR_W))?;
+            stdout.execute(MoveTo(0, top_row + i as u16))?;
+            write!(stdout, "{}", SetForegroundColor(painted))?;
+            // Bold attribute for the phosphor bloom, matching the
+            // chat content rules.
+            if crate::ui::theme::is_bright(color(self.avatar_state)) {
+                write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+            }
+            write!(stdout, "{}", line)?;
+            if crate::ui::theme::is_bright(color(self.avatar_state)) {
+                write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+            }
+            write!(stdout, "{}", ResetColor)?;
+        }
         Ok(())
     }
 

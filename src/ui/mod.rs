@@ -1,3 +1,4 @@
+pub(crate) mod avatar;
 mod events;
 pub(crate) mod input;
 mod markdown;
@@ -1363,6 +1364,7 @@ pub async fn run_interactive(
             } => {
                 match event {
                     AgentEvent::Reasoning(text) => {
+                        renderer.set_avatar_state(avatar::AvatarState::Thinking);
                         if !show_reasoning {
                             continue;
                         }
@@ -1375,6 +1377,7 @@ pub async fn run_interactive(
                         was_reasoning = true;
                     }
                     AgentEvent::Token(text) => {
+                        renderer.set_avatar_state(avatar::AvatarState::Speaking);
                         if was_reasoning {
                             renderer.write_line("", Color::White)?;
                             agent_line_started = false;
@@ -1433,6 +1436,7 @@ pub async fn run_interactive(
                     }
                     AgentEvent::ToolCall { name, args } => {
                         was_reasoning = false;
+                        renderer.set_avatar_state(avatar::AvatarState::from_tool_name(&name));
                         // If a previous tool's chamber never closed
                         // (errored without a ToolResult, etc.), close
                         // it before opening the new one. Without this
@@ -1565,6 +1569,7 @@ pub async fn run_interactive(
                     AgentEvent::Done { response, tokens, cost } => {
                         was_reasoning = false;
                         last_tool_name = None;
+                        renderer.set_avatar_state(avatar::AvatarState::Done);
 
                         #[allow(unused_mut, unused_variables)]
                         let mut plugin_followup: Option<String> = None;
@@ -1888,6 +1893,7 @@ pub async fn run_interactive(
                     }
                     AgentEvent::Error(e) => {
                         was_reasoning = false;
+                        renderer.set_avatar_state(avatar::AvatarState::Error);
                         close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
                         let safe = sanitize_output(&e);
                         renderer.write_line(&format!("error: {}", safe), c_error())?;
@@ -2022,6 +2028,7 @@ pub async fn run_interactive(
                 // the alert renders outside the chamber rather than
                 // nested inside it.
                 close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                renderer.set_avatar_state(avatar::AvatarState::Alert);
 
                 // Framed permission prompt. The double-bar border +
                 // ALERT wordmark visually arrests the eye — this is
