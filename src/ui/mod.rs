@@ -57,6 +57,80 @@ fn with_queue(s: String, n: usize) -> String {
     if n == 0 { s } else { format!("{} q:{}", s, n) }
 }
 
+/// Map a plugin-supplied color string ("cyan", "red", ...) to a
+/// crossterm `Color`. Falls back to dim grey for anything unrecognized
+/// so a typo in plugin code doesn't crash the UI.
+#[cfg(feature = "plugin")]
+fn parse_plugin_color(name: &str) -> Color {
+    // Lowercase + strip a leading `:` so `:cyan`, `cyan`, `Cyan` all
+    // map to the same crossterm color.
+    let normalized = name.trim_start_matches(':').to_ascii_lowercase();
+    match normalized.as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "white" => Color::White,
+        "darkgrey" | "darkgray" | "grey" | "gray" => Color::DarkGrey,
+        "darkred" => Color::DarkRed,
+        "darkgreen" => Color::DarkGreen,
+        "darkyellow" => Color::DarkYellow,
+        "darkblue" => Color::DarkBlue,
+        "darkmagenta" => Color::DarkMagenta,
+        "darkcyan" => Color::DarkCyan,
+        _ => Color::DarkGrey,
+    }
+}
+
+/// Render one plugin entry to the chat. Looks up a registered
+/// renderer for `entry.custom_type`; if found, invokes it and
+/// renders the returned (color, text) lines. If not found (or the
+/// renderer emitted nothing), falls back to a minimal default
+/// rendering: a header line + the raw data string.
+#[cfg(feature = "plugin")]
+fn render_plugin_entry(
+    pm_arc: &std::sync::Arc<std::sync::Mutex<PluginManager>>,
+    renderer: &mut Renderer,
+    entry: &crate::session::PluginEntry,
+) -> std::io::Result<()> {
+    let handler_name = {
+        let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+        mgr.list_renderers()
+            .into_iter()
+            .find(|(t, _)| t == &entry.custom_type)
+            .map(|(_, h)| h)
+    };
+
+    if let Some(handler) = handler_name {
+        let lines = {
+            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            mgr.invoke_renderer(&handler, &entry.data)
+                .unwrap_or_default()
+        };
+        if !lines.is_empty() {
+            for (color_name, text) in lines {
+                let color = parse_plugin_color(&color_name);
+                renderer.write_line(&sanitize_output(&text), color)?;
+            }
+            return Ok(());
+        }
+    }
+
+    // Default rendering: identify the custom type and dump the data.
+    // Keeps entries visible even when their plugin is uninstalled.
+    renderer.write_line(&format!("[entry: {}]", entry.custom_type), Color::DarkGrey)?;
+    if !entry.data.is_empty() {
+        renderer.write_line(
+            &format!("  {}", sanitize_output(&entry.data)),
+            Color::DarkGrey,
+        )?;
+    }
+    Ok(())
+}
+
 /// Snapshot the various pieces of state the info panel surfaces (cwd, MCP,
 /// LSP, todos, modified files) into a `PanelData` ready to hand to the
 /// renderer. Reads global statics (TODO_LIST, MODIFIED_FILES) under their
@@ -441,6 +515,31 @@ pub async fn run_interactive(
                     _ => Color::DarkGrey,
                 };
                 renderer.write_line(&format!("[plugin] {}", msg), color)?;
+            }
+        }
+
+        // Drain plugin-appended session entries. Each entry is
+        // committed to `session.extra_entries` (so it survives
+        // save/load) and displayed via the registered renderer for
+        // its custom_type, or via the default JSON-dump renderer when
+        // no renderer is registered.
+        #[cfg(feature = "plugin")]
+        if let Some(pm_arc) = crate::plugin::hook::global() {
+            let drained = {
+                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.drain_entries()
+            };
+            for (custom_type, data, display) in drained {
+                // Record into session unconditionally (display=false
+                // entries still persist; they're for plugin state that
+                // shouldn't visually appear).
+                let entry = session
+                    .append_plugin_entry(custom_type.clone(), data.clone(), display)
+                    .clone();
+                if !entry.display {
+                    continue;
+                }
+                render_plugin_entry(&pm_arc, &mut renderer, &entry)?;
             }
         }
 

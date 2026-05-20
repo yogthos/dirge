@@ -823,6 +823,147 @@ mod tests {
             "each thread should see its own block reason"
         );
     }
+
+    // --- P2: append-entry, register-renderer, invoke-renderer --------
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_append_entry_records_triple() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/append-entry "bookmark" "label-one")"#)
+            .unwrap();
+        let entries = mgr.drain_entries();
+        assert_eq!(
+            entries,
+            vec![("bookmark".to_string(), "label-one".to_string(), true)]
+        );
+        // Drained.
+        assert!(mgr.drain_entries().is_empty());
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_append_entry_preserves_order_and_flag() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/append-entry "a" "x" true)"#).unwrap();
+        mgr.eval(r#"(harness/append-entry "b" "y" false)"#).unwrap();
+        mgr.eval(r#"(harness/append-entry "c" "z")"#).unwrap();
+        let entries = mgr.drain_entries();
+        assert_eq!(
+            entries,
+            vec![
+                ("a".to_string(), "x".to_string(), true),
+                ("b".to_string(), "y".to_string(), false),
+                ("c".to_string(), "z".to_string(), true),
+            ]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_append_entry_escapes_special_chars() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/append-entry "json" "a\tb\nc\\d")"#)
+            .unwrap();
+        let entries = mgr.drain_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "a\tb\nc\\d");
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_append_entry_ignores_non_string_args() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/append-entry 42 "ok")"#).unwrap();
+        mgr.eval(r#"(harness/append-entry "ok" 42)"#).unwrap();
+        assert!(mgr.drain_entries().is_empty());
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_renderer_records_pairs() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-renderer "bookmark" "render-bookmark")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-renderer "telemetry" "render-stat")"#)
+            .unwrap();
+        let renderers = mgr.list_renderers();
+        assert!(renderers.contains(&("bookmark".to_string(), "render-bookmark".to_string())));
+        assert!(renderers.contains(&("telemetry".to_string(), "render-stat".to_string())));
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_renderer_collects_render_lines() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn my-renderer [data]
+                (harness/render :cyan (string "★ " data))
+                (harness/render :white "details below"))"#,
+        )
+        .unwrap();
+        let lines = mgr.invoke_renderer("my-renderer", "label").unwrap();
+        // Janet's `(string :cyan)` drops the leading `:`; the host sees
+        // bare color names. That matches how the UI parses them back
+        // into crossterm Colors.
+        assert_eq!(
+            lines,
+            vec![
+                ("cyan".to_string(), "★ label".to_string()),
+                ("white".to_string(), "details below".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_renderer_silent_handler_returns_empty() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn silent [data] nil)"#).unwrap();
+        let lines = mgr.invoke_renderer("silent", "anything").unwrap();
+        assert!(lines.is_empty());
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_unknown_renderer_returns_empty() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        let lines = mgr.invoke_renderer("nonexistent", "data").unwrap();
+        assert!(lines.is_empty());
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_renderer_resets_buffer_between_calls() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn one [data] (harness/render :red "from-one"))
+               (defn two [data] (harness/render :blue "from-two"))"#,
+        )
+        .unwrap();
+        let a = mgr.invoke_renderer("one", "x").unwrap();
+        let b = mgr.invoke_renderer("two", "y").unwrap();
+        assert_eq!(a, vec![("red".to_string(), "from-one".to_string())]);
+        assert_eq!(b, vec![("blue".to_string(), "from-two".to_string())]);
+    }
+
+    #[test]
+    fn test_unescape_harness_field_roundtrips() {
+        assert_eq!(super::unescape_harness_field("plain"), "plain");
+        assert_eq!(super::unescape_harness_field("a\\tb"), "a\tb");
+        assert_eq!(super::unescape_harness_field("a\\nb"), "a\nb");
+        assert_eq!(super::unescape_harness_field("a\\\\b"), "a\\b");
+        // Combined: \\ then \t then \n.
+        assert_eq!(
+            super::unescape_harness_field("a\\\\b\\tc\\nd"),
+            "a\\b\tc\nd"
+        );
+        // Unknown escape passes through untouched so plugin data isn't
+        // silently corrupted.
+        assert_eq!(super::unescape_harness_field("a\\xb"), "a\\xb");
+        // Trailing backslash at end of field is preserved.
+        assert_eq!(super::unescape_harness_field("a\\"), "a\\");
+    }
 }
 
 use std::collections::HashMap;
@@ -1158,6 +1299,133 @@ impl PluginManager {
         let _ = self.worker.eval(r#"(set harness-notif-list "")"#);
         parsed
     }
+
+    /// Drain `(harness/append-entry ...)` calls as `(custom_type, data,
+    /// display)` triples. Janet escapes embedded tabs/newlines/
+    /// backslashes via the harness escape; we reverse it here so the
+    /// host stores the original bytes.
+    pub fn drain_entries(&mut self) -> Vec<(String, String, bool)> {
+        let raw = match self.worker.eval("harness-entries-buf") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let parsed: Vec<(String, String, bool)> = raw
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, '\t');
+                let custom_type = unescape_harness_field(parts.next()?);
+                let data = unescape_harness_field(parts.next()?);
+                let display = parts.next().is_some_and(|d| d.trim() == "1");
+                if custom_type.is_empty() {
+                    None
+                } else {
+                    Some((custom_type, data, display))
+                }
+            })
+            .collect();
+        let _ = self.worker.eval(r#"(set harness-entries-buf "")"#);
+        parsed
+    }
+
+    /// Snapshot the plugin-registered renderers as `(custom_type,
+    /// handler-fn-name)` pairs. Same blob format as `list_commands`.
+    pub fn list_renderers(&mut self) -> Vec<(String, String)> {
+        let raw = match self.worker.eval("harness-renderer-list") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        raw.lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, '|');
+                let kind = parts.next()?.trim();
+                let handler = parts.next()?.trim();
+                if kind.is_empty() || handler.is_empty() {
+                    None
+                } else {
+                    Some((kind.to_string(), handler.to_string()))
+                }
+            })
+            .collect()
+    }
+
+    /// Invoke a registered renderer with the entry's `data` string.
+    /// Returns the rendered lines as `(color, text)` pairs. The
+    /// host pre-clears `harness-render-buf`, calls the renderer,
+    /// then reads back the accumulated lines.
+    ///
+    /// On any failure (handler missing, raised Janet error, malformed
+    /// output) returns Ok(empty); callers should fall back to the
+    /// default JSON-dump rendering. We surface Err only for
+    /// catastrophic Janet failures (VM gone).
+    pub fn invoke_renderer(
+        &mut self,
+        handler_fn: &str,
+        data: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let _ = self.worker.eval(r#"(set harness-render-buf "")"#);
+        let escaped_data = escape_janet_string(data);
+        let escaped_fn = escape_janet_string(handler_fn);
+        let code = format!(
+            r#"(try
+                 (let [f (get (curenv) (symbol "{fname}"))]
+                   (if (and f (function? (f :value)))
+                     ((f :value) "{data}")
+                     nil))
+                 ([err fib] nil))"#,
+            fname = escaped_fn,
+            data = escaped_data,
+        );
+        let _ = self.eval(&code)?;
+        let raw = self.worker.eval("harness-render-buf").unwrap_or_default();
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        let parsed: Vec<(String, String)> = raw
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, '\t');
+                let color = parts.next()?.trim();
+                let text = unescape_harness_field(parts.next()?);
+                if color.is_empty() {
+                    None
+                } else {
+                    Some((color.to_string(), text))
+                }
+            })
+            .collect();
+        let _ = self.worker.eval(r#"(set harness-render-buf "")"#);
+        Ok(parsed)
+    }
+}
+
+/// Reverse the harness's tab/newline/backslash escape so the data
+/// the plugin passed round-trips back through Rust unchanged.
+fn unescape_harness_field(s: &str) -> String {
+    // Three-byte escapes: \\, \t, \n. Process linearly.
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some(other) => {
+                // Unknown escape — pass through literally so we never
+                // silently corrupt plugin data.
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Outcome of a tool-hook dispatch. All fields are `None` when no plugin

@@ -263,6 +263,13 @@ Janet scripts access harness capabilities through built-in functions:
 # any hook — the worker thread blocks while the UI handles the dialog):
 (harness/confirm "title" "really delete?")           # -> true|false
 (harness/select  "pick one" ["alpha" "beta" "gamma"]) # -> string|nil
+
+# Typed session entries + custom renderers (P2):
+(harness/append-entry "bookmark" "label-text")  # display=true by default
+(harness/append-entry "telemetry" "{\"cost\":0.02}" false)  # persisted but not displayed
+(harness/register-renderer "bookmark" "render-bookmark-fn")
+(defn render-bookmark-fn [data]
+  (harness/render "cyan" (string "★ " data)))
 ```
 
 Plugins live in `~/.config/dirge/plugins/*.janet` (global) or
@@ -281,6 +288,7 @@ Example plugins in `plugins/`:
 | `confirm_destructive.janet` | `harness/confirm` gating bash danger commands |
 | `select_persona.janet` | `harness/select` + `/persona` to pick a response style |
 | `turn_timing.janet` | `on-turn-start`/`on-turn-end` measuring per-turn elapsed time |
+| `bookmark.janet` | `harness/append-entry` + `harness/register-renderer` — typed entries with custom rendering |
 
 ### Workflow plugin
 
