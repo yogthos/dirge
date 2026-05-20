@@ -282,8 +282,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 pm,
                 store.clone(),
             ));
-            let status_tool =
-                Box::new(tools::TaskStatusTool::new(store)) as Box<dyn rig::tool::ToolDyn>;
+            let status_tool = Box::new(
+                tools::TaskStatusTool::new(store)
+                    .with_permission(permission.clone(), ask_tx.clone()),
+            ) as Box<dyn rig::tool::ToolDyn>;
             builder = builder.tools(hookify(vec![task_tool, status_tool]));
         }
 

@@ -582,6 +582,14 @@ impl Session {
                 .or(Some(summary_id.clone()));
         }
 
+        // On compress we replace every prior compaction record with a
+        // single fresh one. `Compaction::first_kept_index` is meant to
+        // mark the message-index boundary for the *latest* compaction
+        // only — keeping a stale list of records from earlier compresses
+        // makes their indices meaningless after subsequent drains. The
+        // latest summary IS the conversation prefix; older summaries
+        // are folded into it via `previous_summary` in the LLM context.
+        self.compactions.clear();
         self.compactions.push(Compaction {
             summary: CompactString::from(summary),
             first_kept_index: 1, // The summary is at index 0
@@ -590,8 +598,6 @@ impl Session {
             created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
         });
 
-        // Adjust all compaction first_kept indices for the removed messages
-        // (since we never have >1 compaction with the current simple approach, this is fine)
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     }
 }

@@ -91,7 +91,8 @@ impl Tool for WebFetchTool {
                         "description": "URLs to fetch (may be comma-separated)"
                     },
                     "max_chars": {
-                        "type": "number",
+                        "type": "integer",
+                        "minimum": 1,
                         "description": "Maximum characters to return per URL (default: 3000)"
                     }
                 },

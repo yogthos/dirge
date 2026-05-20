@@ -3,16 +3,32 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use std::time::Duration;
 
-use crate::agent::tools::ToolError;
 use crate::agent::tools::background::{BackgroundStore, TaskState};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
 pub struct TaskStatusTool {
     bg_store: BackgroundStore,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
 }
 
 impl TaskStatusTool {
     pub fn new(bg_store: BackgroundStore) -> Self {
-        Self { bg_store }
+        Self {
+            bg_store,
+            permission: None,
+            ask_tx: None,
+        }
+    }
+
+    pub fn with_permission(
+        mut self,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+    ) -> Self {
+        self.permission = permission;
+        self.ask_tx = ask_tx;
+        self
     }
 }
 
@@ -52,6 +68,10 @@ impl Tool for TaskStatusTool {
     }
 
     async fn call(&self, args: TaskStatusArgs) -> Result<String, ToolError> {
+        // Same permission gate as `task` — status polling can side-
+        // channel sensitive subagent results, and the wait=true path
+        // can hold the parent turn open for up to 10 minutes.
+        check_perm(&self.permission, &self.ask_tx, "task_status", &args.task_id).await?;
         let wait = args.wait.unwrap_or(false);
 
         if wait {
