@@ -1288,6 +1288,104 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert!(matches!(&ops[0], TreeOp::SetLabel { .. }));
     }
+
+    // --- load_plugin: single-file + directory + bare-name aliasing ------
+
+    /// Helper: write `text` into a unique tmp file and return its path.
+    /// Tests are responsible for cleanup but caller can skip on success.
+    fn tmpfile(label: &str, content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "dirge-plugin-loadtest-{}-{}.janet",
+            std::process::id(),
+            label
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// A single-file plugin with a bare hook name gets the bare hook
+    /// aliased to `{stem}-{hook}` and registered for dispatch.
+    #[test]
+    fn load_plugin_aliases_bare_hooks_to_stem_prefix() {
+        let path = tmpfile("bare-aliased", r#"(defn on-prompt [ctx] "from-bare")"#);
+        let mut mgr = PluginManager::try_new().unwrap();
+        let loaded = super::load_plugin(&mut mgr, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        assert_eq!(loaded.stem, stem);
+        assert!(loaded.hooks_registered.contains(&"on-prompt".to_string()));
+        let out = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        assert_eq!(out, vec!["from-bare".to_string()]);
+    }
+
+    /// Two plugins both using *bare* hook names don't clobber each
+    /// other — the alias step preserves each plugin's hook under its
+    /// own `{stem}-on-prompt` namespace, so both fire on dispatch.
+    #[test]
+    fn load_plugin_isolates_bare_hooks_across_plugins() {
+        let p1 = tmpfile("alpha-iso", r#"(defn on-prompt [ctx] "from-alpha")"#);
+        let p2 = tmpfile("beta-iso", r#"(defn on-prompt [ctx] "from-beta")"#);
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &p1).unwrap();
+        super::load_plugin(&mut mgr, &p2).unwrap();
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+        let out = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        assert_eq!(out.len(), 2, "both plugins fire: {out:?}");
+        assert!(out.contains(&"from-alpha".to_string()));
+        assert!(out.contains(&"from-beta".to_string()));
+    }
+
+    /// A directory plugin loads every `*.janet` file inside in
+    /// alphabetical order. The stem is the directory name; multi-file
+    /// plugins share the same Janet env so files can collaborate.
+    #[test]
+    fn load_plugin_supports_directory_of_files() {
+        let dir = std::env::temp_dir().join(format!("dirge-multifile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("00-state.janet"), r#"(var shared-counter 0)"#).unwrap();
+        std::fs::write(
+            dir.join("01-hooks.janet"),
+            r#"(defn on-prompt [ctx]
+                 (++ shared-counter)
+                 (string "counter=" shared-counter))"#,
+        )
+        .unwrap();
+
+        let mut mgr = PluginManager::try_new().unwrap();
+        let loaded = super::load_plugin(&mut mgr, &dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(loaded.files.len(), 2);
+        // 00-state.janet sorts before 01-hooks.janet so the var is
+        // defined before the hook references it.
+        assert!(
+            loaded.files[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("00-")
+        );
+        assert!(loaded.stem.starts_with("dirge-multifile-"));
+        let out = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        assert_eq!(out, vec!["counter=1".to_string()]);
+        // Counter persists — proves shared state across hook invocations.
+        let out2 = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        assert_eq!(out2, vec!["counter=2".to_string()]);
+    }
+
+    /// Empty directory plugins return an error rather than silently
+    /// registering nothing — typo'd plugin dirs should surface visibly.
+    #[test]
+    fn load_plugin_rejects_empty_directory() {
+        let dir = std::env::temp_dir().join(format!("dirge-empty-plugin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut mgr = PluginManager::try_new().unwrap();
+        let err = super::load_plugin(&mut mgr, &dir).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("no .janet files"), "got: {err}");
+    }
 }
 
 use std::collections::HashMap;
@@ -1356,6 +1454,123 @@ pub fn decide_post_done_action(
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 pub fn filter_existing_dirs(candidates: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
     candidates.iter().filter(|p| p.is_dir()).cloned().collect()
+}
+
+/// All hook names the host knows about. Plugins define functions with
+/// these names (bare or stem-prefixed) and the loader hooks them up.
+/// Centralized so the loader and any future telemetry stay in sync.
+pub const HOOK_NAMES: &[&str] = &[
+    "on-init",
+    "on-prompt",
+    "on-response",
+    "on-turn-start",
+    "on-turn-end",
+    "on-message-update",
+    "on-tool-start",
+    "on-tool-end",
+    "on-error",
+    "on-complete",
+];
+
+/// One loaded plugin's stem (used for hook-name namespacing) and the
+/// source path(s) that contributed code. For single-file plugins this
+/// is one path; for directory plugins it's every `.janet` file inside
+/// in load order.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct LoadedPlugin {
+    pub stem: String,
+    pub files: Vec<std::path::PathBuf>,
+    pub hooks_registered: Vec<String>,
+}
+
+/// Discover, evaluate, and register a plugin from `path`.
+///
+/// `path` may be:
+/// - A `*.janet` file — single-file plugin; stem = file stem.
+/// - A directory — multi-file plugin; stem = directory name. All
+///   `*.janet` files inside are loaded in alphabetical order into the
+///   shared Janet env, so split files share state and `harness/*`
+///   registrations.
+///
+/// After eval, any bare hook fns (`on-prompt`, `on-tool-start`, etc.)
+/// get a `{stem}-{hook}` alias so they survive subsequent plugin loads
+/// that would otherwise overwrite the bare symbol in the shared Janet
+/// env. Then `{stem}-{hook}` is what we register for dispatch — that
+/// way two plugins both defining `on-tool-start` no longer collide.
+///
+/// Returns the [`LoadedPlugin`] descriptor (stem + which files were
+/// read + which hooks fired). Errors short-circuit: a malformed first
+/// file aborts the whole plugin load.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+pub fn load_plugin(
+    mgr: &mut PluginManager,
+    path: &std::path::Path,
+) -> Result<LoadedPlugin, String> {
+    let (stem, files) = if path.is_dir() {
+        let dir_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("plugin dir has no name: {}", path.display()))?
+            .to_string();
+        let mut janet_files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+            .map_err(|e| format!("cannot read plugin dir {}: {}", path.display(), e))?
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .filter(|p| p.is_file() && p.extension().map_or(false, |ext| ext == "janet"))
+            .collect();
+        janet_files.sort();
+        if janet_files.is_empty() {
+            return Err(format!(
+                "plugin dir {} contains no .janet files",
+                path.display()
+            ));
+        }
+        (dir_name, janet_files)
+    } else {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("plugin file has no stem: {}", path.display()))?
+            .to_string();
+        (stem, vec![path.to_path_buf()])
+    };
+
+    for file in &files {
+        mgr.load_file(file)
+            .map_err(|e| format!("failed to load {}: {}", file.display(), e))?;
+    }
+
+    // Promote any bare hook symbols to stem-prefixed copies so a later
+    // plugin redefining the bare name can't shadow ours. We construct
+    // the prefixed name at runtime via curenv-mutation because Janet's
+    // `def` requires a literal symbol.
+    let mut hooks_registered = Vec::new();
+    for hook in HOOK_NAMES {
+        let prefixed = format!("{}-{}", stem, hook);
+        let escaped_hook = escape_janet_string(hook);
+        let escaped_prefixed = escape_janet_string(&prefixed);
+        let alias_code = format!(
+            r#"(let [env (curenv)
+                    bare-sym (symbol "{bare}")
+                    prefixed-sym (symbol "{prefixed}")
+                    bare-entry (get env bare-sym)]
+                 (when (and bare-entry (not (get env prefixed-sym)))
+                   (put env prefixed-sym bare-entry)))"#,
+            bare = escaped_hook,
+            prefixed = escaped_prefixed,
+        );
+        let _ = mgr.eval(&alias_code);
+        if mgr.has_symbol(&prefixed) {
+            mgr.register(hook, &prefixed);
+            hooks_registered.push(hook.to_string());
+        }
+    }
+
+    Ok(LoadedPlugin {
+        stem,
+        files,
+        hooks_registered,
+    })
 }
 
 pub struct PluginManager {

@@ -309,18 +309,6 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;
-        let hook_names = [
-            "on-init",
-            "on-prompt",
-            "on-response",
-            "on-turn-start",
-            "on-turn-end",
-            "on-message-update",
-            "on-tool-start",
-            "on-tool-end",
-            "on-error",
-            "on-complete",
-        ];
         let candidate_dirs: Vec<PathBuf> = vec![
             dirs::home_dir()
                 .unwrap_or_default()
@@ -343,26 +331,34 @@ async fn main() -> anyhow::Result<()> {
 
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "janet") {
-                    eprintln!("loading plugin: {}", path.display());
-                    let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
-                    match mgr.load_file(&path) {
-                        Ok(()) => {
-                            let stem = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("unknown");
-                            for hook in &hook_names {
-                                let fn_name = format!("{}-{}", stem, hook);
-                                if mgr.has_symbol(&fn_name) {
-                                    mgr.register(hook, &fn_name);
-                                    eprintln!("  registered hook: {} -> {}", hook, fn_name);
-                                }
-                            }
+                // A plugin is either:
+                //   - a single `.janet` file (legacy)
+                //   - a directory whose name is the plugin id and whose
+                //     `*.janet` contents are concatenated into one Janet
+                //     env (multi-file plugins)
+                let is_janet_file =
+                    path.is_file() && path.extension().map_or(false, |e| e == "janet");
+                let is_plugin_dir = path.is_dir();
+                if !is_janet_file && !is_plugin_dir {
+                    continue;
+                }
+                eprintln!("loading plugin: {}", path.display());
+                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                match plugin::load_plugin(&mut mgr, &path) {
+                    Ok(loaded) => {
+                        if loaded.files.len() > 1 {
+                            eprintln!(
+                                "  loaded {} files from plugin '{}'",
+                                loaded.files.len(),
+                                loaded.stem,
+                            );
                         }
-                        Err(e) => {
-                            eprintln!("warning: failed to load plugin {}: {}", path.display(), e);
+                        for hook in &loaded.hooks_registered {
+                            eprintln!("  registered hook: {} -> {}-{}", hook, loaded.stem, hook);
                         }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: failed to load plugin {}: {}", path.display(), e);
                     }
                 }
             }

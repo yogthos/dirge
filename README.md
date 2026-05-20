@@ -110,6 +110,9 @@ dirge --provider glm       # defaults to glm-4
 | `/reasoning` | Toggle reasoning visibility |
 | `/btw <question>` | Ask a quick question (no tools, doesn't affect session) |
 | `/sessions` | List/save/load sessions |
+| `/tree [id-prefix]` | Show session tree; with prefix, switch the active branch to that leaf |
+| `/fork [id-prefix]` | Branch off the chosen message (default: last user message) and restore its text to the editor |
+| `/clone <id-prefix>` | Switch the active branch to the entry without restoring text |
 | `/loop [prompt]` | Start iterative coding loop |
 | `/worktree <name>` | Create a git worktree on branch |
 | `/wt-merge [branch]` | Merge worktree branch |
@@ -212,93 +215,23 @@ Skills are auto-discovered at agent startup and listed in the `skill` tool descr
 
 ## Plugin system (Janet)
 
-When built with `--features plugin`, dirge embeds the [Janet](https://janet-lang.org) scripting language for harness-driven workflows. Plugins are Janet scripts placed in `~/.config/dirge/plugins/` or `./.dirge/plugins/` that define hooks called at specific points in the agent lifecycle:
+When built with `--features plugin`, dirge embeds the [Janet](https://janet-lang.org) scripting language for harness-driven workflows. Plugins are Janet scripts placed in `~/.config/dirge/plugins/` (global) or `./.dirge/plugins/` (project-local) that define hooks at specific points in the agent lifecycle and call into `harness/*` APIs to log, gate tools, transform prompts, render custom entries, control the session tree, and more.
 
-| Hook | When | Context |
-|------|------|---------|
-| `on-init` | Session start | `{:model "..." :cwd "..." :provider "..."}` |
-| `on-prompt` | Before LLM call | `{:prompt "..."}` |
-| `on-response` | After LLM response | `{:response "..."}` |
-| `on-tool-start` | Before tool execution | `{:tool "bash" :args {...}}` |
-| `on-tool-end` | After tool completes | `{:output "..."}` |
-| `on-error` | Error occurred | `{:error "..."}` |
-| `on-complete` | Agent turn finishes | (no context — use on-response) |
-| `on-turn-start` | Start of one LLM call cycle within a run | `{:index N}` |
-| `on-message-update` | Every ~16 streamed tokens within a turn | `{:index N :partial "text-so-far"}` |
-| `on-turn-end` | After the turn's tool results return | `{:index N :message "full text"}` |
-
-### Harness APIs
-
-Janet scripts access harness capabilities through built-in functions:
+A minimal plugin:
 
 ```janet
-(harness/log "message")          # Log to stderr
-(harness/get-cwd)                 # Get current working directory
-(harness/set-phase :architect)    # Set workflow phase
-(harness/request-prompt "text")   # Queue prompt for the LLM
-(harness/store-response "text")   # Not called directly — harness stores automatically
-
-# Tool interception (inside on-tool-start / on-tool-end hooks):
-(harness/block "reason")          # Abort the tool call; LLM sees the reason
-(harness/mutate-input json-str)   # Rewrite tool args before the tool runs
-(harness/replace-result text)     # Swap the tool output the LLM sees
-
-# Slash-command registration (call at plugin load time):
-(harness/register-command "cmd" "handler-fn-name")
-# Then define the handler. It receives one arg string and returns nil
-# or a string the chat will display.
-(defn handler-fn-name [args] (string "result: " args))
-
-# Notifications (fire-and-forget; rendered as colored chat lines):
-(harness/notify "msg")              # default :info, dim grey
-(harness/notify "watch out" :warn)  # yellow
-(harness/notify "broken" :error)    # red
-
-# Input transform (from on-prompt hooks):
-(harness/replace-prompt "rewritten user message")
-# Replaces the user's message for the current turn entirely.
-# Distinct from harness/request-prompt, which queues a follow-up turn.
-
-# Blocking user-input dialogs (rendered by the UI; safe to call from
-# any hook — the worker thread blocks while the UI handles the dialog):
-(harness/confirm "title" "really delete?")           # -> true|false
-(harness/select  "pick one" ["alpha" "beta" "gamma"]) # -> string|nil
-
-# Typed session entries + custom renderers (P2):
-(harness/append-entry "bookmark" "label-text")  # display=true by default
-(harness/append-entry "telemetry" "{\"cost\":0.02}" false)  # persisted but not displayed
-(harness/register-renderer "bookmark" "render-bookmark-fn")
-(defn render-bookmark-fn [data]
-  (harness/render "cyan" (string "★ " data)))
-
-# Custom LLM provider registration (P1):
-#   Plugins can declare an OpenAI-compatible (or any rig-supported)
-#   provider at startup. Config-declared custom_providers win on
-#   name collision.
-(harness/register-provider "local-openai" "openai"
-                            "http://localhost:8000/v1"
-                            "LOCAL_OPENAI_API_KEY")
-
-# Session-tree control (P4d) — mirrors pi's ctx.setLabel /
-# ctx.fork / ctx.navigateTree / ctx.newSession / ctx.switchSession.
-# Queued through the host and applied between UI events.
-(harness/set-label entry-id "milestone")   # bookmark a node; pass nil to clear
-(harness/fork entry-id)                    # branch at parent + restore prompt
-(harness/fork entry-id :at)                # branch at this entry, no editor pop
-(harness/navigate-tree entry-id)           # switch active leaf
-(harness/new-session)                      # reset in place; optional parent id
-(harness/switch-session "id-prefix")       # load saved session by id prefix
+(defn on-prompt [ctx]
+  (when (string/find "security" (ctx :prompt))
+    (harness/notify "running with security mindset" :info)))
 ```
 
-Plugins live in `~/.config/dirge/plugins/*.janet` (global) or
-`./.dirge/plugins/*.janet` (project-local). Janet runs on a dedicated
-worker thread so blocking dialogs don't freeze the UI.
+**See [`docs/PLUGINS.md`](docs/PLUGINS.md)** for the complete plugin author's guide — hook reference, the full `harness/*` API surface (logging, tool interception, dialogs, custom commands, renderers, providers, session-tree control), worked examples, and debugging tips.
 
-Example plugins in `plugins/`:
+Example plugins in [`plugins/`](plugins/):
 
 | File | Demonstrates |
 |------|--------------|
-| `workflow.janet` | Built-in architect → implementor → review orchestration |
+| `workflow.janet` | Architect → implementor → review orchestration via inversion of control |
 | `protected_paths.janet` | `harness/block` + `harness/replace-result` (deny + truncate) |
 | `hello_cmd.janet` | `harness/register-command` (custom `/cmd`) |
 | `notify_example.janet` | `harness/notify` for chat notifications |
@@ -309,30 +242,7 @@ Example plugins in `plugins/`:
 | `bookmark.janet` | `harness/append-entry` + `harness/register-renderer` — typed entries with custom rendering |
 | `local_openai.janet` | `harness/register-provider` declaring vLLM/Ollama/LMStudio local endpoints |
 | `session_tree.janet` | `harness/set-label` + `harness/new-session` — `/label` and `/fresh` slash commands |
-
-### Workflow plugin
-
-The built-in `workflow.janet` plugin automatically drives architect → implementor → review phases when a feature request is detected. It uses **inversion of control** — the harness drives the model through scripted phases rather than waiting for the model to decide:
-
-1. **Architect phase**: plans code layout, produces mermaid diagrams, plans file structure, creates function stubs
-2. **Implementor phase**: enforces TDD — write failing test first, then implement, verify green
-3. **Review phase**: reviews all changes, finds bugs, runs tests, fixes failures
-
-The plugin detects feature requests by matching patterns like "add a feature", "implement", "build a", etc., and then orchestrates the entire development cycle automatically.
-
-### Custom plugins
-
-Create `~/.config/dirge/plugins/my-plugin.janet`:
-
-```janet
-(defn on-prompt [ctx]
-  (let [prompt (ctx :prompt)]
-    (if (string/find "security" prompt)
-      (string "SECURITY REVIEW — check for:"
-              "\n- SQL injection"
-              "\n- XSS vectors"
-              "\n- Authentication bypass"))))
-```
+| `turn_timer/` | Multi-file plugin — state, hooks, and a `/timer-stats` command split across three files in a single directory |
 
 ## LSP integration
 

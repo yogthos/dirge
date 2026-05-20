@@ -91,28 +91,6 @@ pub struct SessionTree {
     pub leaf_id: Option<CompactString>,
 }
 
-impl SessionTree {
-    /// Walk from `leaf_id` to root, returning the chain of ids in
-    /// chronological order (root first, leaf last). Used to confirm
-    /// the tree's current path matches `Session::messages`.
-    ///
-    /// Returns an empty Vec if `leaf_id` is None or any link is
-    /// broken (defensive — a healthy tree always reconstructs).
-    pub fn path_from_leaf(&self) -> Vec<&TreeNode> {
-        let mut path = Vec::new();
-        let mut cursor = self.leaf_id.as_ref();
-        while let Some(id) = cursor {
-            let Some(node) = self.entries.get(id) else {
-                return Vec::new();
-            };
-            path.push(node);
-            cursor = node.parent.as_ref();
-        }
-        path.reverse();
-        path
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionAllowEntry {
     pub tool: String,
@@ -444,6 +422,7 @@ impl Session {
 
     /// Set or clear a label on a tree node. Used by
     /// `harness/set-label` (P4d) and by `/bookmark`-style commands.
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     pub fn set_label(
         &mut self,
         entry_id: &CompactString,
@@ -471,6 +450,7 @@ impl Session {
     /// recorded as `name` for lineage; pi stores this in a session
     /// header field. We piggyback on `name` to avoid bumping the
     /// session schema for one optional field.
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     pub fn reset_to_new(&mut self, parent_session: Option<&str>) {
         let now = CompactString::new(chrono::Utc::now().to_rfc3339());
         self.id = CompactString::new(Uuid::new_v4().to_string());
@@ -706,20 +686,6 @@ mod tests {
         assert_eq!(s.tree.leaf_id.as_ref(), Some(&second_id));
         // Second node's parent is the first node.
         assert_eq!(s.tree.entries[&second_id].parent.as_ref(), Some(&first_id));
-    }
-
-    /// `path_from_leaf` walks back to root and reports the chain in
-    /// chronological order. Matches the linear `messages` Vec ordering.
-    #[test]
-    fn path_from_leaf_matches_messages_order() {
-        let mut s = Session::new("p", "m", 0);
-        s.add_message(MessageRole::User, "a");
-        s.add_message(MessageRole::Assistant, "b");
-        s.add_message(MessageRole::User, "c");
-        let path = s.tree.path_from_leaf();
-        let path_ids: Vec<_> = path.iter().map(|n| n.id.as_str()).collect();
-        let msg_ids: Vec<_> = s.messages.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(path_ids, msg_ids);
     }
 
     /// Pre-P4b session JSON (no `tree` field) deserializes with an

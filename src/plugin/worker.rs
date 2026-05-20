@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+#[cfg_attr(not(feature = "plugin"), allow(unused_imports))]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -240,7 +241,13 @@ const HARNESS_DIALOG_INIT: &str = r#"
 
 /// What the UI is being asked to render. Carries a one-shot reply
 /// channel back so the worker can resume once the user answers.
+///
+/// Variants are only constructed when the plugin feature is enabled,
+/// but the *type* is referenced unconditionally by the UI's channel
+/// signature — hence the cfg-gated dead-code allow rather than a
+/// feature gate on the whole enum.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 pub enum DialogRequest {
     Confirm {
         title: String,
@@ -255,6 +262,7 @@ pub enum DialogRequest {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 pub enum DialogReply {
     /// User answered yes/no. False also covers cancel/timeout.
     Confirm(bool),
