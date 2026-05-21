@@ -727,7 +727,14 @@ pub async fn run_interactive(
                     "error" => c_error(),
                     _ => theme::dim(),
                 };
-                renderer.write_line(&format!("[plugin] {}", msg), color)?;
+                // Sanitize plugin-supplied strings: a misbehaving
+                // or malicious plugin could emit ANSI escape codes
+                // through `harness/notify`, painting the terminal
+                // or moving the cursor. All other LLM/tool output
+                // paths go through `sanitize_output`; plugin
+                // notifications were the only path bypassing it.
+                let safe = sanitize_output(&msg);
+                renderer.write_line(&format!("[plugin] {}", safe), color)?;
             }
         }
 
@@ -1538,8 +1545,10 @@ pub async fn run_interactive(
                                     ) {
                                         Ok(results) if !results.is_empty() => {
                                             for line in &results {
+                                                // Sanitize plugin output (ANSI injection defense).
+                                                let safe = sanitize_output(line);
                                                 renderer.write_line(
-                                                    &format!("[plugin] {}", line),
+                                                    &format!("[plugin] {}", safe),
                                                     theme::dim(),
                                                 )?;
                                             }
@@ -1885,8 +1894,10 @@ pub async fn run_interactive(
                             ) {
                                 Ok(results) if !results.is_empty() => {
                                     for line in &results {
+                                        // Sanitize plugin output (ANSI injection defense).
+                                        let safe = sanitize_output(line);
                                         renderer.write_line(
-                                            &format!("[plugin] {}", line),
+                                            &format!("[plugin] {}", safe),
                                             theme::dim(),
                                         )?;
                                     }

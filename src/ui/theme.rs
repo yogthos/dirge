@@ -376,17 +376,50 @@ pub fn banner_secondary() -> Color {
 /// fake the CRT phosphor "bloom" effect. Bright phosphor tones glow;
 /// dim secondary tones stay un-bloomed so the two-tone depth in the
 /// reference screenshots is preserved.
+///
+/// Custom themes (PR #102) can use `Color::Rgb { r, g, b }` and
+/// `Color::AnsiValue(u8)`. Without per-color brightness detection
+/// those rendered as dim because the original `matches!` only
+/// covered the 16-color named palette — a user theme with
+/// `#ff00ff` (vibrant magenta) was treated as dim and lost its
+/// bold attribute.
 pub fn is_bright(c: Color) -> bool {
-    matches!(
-        c,
+    match c {
         Color::Green
-            | Color::Red
-            | Color::Yellow
-            | Color::Cyan
-            | Color::Magenta
-            | Color::Blue
-            | Color::White
-    )
+        | Color::Red
+        | Color::Yellow
+        | Color::Cyan
+        | Color::Magenta
+        | Color::Blue
+        | Color::White => true,
+        // Use max-channel rather than luminance: terminal "bright"
+        // means visually-saturated, and a vibrant magenta
+        // (#ff00ff, lum ≈ 105) is intuitively bright even though
+        // BT.601 luminance puts it below the halfway mark. Max-
+        // channel correctly catches pure red / blue / magenta in
+        // addition to white / yellow.
+        Color::Rgb { r, g, b } => r.max(g).max(b) > 128,
+        // 256-color palette: 0..=7 dim, 8..=15 bright, 16..=231 6×6×6
+        // RGB cube where the higher half is bright, 232..=255 grayscale
+        // ramp where the top half is bright. This is a coarse but
+        // reasonable mapping — perfect accuracy would require looking
+        // up the exact xterm palette.
+        Color::AnsiValue(v) => match v {
+            0..=7 => false,
+            8..=15 => true,
+            16..=231 => {
+                // 6×6×6 RGB cube starts at 16. Compute approximate
+                // average of the three channels in [0..=5].
+                let n = v - 16;
+                let r = n / 36;
+                let g = (n / 6) % 6;
+                let b = n % 6;
+                (r + g + b) as u32 > 7 // > half of max 15
+            }
+            232..=255 => v >= 244, // grayscale: top half = bright
+        },
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +429,31 @@ mod tests {
     /// `phosphor` and `plain` differ in their agent color — quick
     /// sanity check that the presets aren't accidentally identical.
     #[test]
+    /// Regression: `is_bright` must handle `Color::Rgb` and
+    /// `Color::AnsiValue` introduced by PR #102's custom theme
+    /// JSON. Without this, vibrant RGB colors in a user theme
+    /// rendered dim because the original `matches!` only covered
+    /// the named 16-color palette.
+    #[test]
+    fn is_bright_handles_rgb_and_ansivalue() {
+        // RGB: bright magenta should glow.
+        assert!(is_bright(Color::Rgb {
+            r: 255,
+            g: 0,
+            b: 255,
+        }));
+        // RGB: deep navy should not.
+        assert!(!is_bright(Color::Rgb { r: 0, g: 0, b: 32 }));
+        // AnsiValue: low (0..=7) = dim; high (8..=15) = bright.
+        assert!(!is_bright(Color::AnsiValue(0)));
+        assert!(is_bright(Color::AnsiValue(15)));
+        // 6x6x6 cube — saturated yellow ~226 is bright.
+        assert!(is_bright(Color::AnsiValue(226)));
+        // Grayscale ramp — 232 darkest, 255 lightest.
+        assert!(!is_bright(Color::AnsiValue(232)));
+        assert!(is_bright(Color::AnsiValue(255)));
+    }
+
     fn presets_are_distinct() {
         assert_ne!(Theme::phosphor().agent, Theme::plain().agent);
         assert_ne!(Theme::phosphor().accent, Theme::plain().accent);

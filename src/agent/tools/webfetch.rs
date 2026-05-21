@@ -41,8 +41,24 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
+/// Reject non-http(s) schemes. Without this, `file://`, `ftp://`,
+/// `gopher://` etc. would be passed to reqwest — current reqwest
+/// versions reject most of these, but the defense should be
+/// explicit at the dirge boundary rather than relying on the HTTP
+/// client's policy.
+fn validate_url_scheme(url: &str) -> Result<(), String> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(format!(
+            "webfetch only supports http(s); refused {url:?} (use a curl-style scheme prefix to be explicit)"
+        ))
+    }
+}
+
 async fn fetch_url(client: &reqwest::Client, url: &str) -> Result<String, String> {
     let url = normalize_url(url);
+    validate_url_scheme(&url)?;
 
     let resp = client
         .get(&url)
@@ -261,6 +277,23 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("maximum 10"));
+    }
+
+    /// Regression: scheme validation must reject anything that
+    /// isn't http(s). Before this, an LLM prompting
+    /// `webfetch(["file:///etc/passwd"])` relied on reqwest's
+    /// internal scheme filter — explicit at-boundary defense is
+    /// better.
+    #[test]
+    fn validate_url_scheme_rejects_non_http() {
+        assert!(validate_url_scheme("https://example.com").is_ok());
+        assert!(validate_url_scheme("http://localhost:3000").is_ok());
+        assert!(validate_url_scheme("file:///etc/passwd").is_err());
+        assert!(validate_url_scheme("ftp://example.com").is_err());
+        assert!(validate_url_scheme("gopher://example.com").is_err());
+        assert!(validate_url_scheme("javascript:alert(1)").is_err());
+        // Empty string also blocked.
+        assert!(validate_url_scheme("").is_err());
     }
 
     // Regression: the WebFetchArgs default for max_chars must be 3000 — agents

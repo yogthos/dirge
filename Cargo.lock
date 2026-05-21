@@ -2682,7 +2682,6 @@ version = "1.0.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
- "base64 0.22.1",
  "chrono",
  "clap",
  "compact_str",
@@ -2692,7 +2691,6 @@ dependencies = [
  "html2text",
  "http 1.4.0",
  "ignore",
- "image",
  "include_dir",
  "indexmap 2.14.0",
  "janetrs",

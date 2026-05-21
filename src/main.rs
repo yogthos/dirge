@@ -4,7 +4,6 @@ mod config;
 mod context;
 mod event;
 mod extras;
-mod image_util;
 #[cfg(feature = "lsp")]
 mod lsp;
 mod permission;
