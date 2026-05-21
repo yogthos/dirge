@@ -57,6 +57,29 @@ struct Channels {
 }
 
 fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
+    // Warn on conflicting CLI flags. Previously `--yolo --restrictive`
+    // silently picked yolo (the first-match in the if-else chain)
+    // without surfacing the conflict — the user thought they had
+    // restricted permissions and got the opposite. Emit a stderr
+    // warning naming the active mode so the user can correct it.
+    let cli_modes: &[(bool, &str)] = &[
+        (cli.yolo, "--yolo"),
+        (cli.accept_all, "--accept-all"),
+        (cli.restrictive, "--restrictive"),
+    ];
+    let cli_picks: Vec<&str> = cli_modes
+        .iter()
+        .filter(|(v, _)| *v)
+        .map(|(_, name)| *name)
+        .collect();
+    if cli_picks.len() > 1 {
+        eprintln!(
+            "warning: conflicting permission flags {:?}; using the most permissive ({}). \
+             Pass only one of --yolo / --accept-all / --restrictive.",
+            cli_picks, cli_picks[0],
+        );
+    }
+
     if cli.yolo || cfg.yolo.unwrap_or(false) {
         SecurityMode::Yolo
     } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {

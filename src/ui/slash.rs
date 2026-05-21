@@ -383,9 +383,46 @@ pub async fn handle_slash(
                     if let Some(s) = sessions.into_iter().next() {
                         let msg_count = s.messages.len();
                         *session = s;
+                        // Restore the prompt that was active when the
+                        // session was saved. Without this, `/sessions
+                        // <id>` would always rebuild the agent with the
+                        // default prompt, even if the saved session
+                        // recorded `current_prompt_name = Some("plan")`.
+                        // Sets both context fields + rebuilds the agent
+                        // so the new prompt actually takes effect.
+                        let restored = session.current_prompt_name.clone();
+                        if let Some(name) = restored.as_deref()
+                            && let Some(content) = context.prompts.get(name)
+                        {
+                            context.current_prompt = Some(content.clone());
+                            context.current_prompt_name = Some(name.to_string());
+                            let model = client.completion_model(session.model.to_string());
+                            *agent = crate::provider::build_agent(
+                                model,
+                                cli,
+                                cfg,
+                                context,
+                                permission.clone(),
+                                ask_tx.clone(),
+                                None,
+                                None,
+                                bg_store.clone(),
+                                #[cfg(feature = "lsp")]
+                                None,
+                                sandbox.clone(),
+                                #[cfg(feature = "mcp")]
+                                mcp_manager,
+                                #[cfg(feature = "semantic")]
+                                semantic_manager,
+                            )
+                            .await;
+                        }
                         render_session(renderer, session, cli, cfg, context)?;
+                        let prompt_note = restored
+                            .map(|n| format!("; prompt: {}", n))
+                            .unwrap_or_default();
                         renderer.write_line(
-                            &format!("loaded session ({} msgs)", msg_count),
+                            &format!("loaded session ({} msgs{})", msg_count, prompt_note),
                             c_agent(),
                         )?;
                     }

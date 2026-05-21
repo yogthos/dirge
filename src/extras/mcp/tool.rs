@@ -79,9 +79,32 @@ impl ToolDyn for McpTool {
                 .map(|a| CallToolRequestParams::new(tool_name.clone()).with_arguments(a))
                 .unwrap_or_else(|| CallToolRequestParams::new(tool_name.clone()));
 
-            let result = peer.call_tool(params).await.map_err(|e| {
-                ToolError::ToolCallError(Box::new(McpToolError(format!("MCP tool error: {e}"))))
-            })?;
+            // MCP tool calls go over JSON-RPC to a spawned server
+            // process. If the server hangs (deadlock, infinite
+            // loop, lost stdin pipe), the await never resolves and
+            // the agent turn stalls indefinitely. Cap at 120s to
+            // match `bash`'s default timeout — anything longer is
+            // clearly broken on the server side. The error message
+            // names the server + tool so the user can identify
+            // which MCP server is misbehaving.
+            const MCP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+            let result = match tokio::time::timeout(MCP_CALL_TIMEOUT, peer.call_tool(params)).await
+            {
+                Ok(r) => r.map_err(|e| {
+                    ToolError::ToolCallError(Box::new(McpToolError(format!(
+                        "MCP tool error ({}::{}): {e}",
+                        server_name, tool_name,
+                    ))))
+                })?,
+                Err(_) => {
+                    return Err(ToolError::ToolCallError(Box::new(McpToolError(format!(
+                        "MCP tool {}::{} timed out after {}s",
+                        server_name,
+                        tool_name,
+                        MCP_CALL_TIMEOUT.as_secs(),
+                    )))));
+                }
+            };
 
             if result.is_error.unwrap_or(false) {
                 let error_msg = result

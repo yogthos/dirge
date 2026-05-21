@@ -626,16 +626,20 @@ impl InputEditor {
                 true
             }
             KeyCode::Esc => {
-                let at_pos = self.buffer.rfind('@');
-                if let Some(at) = at_pos {
-                    let before: String = self.buffer.chars().take(at).collect();
-                    let after: String = self
-                        .buffer
-                        .chars()
-                        .skip(at + 1 + picker.query.len())
-                        .collect();
-                    self.buffer = format!("{}{}", before, after).into();
+                // Use BYTE-level slicing here, matching the Enter
+                // path above. `rfind('@')` returns a byte offset;
+                // the previous implementation used `chars().take(at)`
+                // and `chars().skip(at + ...)` which mixed byte
+                // offsets with char counts and corrupted the buffer
+                // for any input containing multi-byte UTF-8 chars
+                // before the `@` (accented letters, emoji, CJK, …).
+                if let Some(at) = self.buffer.rfind('@') {
+                    let before = &self.buffer[..at];
+                    let after_byte = at + 1 + picker.query.len();
+                    let after = self.buffer.get(after_byte..).unwrap_or("");
+                    let new_buf = format!("{}{}", before, after);
                     self.cursor = at;
+                    self.buffer = new_buf.into();
                 }
                 picker.deactivate();
                 true

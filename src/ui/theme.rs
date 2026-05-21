@@ -303,7 +303,8 @@ fn load_custom_theme(name: &str) -> Result<Theme, String> {
     if !path.exists() {
         return Err(format!("no such file: {}", path.display()));
     }
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let overrides: ThemeJson =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
     // Label defaults to the filename's stem in uppercase if the JSON
