@@ -2486,7 +2486,7 @@ pub async fn run_interactive(
                 // ToolResult body lands inside it as usual. If the
                 // user denies, the chamber is already closed and
                 // we add a brief "(denied)" line below.
-                let pending_chamber_state =
+                let pending_chamber_tool =
                     if let Some(open_name) = last_tool_name.clone() {
                         let (frame_w, inner) = chamber_widths(&renderer);
                         renderer.write_line(
@@ -2494,6 +2494,12 @@ pub async fn run_interactive(
                             theme::dim(),
                         )?;
                         renderer.write_line(&chamber_bottom(frame_w), c_tool())?;
+                        // Blank line between the closed chamber and
+                        // the alert box so the two boxes don't sit
+                        // flush against each other — `╰─╯` directly
+                        // followed by `╭─ ⚠ ALERT` reads as one
+                        // continuous border.
+                        renderer.write_line("", Color::White)?;
                         last_tool_name = None;
                         Some(open_name)
                     } else {
@@ -2655,7 +2661,13 @@ pub async fn run_interactive(
                 // - **Deny**: chamber stayed closed; render a
                 //   single dim "(denied)" trailer line so it's
                 //   clear no result is coming.
-                if let Some(reopen_name) = pending_chamber_state {
+                if let Some(reopen_name) = pending_chamber_tool {
+                    // Visual breathing room between the alert box's
+                    // bottom border and whatever follows (reopened
+                    // chamber OR denied trailer). Without this, the
+                    // alert's `╰─╯` sits flush against the next
+                    // line which reads as continuous output.
+                    renderer.write_line("", Color::White)?;
                     if was_denied {
                         renderer.write_line(
                             &format!("  ↳ denied: {} {}", ask_req.tool, ask_req.input),
@@ -2668,11 +2680,18 @@ pub async fn run_interactive(
                         // have rendered (path for read/write/edit,
                         // command for bash, etc.) so we can pass it
                         // directly without re-parsing the JSON args.
+                        //
+                        // Note for `apply_patch`: the initial chamber
+                        // showed "N ops" (overview); the reopened
+                        // chamber here shows the specific path the
+                        // user just permitted. Intentional — the
+                        // user is approving per-op, so per-op
+                        // identification is more useful at the
+                        // reopen point.
                         let upper = reopen_name.to_ascii_uppercase();
                         let raw_value = sanitize_output(&ask_req.input).into_string();
                         let (frame_w, _) = chamber_widths(&renderer);
                         let header = fit_banner_header(&upper, &raw_value, frame_w);
-                        renderer.write_line("", Color::White)?;
                         renderer.write_line(&header, c_tool())?;
                         last_tool_name = Some(reopen_name);
                     }
