@@ -2465,20 +2465,41 @@ pub async fn run_interactive(
                     agent_line_started = false;
                 }
 
-                // DON'T close the open tool chamber here. Previously
-                // we emitted a NO_OUTPUT close before the alert,
-                // which (a) misleadingly said "tool denied" before
-                // the user had answered and (b) produced a chamber
-                // with a top border and bottom border but no body
-                // when the user later ALLOWED the tool — the
-                // subsequent ToolResult rendered into a now-closed
-                // chamber, painting `│ … │` rows + `╰` with no `╭`.
+                // Chamber-vs-alert interleaving:
                 //
-                // New flow: leave the chamber open while the alert
-                // displays inside its visual region. After the user
-                // answers: if denied, close the chamber WITH the
-                // "denied" message; if allowed, leave it open so
-                // the ToolResult populates it normally.
+                // The in-flight tool's chamber TOP was already drawn
+                // by the ToolCall handler when the LLM emitted the
+                // call. Drawing the alert box directly below would
+                // visually orphan that top — the chamber would have
+                // no body and no bottom, looking like a broken card.
+                //
+                // Old behavior (PR #100): leave the chamber open and
+                // hope the body lands inside it. In practice the
+                // alert renders BETWEEN the chamber top and the
+                // chamber body, so the top is visually disconnected
+                // from the body that arrives later.
+                //
+                // New behavior: close the in-flight chamber with a
+                // "awaiting permission" footer BEFORE the alert
+                // displays. If the user allows, reopen a fresh
+                // chamber (matching banner) below the alert so the
+                // ToolResult body lands inside it as usual. If the
+                // user denies, the chamber is already closed and
+                // we add a brief "(denied)" line below.
+                let pending_chamber_state =
+                    if let Some(open_name) = last_tool_name.clone() {
+                        let (frame_w, inner) = chamber_widths(&renderer);
+                        renderer.write_line(
+                            &chamber_row("awaiting permission…", inner),
+                            theme::dim(),
+                        )?;
+                        renderer.write_line(&chamber_bottom(frame_w), c_tool())?;
+                        last_tool_name = None;
+                        Some(open_name)
+                    } else {
+                        None
+                    };
+
                 renderer.set_avatar_state(avatar::AvatarState::Alert);
                 // Force a bottom-row repaint so the avatar updates to
                 // the Alert face immediately, before the user reads
@@ -2622,12 +2643,39 @@ pub async fn run_interactive(
                 let was_denied = matches!(decision, UserDecision::Deny);
                 let _ = ask_req.reply.send(decision);
 
-                // If the user denied, the tool will never run and
-                // no ToolResult will arrive — close the in-flight
-                // chamber here with the "denied" marker. On allow,
-                // leave it open so the ToolResult fills it in.
-                if was_denied {
-                    close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                // Reopen / mark the chamber depending on outcome:
+                //
+                // - **Allow**: write a fresh chamber TOP banner so
+                //   the about-to-arrive ToolResult body has a
+                //   chamber to land inside. This gives the user a
+                //   clear "permission granted, tool running" visual
+                //   pair (closed chamber for the pause, fresh
+                //   chamber for the result).
+                //
+                // - **Deny**: chamber stayed closed; render a
+                //   single dim "(denied)" trailer line so it's
+                //   clear no result is coming.
+                if let Some(reopen_name) = pending_chamber_state {
+                    if was_denied {
+                        renderer.write_line(
+                            &format!("  ↳ denied: {} {}", ask_req.tool, ask_req.input),
+                            theme::dim(),
+                        )?;
+                    } else {
+                        // Reopen with the same banner shape the
+                        // ToolCall handler uses. `ask_req.input` is
+                        // the value that the original banner would
+                        // have rendered (path for read/write/edit,
+                        // command for bash, etc.) so we can pass it
+                        // directly without re-parsing the JSON args.
+                        let upper = reopen_name.to_ascii_uppercase();
+                        let raw_value = sanitize_output(&ask_req.input).into_string();
+                        let (frame_w, _) = chamber_widths(&renderer);
+                        let header = fit_banner_header(&upper, &raw_value, frame_w);
+                        renderer.write_line("", Color::White)?;
+                        renderer.write_line(&header, c_tool())?;
+                        last_tool_name = Some(reopen_name);
+                    }
                 }
 
                 if let Some(pattern) = allow_pattern {
