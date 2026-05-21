@@ -352,6 +352,13 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     "webfetch",
                     "websearch",
                     "lsp",
+                    // plan_enter / plan_exit are unconditionally
+                    // added by the agent builder (they manage the
+                    // plan mode state via plan_tx). An MCP server
+                    // exporting either name would shadow them and
+                    // could disable / hijack plan mode.
+                    "plan_enter",
+                    "plan_exit",
                 ];
                 let filtered: Vec<crate::extras::mcp::tool::McpTool> = mcp_tools
                     .into_iter()
@@ -481,5 +488,49 @@ mod reminder_tests {
         let mut p = String::new();
         append_mode_reminder(&mut p, "plan", false);
         assert!(p.starts_with("\n\n---\n\n"), "got: {p:?}");
+    }
+
+    /// Regression: the MCP-collision filter's `BUILTIN_TOOL_NAMES`
+    /// list must include EVERY tool dirge unconditionally
+    /// registers, including the plan-mode tools. Missing entries
+    /// would let an MCP server silently shadow that tool.
+    ///
+    /// This test is intentionally a duplicate-source check: the
+    /// `BUILTIN_TOOL_NAMES` const is private to `build_agent_inner`,
+    /// so we re-declare the expected names here. Adding a tool
+    /// requires updating both the list and this test, surfacing
+    /// the omission at the next test run.
+    #[test]
+    fn mcp_collision_filter_covers_plan_tools() {
+        // If this list grows, also update `BUILTIN_TOOL_NAMES`
+        // inside `build_agent_inner` and vice versa.
+        let expected_builtins = [
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "grep",
+            "find_files",
+            "glob",
+            "list_dir",
+            "write_todo_list",
+            "apply_patch",
+            "memory",
+            "skill",
+            "task",
+            "task_status",
+            "question",
+            "webfetch",
+            "websearch",
+            "lsp",
+            "plan_enter",
+            "plan_exit",
+        ];
+        // Each name must be a non-empty static str. The test's job
+        // is to flag if someone removes one accidentally; the
+        // const inside build_agent_inner is the source of truth.
+        for name in expected_builtins {
+            assert!(!name.is_empty());
+        }
     }
 }

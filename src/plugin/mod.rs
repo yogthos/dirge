@@ -1,4 +1,10 @@
-#[cfg(test)]
+// Tests exercise plugin-feature internals (Janet worker, harness
+// API, hook dispatch). Without the feature, the JanetClient and
+// related symbols don't exist, so the tests can't compile. Gate
+// the whole test module on the feature to keep `cargo test` (no
+// args) green for users who don't have the plugin toolchain set
+// up.
+#[cfg(all(test, feature = "plugin"))]
 mod tests {
     use super::*;
 
