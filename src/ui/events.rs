@@ -74,9 +74,9 @@ pub fn render_session(
         // Continuation lines are indented to that same width so the
         // handle isn't repeated on every wrap.
         let (handle, line_color) = match msg.role {
-            MessageRole::User => ("<you>   ", theme::user()),
+            MessageRole::User => ("<you> ", theme::user()),
             MessageRole::Assistant => ("<dirge> ", theme::agent()),
-            MessageRole::System => ("<sys>   ", theme::system()),
+            MessageRole::System => ("<sys> ", theme::system()),
         };
         let cont_indent = " ".repeat(handle.chars().count());
 

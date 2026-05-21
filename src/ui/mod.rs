@@ -1294,7 +1294,7 @@ pub async fn run_interactive(
                                 }
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
                                 match prefix {
@@ -1353,7 +1353,7 @@ pub async fn run_interactive(
                                 }
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
                                 let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager).await;
@@ -1523,7 +1523,7 @@ pub async fn run_interactive(
                             } else {
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
 
@@ -2187,7 +2187,7 @@ pub async fn run_interactive(
                             for line in combined.lines() {
                                 let safe_line = sanitize_output(line);
                                 renderer
-                                    .write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                    .write_line(&format!("<you> {}", safe_line), theme::user())?;
                             }
                             renderer.write_line("", Color::White)?;
 
@@ -2292,7 +2292,7 @@ pub async fn run_interactive(
                             let combined = queued.join("\n\n");
                             for line in combined.lines() {
                                 let safe_line = sanitize_output(line);
-                                renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                             }
                             renderer.write_line("", Color::White)?;
 
