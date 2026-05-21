@@ -284,9 +284,104 @@ fn build_acp_permission(state: &AcpState) -> (Option<PermCheck>, Option<AskSende
     let checker = PermissionChecker::new(&perm_config, mode, None);
     let perm: PermCheck = Arc::new(Mutex::new(checker));
 
-    let (ask_tx, _ask_rx) = tokio::sync::mpsc::channel(64);
-
+    let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
+    spawn_acp_ask_drain(ask_rx);
     (Some(perm), Some(ask_tx))
+}
+
+/// Drain `ask_rx` by responding to every permission ask with
+/// `Deny`. ACP runs are non-interactive — there's no human at a
+/// keyboard to confirm prompts. Previously the receiver was simply
+/// dropped (`_ask_rx`), so any tool needing `Ask` confirmation
+/// hit the 30s permission timeout and surfaced as a generic
+/// failure to the editor client. Fail-fast with a clear deny is
+/// strictly better: the LLM sees the denial immediately and can
+/// re-plan, or the user can configure explicit allow rules.
+///
+/// **Future work**: route the ask through the ACP protocol as a
+/// `requestPermission` notification so the editor client can
+/// surface a real dialog. Out of scope for the F1 fix; that's a
+/// Phase C5-ish feature requiring ACP protocol wiring.
+fn spawn_acp_ask_drain(
+    mut ask_rx: tokio::sync::mpsc::Receiver<crate::permission::ask::AskRequest>,
+) {
+    tokio::spawn(async move {
+        while let Some(req) = ask_rx.recv().await {
+            // The tool's caller is awaiting on `req.reply`. Dropping
+            // it without sending would also surface as a tool error
+            // ("Permission system unavailable"), but Deny is a
+            // clearer signal that the call was *refused* rather
+            // than the system being broken.
+            let _ = req.reply.send(crate::permission::ask::UserDecision::Deny);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for F1: any `AskRequest` sent through the ACP
+    /// ask channel must be promptly responded to with `Deny`,
+    /// rather than hanging. Without `spawn_acp_ask_drain`, the
+    /// `reply` oneshot is dropped on receiver drop → tool sees
+    /// `Permission system unavailable` (technically OK, but slower
+    /// and worse signal). With the drain, the tool sees `Deny`
+    /// within a tick.
+    #[tokio::test]
+    async fn acp_ask_drain_responds_with_deny() {
+        let (ask_tx, ask_rx) = tokio::sync::mpsc::channel::<crate::permission::ask::AskRequest>(8);
+        spawn_acp_ask_drain(ask_rx);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        ask_tx
+            .send(crate::permission::ask::AskRequest {
+                tool: "bash".to_string(),
+                input: "rm -rf /".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("send must succeed");
+
+        let resp = tokio::time::timeout(std::time::Duration::from_millis(200), reply_rx)
+            .await
+            .expect("must reply within 200ms — F1 regression")
+            .expect("reply channel must not be dropped");
+        assert!(
+            matches!(resp, crate::permission::ask::UserDecision::Deny),
+            "ACP ask must auto-deny; got {:?}",
+            resp,
+        );
+    }
+
+    /// Multiple concurrent asks all get responded to.
+    #[tokio::test]
+    async fn acp_ask_drain_handles_multiple_concurrent_asks() {
+        let (ask_tx, ask_rx) = tokio::sync::mpsc::channel::<crate::permission::ask::AskRequest>(8);
+        spawn_acp_ask_drain(ask_rx);
+
+        let mut replies = Vec::new();
+        for i in 0..5 {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            ask_tx
+                .send(crate::permission::ask::AskRequest {
+                    tool: format!("bash-{i}"),
+                    input: format!("cmd-{i}"),
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            replies.push(reply_rx);
+        }
+
+        for reply_rx in replies {
+            let resp = tokio::time::timeout(std::time::Duration::from_millis(500), reply_rx)
+                .await
+                .expect("each reply must arrive promptly")
+                .expect("reply channel dropped");
+            assert!(matches!(resp, crate::permission::ask::UserDecision::Deny));
+        }
+    }
 }
 
 fn resolve_acp_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
