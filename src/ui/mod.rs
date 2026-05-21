@@ -104,9 +104,10 @@ fn capture_partial_on_abort(
     session: &mut crate::session::Session,
     why: &str,
     tool_calls_in_turn: u32,
+    tool_calls_buf: &mut Vec<crate::session::ToolCallEntry>,
 ) -> bool {
     let trimmed = response_buf.trim_end();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() && tool_calls_buf.is_empty() {
         response_buf.clear();
         return false;
     }
@@ -123,7 +124,18 @@ fn capture_partial_on_abort(
     } else {
         format!("[interrupted by user ({})]", why)
     };
-    let stashed = format!("{}\n\n{}", trimmed, trailer);
+    let stashed = if trimmed.is_empty() {
+        trailer
+    } else {
+        format!("{}\n\n{}", trimmed, trailer)
+    };
+    // Phase 3: persist the tool-call entries too. Any entry still
+    // in Interrupted state at abort time stays Interrupted (the
+    // matching ToolResult never arrived). Completed entries keep
+    // their state — they ran fully before the user cancelled.
+    // `convert_history` will emit tool_result blocks for both
+    // states on resume so the LLM never sees orphan tool_use.
+    let calls = std::mem::take(tool_calls_buf);
     // Capture the message's token estimate before add_message so we
     // can also bump `total_tokens` in lockstep with
     // `total_estimated_tokens` — matches the Done / Interjected
@@ -131,7 +143,7 @@ fn capture_partial_on_abort(
     // placeholder; kept consistent so the abort case doesn't look
     // like a zero-token turn).
     let est = crate::session::Session::estimate_tokens(&stashed);
-    session.add_message(crate::session::MessageRole::Assistant, &stashed);
+    session.add_message_with_tool_calls(crate::session::MessageRole::Assistant, &stashed, calls);
     session.total_tokens = session.total_tokens.saturating_add(est);
     response_buf.clear();
     true
@@ -454,6 +466,16 @@ pub async fn run_interactive(
     // ran but their results aren't in the preserved text. Reset
     // when a new agent run starts (alongside response_buf clear).
     let mut tool_calls_this_run: u32 = 0;
+    // Structured tool-call records for the current agent run.
+    // Populated from `AgentEvent::ToolCall` (state: Interrupted) and
+    // updated to `Completed{result}` on the matching `ToolResult`.
+    // Attached to the assistant message on `Done` / `Interjected`,
+    // or all remaining pending entries marked Interrupted on abort
+    // (Ctrl+C / Esc). Persists to the session JSON; on resume,
+    // `convert_history` re-emits each as a structured tool_use +
+    // tool_result block so the LLM doesn't re-call the same tools.
+    // Mirrors opencode's `ToolPart` lifecycle.
+    let mut tool_calls_buf: Vec<crate::session::ToolCallEntry> = Vec::new();
     // Per-turn streaming state for the plugin hooks. The batcher
     // collects tokens since the last `on-message-update` dispatch so
     // we don't round-trip into Janet for every single token; the
@@ -805,6 +827,7 @@ pub async fn run_interactive(
                                     session,
                                     "Ctrl+C",
                                     tool_calls_this_run,
+                                    &mut tool_calls_buf,
                                 );
                                 // Whether or not we stashed, the run
                                 // is over — reset the counter so a
@@ -982,6 +1005,7 @@ pub async fn run_interactive(
                                 session,
                                 "Esc",
                                 tool_calls_this_run,
+                                &mut tool_calls_buf,
                             );
                             tool_calls_this_run = 0;
                             let msg = if stashed {
@@ -1552,8 +1576,19 @@ pub async fn run_interactive(
                         renderer.render_viewport()?;
                         agent_line_started = true;
                     }
-                    AgentEvent::ToolCall { name, args } => {
+                    AgentEvent::ToolCall { id, name, args } => {
                         was_reasoning = false;
+                        // Phase 3: persist as structured entry. Start
+                        // in Interrupted state so that if the user
+                        // aborts before the result arrives, the saved
+                        // session captures the right state. The
+                        // matching `ToolResult` flips it to Completed.
+                        tool_calls_buf.push(crate::session::ToolCallEntry {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            args: args.clone(),
+                            state: crate::session::ToolCallState::Interrupted,
+                        });
                         // Track for the abort-trailer warning: when
                         // the user later hits Ctrl+C / Esc, the
                         // saved partial reply notes how many tool
@@ -1601,7 +1636,24 @@ pub async fn run_interactive(
                         // longer dispatches it here — that would double-
                         // fire the hook per tool call.
                     }
-                    AgentEvent::ToolResult { output } => {
+                    AgentEvent::ToolResult { id, output } => {
+                        // Phase 3: pair the result with its call.
+                        // Prefer id-match; fall back to the most-
+                        // recent Interrupted (pending) entry for
+                        // providers that don't emit ids.
+                        let target = if !id.is_empty() {
+                            tool_calls_buf.iter_mut().rev().find(|e| e.id == id.as_str())
+                        } else {
+                            tool_calls_buf
+                                .iter_mut()
+                                .rev()
+                                .find(|e| matches!(e.state, crate::session::ToolCallState::Interrupted))
+                        };
+                        if let Some(entry) = target {
+                            entry.state = crate::session::ToolCallState::Completed {
+                                result: output.to_string(),
+                            };
+                        }
                         let show_details = cfg.show_tool_details.unwrap_or(true);
                         let max_chars = cfg.resolve_tool_result_max_chars();
                         let show_diff = cfg.resolve_show_edit_diff();
@@ -1777,7 +1829,15 @@ pub async fn run_interactive(
 
                         renderer.write_line("", Color::White)?;
                         renderer.write_line("", Color::White)?;
-                        session.add_message(MessageRole::Assistant, &response);
+                        // Phase 3: persist structured tool calls
+                        // alongside the assistant text so the next
+                        // resume sees the full tool_use/tool_result
+                        // pairs in convert_history.
+                        session.add_message_with_tool_calls(
+                            MessageRole::Assistant,
+                            &response,
+                            std::mem::take(&mut tool_calls_buf),
+                        );
                         // TODO(cost-tracking): `tokens` here is the heuristic
                         // estimate (text.len()/4) and `cost` is always 0.0 —
                         // these accumulate into placeholder fields and won't
@@ -2054,11 +2114,27 @@ pub async fn run_interactive(
                         // history. Even truncated, it lets the LLM see what
                         // it had said when the user spoke up.
                         if !partial_response.is_empty() {
-                            session.add_message(MessageRole::Assistant, &partial_response);
+                            // Phase 3: same structured persistence
+                            // as the Done branch. Any pending entries
+                            // (tool calls without a result yet) keep
+                            // their Interrupted state — the LLM
+                            // sees [Tool execution was interrupted]
+                            // tool_result on resume.
+                            session.add_message_with_tool_calls(
+                                MessageRole::Assistant,
+                                &partial_response,
+                                std::mem::take(&mut tool_calls_buf),
+                            );
                             // TODO(cost-tracking): same caveat as the Done
                             // branch — `tokens` is an estimate, not actual
                             // provider usage. Wire after rig usage plumbing.
                             session.total_tokens = session.total_tokens.saturating_add(tokens);
+                        } else {
+                            // No partial text but maybe pending tool
+                            // calls — drop them; the session already
+                            // captured them via prior turns or they
+                            // were a single-call abort with no text.
+                            tool_calls_buf.clear();
                         }
                         // Run ended (interjection-style) — reset the
                         // per-run tool-call counter alongside the
@@ -3320,12 +3396,66 @@ mod tests {
     // sees on the next turn what it had been saying. Mirrors
     // opencode's `finalizeInterruptedAssistant` in
     // `packages/opencode/src/session/prompt.ts`.
+    /// Phase 3 — abort with pending tool calls preserves them as
+    /// structured entries on the stashed message. Pending entries
+    /// stay Interrupted (no matching result arrived); on resume,
+    /// `convert_history` will emit a [Tool execution was
+    /// interrupted] tool_result so the LLM sees paired blocks.
+    #[test]
+    fn capture_partial_on_abort_preserves_pending_tool_calls_as_interrupted() {
+        let mut session = crate::session::Session::new("p", "m", 100_000);
+        let mut buf = String::from("Running bash...");
+        let mut calls = vec![
+            crate::session::ToolCallEntry {
+                id: "tc_abc".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"cmd": "sleep 99"}),
+                state: crate::session::ToolCallState::Interrupted,
+            },
+            crate::session::ToolCallEntry {
+                id: "tc_xyz".to_string(),
+                name: "read".to_string(),
+                args: serde_json::json!({"path": "/etc/hostname"}),
+                state: crate::session::ToolCallState::Completed {
+                    result: "myhost".to_string(),
+                },
+            },
+        ];
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 2, &mut calls);
+        assert!(stashed);
+        assert!(calls.is_empty(), "tool_calls_buf must be drained on stash");
+
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.tool_calls.len(), 2);
+        let interrupted = last
+            .tool_calls
+            .iter()
+            .find(|e| e.id == "tc_abc")
+            .expect("missing interrupted entry");
+        assert!(matches!(
+            interrupted.state,
+            crate::session::ToolCallState::Interrupted,
+        ));
+        let completed = last
+            .tool_calls
+            .iter()
+            .find(|e| e.id == "tc_xyz")
+            .expect("missing completed entry");
+        match &completed.state {
+            crate::session::ToolCallState::Completed { result } => {
+                assert_eq!(result, "myhost");
+            }
+            other => panic!("expected Completed; got {other:?}"),
+        }
+    }
+
     #[test]
     fn capture_partial_on_abort_stashes_partial_with_trailer() {
         let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
         let baseline = session.messages.len();
         let mut buf = String::from("I was about to explain that");
-        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0);
+        let stashed =
+            capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0, &mut Vec::new());
         assert!(stashed);
         assert_eq!(session.messages.len(), baseline + 1);
         let last = session.messages.last().unwrap();
@@ -3351,7 +3481,8 @@ mod tests {
         let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
         let baseline = session.messages.len();
         let mut buf = String::new();
-        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0);
+        let stashed =
+            capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0, &mut Vec::new());
         assert!(!stashed);
         assert_eq!(session.messages.len(), baseline);
     }
@@ -3363,7 +3494,7 @@ mod tests {
         let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
         let baseline = session.messages.len();
         let mut buf = String::from("   \n\n\t  ");
-        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Esc", 0);
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Esc", 0, &mut Vec::new());
         assert!(!stashed);
         assert_eq!(session.messages.len(), baseline);
     }
@@ -3379,7 +3510,8 @@ mod tests {
     fn capture_partial_on_abort_trailer_notes_tool_calls() {
         let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
         let mut buf = String::from("I deleted the file");
-        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 2);
+        let stashed =
+            capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 2, &mut Vec::new());
         assert!(stashed);
         let content = &session.messages.last().unwrap().content;
         assert!(
@@ -3406,7 +3538,7 @@ mod tests {
     fn capture_partial_on_abort_trailer_handles_singular_tool_call() {
         let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
         let mut buf = String::from("Running tests now");
-        capture_partial_on_abort(&mut buf, &mut session, "Esc", 1);
+        capture_partial_on_abort(&mut buf, &mut session, "Esc", 1, &mut Vec::new());
         let content = &session.messages.last().unwrap().content;
         assert!(
             content.contains("1 tool call ran"),
@@ -3556,7 +3688,7 @@ mod tests {
         let mut buf = String::from(
             "A reasonably long partial response that should produce a non-zero token estimate.",
         );
-        capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0);
+        capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0, &mut Vec::new());
         // Both fields advanced by the same amount (the stashed
         // message's estimated_tokens). Without the parity fix, only
         // total_estimated_tokens moved.

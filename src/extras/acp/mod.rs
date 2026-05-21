@@ -209,7 +209,7 @@ async fn run_prompt(
                 );
                 let _ = cx.send_notification(notif);
             }
-            AgentEvent::ToolCall { name, args } => {
+            AgentEvent::ToolCall { id: _, name, args } => {
                 let args_str = args.to_string();
                 let call_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
                 last_tool_call_id = Some(call_id.clone());
@@ -221,7 +221,7 @@ async fn run_prompt(
                 );
                 let _ = cx.send_notification(notif);
             }
-            AgentEvent::ToolResult { output } => {
+            AgentEvent::ToolResult { id: _, output } => {
                 // Use the most recent ToolCall id so the client can
                 // correlate result → call. Falls back to an empty id
                 // only if a stray ToolResult arrives without a prior

@@ -14,6 +14,48 @@ pub enum MessageRole {
     System,
 }
 
+/// State of a tool call attached to an assistant message. Mirrors
+/// opencode's `ToolPart.state` (`message-v2.ts:310-320`). The point
+/// of preserving state — rather than just "this tool ran" — is so
+/// that resumed sessions can emit a paired tool_result block to the
+/// LLM even for tool calls that didn't complete (e.g. user hit
+/// Ctrl+C mid-execution). Anthropic + OpenAI reject orphan tool_use
+/// blocks; we always emit a result, even if its content is an
+/// interrupted marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolCallState {
+    /// Tool ran to completion. `result` is the output text the LLM
+    /// would see (the same string the UI rendered in the chamber).
+    Completed { result: String },
+    /// Tool was dispatched but the agent was aborted before its
+    /// result came back. Resumed sessions emit a tool_result with
+    /// "[Tool execution was interrupted]" so the LLM knows the
+    /// effect is undefined.
+    Interrupted,
+    /// Tool dispatched but the call errored (e.g. permission denied,
+    /// runtime panic). `error` is the message the LLM saw.
+    Failed { error: String },
+}
+
+/// One tool invocation attached to an assistant message. We keep
+/// the original call id (rig's `ToolCall.id`) so resumed sessions
+/// emit tool_result blocks with the right correlation id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallEntry {
+    /// Provider-supplied call id (e.g. `tooluse_abc123` for
+    /// Anthropic, `call_xyz` for OpenAI). Used as the
+    /// `tool_use_id` / `tool_call_id` correlation on resume.
+    pub id: String,
+    /// Tool name as the LLM saw it (`bash`, `read`, `mcp_tool:...`).
+    pub name: String,
+    /// Arguments the LLM sent. JSON value so it round-trips
+    /// without re-parsing.
+    pub args: serde_json::Value,
+    /// Outcome — completed, interrupted, or failed.
+    pub state: ToolCallState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessage {
     pub role: MessageRole,
@@ -31,6 +73,16 @@ pub struct SessionMessage {
     /// chat messages with plugin entries by timestamp.
     #[serde(default)]
     pub timestamp: i64,
+    /// Tool calls + results attached to this assistant message.
+    /// Empty for User / System messages and for assistants that
+    /// didn't invoke any tools. Phase 3 added persistence so
+    /// resumed sessions re-emit structured tool_use/tool_result
+    /// blocks to the LLM instead of only the assistant's text;
+    /// previously the LLM lost all context of prior tool work on
+    /// session resume. Defaulted on deserialize for back-compat
+    /// with pre-Phase-3 session files.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallEntry>,
 }
 
 /// Generate a fresh message id. Extracted for `#[serde(default = ...)]`.
@@ -282,6 +334,21 @@ impl Session {
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
+        self.add_message_with_tool_calls(role, content, Vec::new());
+    }
+
+    /// Same as `add_message` but attaches structured tool-call
+    /// entries to the new message. Used by the runner to persist
+    /// assistant turns that invoked tools so `convert_history`
+    /// can re-emit structured tool_use/tool_result blocks on
+    /// session resume. Empty `tool_calls` is equivalent to the
+    /// plain `add_message`.
+    pub fn add_message_with_tool_calls(
+        &mut self,
+        role: MessageRole,
+        content: &str,
+        tool_calls: Vec<ToolCallEntry>,
+    ) {
         // Make sure tree + store mirror any messages that were loaded
         // from a pre-P4b/P4c session file BEFORE we append the new
         // one — otherwise the rebuild would re-insert this new message
@@ -299,6 +366,7 @@ impl Session {
             estimated_tokens: tokens,
             id: id.clone(),
             timestamp,
+            tool_calls,
         };
         self.messages.push(msg.clone());
         self.message_store.insert(id.clone(), msg);
@@ -597,6 +665,7 @@ impl Session {
             estimated_tokens: summary_tokens,
             id: summary_id.clone(),
             timestamp: summary_ts,
+            tool_calls: Vec::new(),
         };
 
         // Collect the IDs of the messages we're about to drop so we
@@ -1243,6 +1312,147 @@ mod tests {
         assert_eq!(s.messages.len(), 1);
     }
 
+    /// Phase 3 — tool calls round-trip through serde with default
+    /// for back-compat. Old session files without the field
+    /// deserialize into an empty Vec.
+    #[test]
+    fn session_message_tool_calls_default_when_field_missing() {
+        let json = r#"{
+            "role": "assistant",
+            "content": "Done.",
+            "estimated_tokens": 5
+        }"#;
+        let msg: SessionMessage = serde_json::from_str(json).unwrap();
+        assert!(
+            msg.tool_calls.is_empty(),
+            "missing field must default to []"
+        );
+    }
+
+    /// Round-trip: write a message WITH tool_calls, read back, fields intact.
+    #[test]
+    fn session_message_tool_calls_roundtrip() {
+        let mut s = Session::new("p", "m", 0);
+        let calls = vec![
+            ToolCallEntry {
+                id: "tc_1".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"cmd": "ls"}),
+                state: ToolCallState::Completed {
+                    result: "file1\nfile2".to_string(),
+                },
+            },
+            ToolCallEntry {
+                id: "tc_2".to_string(),
+                name: "read".to_string(),
+                args: serde_json::json!({"path": "/tmp/x"}),
+                state: ToolCallState::Interrupted,
+            },
+        ];
+        s.add_message_with_tool_calls(MessageRole::Assistant, "Let me check.", calls.clone());
+
+        let blob = serde_json::to_string(&s).unwrap();
+        let s2: Session = serde_json::from_str(&blob).unwrap();
+        let last = s2.messages.last().unwrap();
+        assert_eq!(last.tool_calls.len(), 2);
+        assert_eq!(last.tool_calls[0].id, "tc_1");
+        assert!(matches!(
+            last.tool_calls[0].state,
+            ToolCallState::Completed { .. },
+        ));
+        assert!(matches!(
+            last.tool_calls[1].state,
+            ToolCallState::Interrupted,
+        ));
+    }
+
+    /// Convert history materializes prior tool calls as structured
+    /// rig Message blocks (Assistant with ToolCall content +
+    /// User with ToolResult content). Without this, resumed sessions
+    /// lose tool-call context and the LLM may re-call the same
+    /// tools. Matches opencode's `message-v2.ts:630-899` pattern.
+    #[test]
+    fn convert_history_emits_tool_use_and_tool_result_blocks() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "list files");
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            "Here:",
+            vec![ToolCallEntry {
+                id: "tc_42".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"cmd": "ls"}),
+                state: ToolCallState::Completed {
+                    result: "a\nb".to_string(),
+                },
+            }],
+        );
+
+        let history = crate::agent::runner::convert_history(&s);
+        // Expect: User("list files"), Assistant(text + tool_use),
+        // User(tool_result). 3 messages total.
+        assert_eq!(history.len(), 3, "history shape: {:#?}", history);
+
+        // Last is a User with tool_result content carrying the id.
+        match &history[2] {
+            rig::completion::Message::User { content } => {
+                let s = format!("{:?}", content);
+                assert!(s.contains("tc_42"), "tool_result missing call id: {s}");
+                // Debug format escapes newlines, so check the
+                // escaped form. The underlying string still has the
+                // real newline; this is just an assertion-side
+                // formatting consideration.
+                assert!(
+                    s.contains("a\\nb") || s.contains("a\nb"),
+                    "tool_result missing output: {s}",
+                );
+            }
+            other => panic!("expected User tool_result message; got {other:?}"),
+        }
+
+        // Middle is Assistant with both text and a ToolCall.
+        match &history[1] {
+            rig::completion::Message::Assistant { content, .. } => {
+                let s = format!("{:?}", content);
+                assert!(s.contains("tc_42"), "tool_use missing id: {s}");
+                assert!(s.contains("\"bash\""), "tool_use missing name: {s}");
+            }
+            other => panic!("expected Assistant message; got {other:?}"),
+        }
+    }
+
+    /// Interrupted tool calls must be emitted as tool_result with
+    /// an "[interrupted]" marker, NOT skipped. Anthropic + OpenAI
+    /// reject orphan tool_use blocks; opencode handles this
+    /// (`message-v2.ts:848-857`) by emitting an error tool_result.
+    #[test]
+    fn convert_history_pairs_interrupted_tool_calls_with_error_marker() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            "About to bash...",
+            vec![ToolCallEntry {
+                id: "tc_99".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"cmd": "sleep 9999"}),
+                state: ToolCallState::Interrupted,
+            }],
+        );
+
+        let history = crate::agent::runner::convert_history(&s);
+        // 2 messages: Assistant(text + tool_use) + User(tool_result-interrupted).
+        assert_eq!(history.len(), 2);
+        let last_str = format!("{:?}", &history[1]);
+        assert!(
+            last_str.contains("tc_99"),
+            "interrupted result must reference call id: {last_str}",
+        );
+        assert!(
+            last_str.contains("interrupted") || last_str.contains("Interrupted"),
+            "interrupted result must say so: {last_str}",
+        );
+    }
+
     /// Phase 2 — compress drops a parent that has a sibling branch
     /// underneath. The sibling subtree must also be pruned;
     /// otherwise its nodes have `parent` pointing at a removed id
@@ -1289,6 +1499,7 @@ mod tests {
                 estimated_tokens: 1,
                 id: sib1_id.clone(),
                 timestamp: 0,
+                tool_calls: Vec::new(),
             },
         );
         s.message_store.insert(
@@ -1299,6 +1510,7 @@ mod tests {
                 estimated_tokens: 1,
                 id: sib2_id.clone(),
                 timestamp: 0,
+                tool_calls: Vec::new(),
             },
         );
 

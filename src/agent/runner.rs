@@ -123,6 +123,8 @@ pub struct AgentRunner {
 }
 
 pub fn convert_history(session: &Session) -> Vec<Message> {
+    use rig::OneOrMany;
+    use rig::completion::message::AssistantContent;
     let (summary, first_kept) = session.compacted_context();
     let mut messages = Vec::new();
 
@@ -136,8 +138,63 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
     for msg in &session.messages[first_kept..] {
         match msg.role {
             MessageRole::User => messages.push(Message::user(msg.content.to_string())),
-            MessageRole::Assistant => messages.push(Message::assistant(msg.content.to_string())),
             MessageRole::System => messages.push(Message::system(msg.content.to_string())),
+            MessageRole::Assistant => {
+                // Phase 3: if this assistant message has structured
+                // tool calls, emit a single Assistant message with
+                // text + tool_use content parts, followed by ONE
+                // tool_result User message per call. The pairing
+                // matches opencode's `toModelMessagesEffect`
+                // (`message-v2.ts:630-899`); Anthropic + OpenAI
+                // reject orphan tool_use blocks so we always emit a
+                // result, marking Interrupted/Failed as error text
+                // rather than skipping. Bare assistant messages
+                // (no tool_calls) keep the prior simple shape.
+                if msg.tool_calls.is_empty() {
+                    messages.push(Message::assistant(msg.content.to_string()));
+                    continue;
+                }
+
+                // Build the Assistant message's content blocks: text
+                // first (if any) then each ToolCall.
+                let mut parts: Vec<AssistantContent> = Vec::new();
+                if !msg.content.is_empty() {
+                    parts.push(AssistantContent::text(msg.content.to_string()));
+                }
+                for tc in &msg.tool_calls {
+                    parts.push(AssistantContent::tool_call(
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        tc.args.clone(),
+                    ));
+                }
+                // OneOrMany::many requires at least one element; we
+                // always have at least one ToolCall here since
+                // tool_calls is non-empty.
+                let content = if parts.len() == 1 {
+                    OneOrMany::one(parts.pop().unwrap())
+                } else {
+                    OneOrMany::many(parts).expect("non-empty parts vec")
+                };
+                messages.push(Message::Assistant { id: None, content });
+
+                // One User tool_result per call. State maps to:
+                //  Completed  → result text verbatim
+                //  Interrupted → "[Tool execution was interrupted]"
+                //  Failed     → "[Tool error: <message>]"
+                for tc in &msg.tool_calls {
+                    let body = match &tc.state {
+                        crate::session::ToolCallState::Completed { result } => result.clone(),
+                        crate::session::ToolCallState::Interrupted => {
+                            "[Tool execution was interrupted]".to_string()
+                        }
+                        crate::session::ToolCallState::Failed { error } => {
+                            format!("[Tool error: {}]", error)
+                        }
+                    };
+                    messages.push(Message::tool_result(tc.id.clone(), body));
+                }
+            }
         }
     }
 
@@ -217,6 +274,7 @@ where
                 outcome.had_tool_calls = true;
                 let _ = event_tx
                     .send(AgentEvent::ToolCall {
+                        id: CompactString::from(tool_call.id),
                         name: CompactString::from(tool_call.function.name),
                         args: tool_call.function.arguments,
                     })
@@ -238,6 +296,7 @@ where
                 }
                 let _ = event_tx
                     .send(AgentEvent::ToolResult {
+                        id: CompactString::from(tool_result.id),
                         output: CompactString::from(output),
                     })
                     .await;
