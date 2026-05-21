@@ -447,7 +447,11 @@ where
                 .send(AgentEvent::Reasoning(CompactString::new(retry_msg)))
                 .await;
 
-            let delay = policy.backoff_duration(attempts);
+            // F14: honor `Retry-After` from the provider's error
+            // message if present — retrying before the server's
+            // requested wait just earns another 429. Otherwise the
+            // exponential-backoff computed delay applies.
+            let delay = policy.backoff_duration_for_msg(attempts, &msg);
             tokio::time::sleep(delay).await;
             attempts += 1;
         }
