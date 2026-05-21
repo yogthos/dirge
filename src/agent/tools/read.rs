@@ -121,8 +121,21 @@ impl Tool for ReadTool {
         let mut total_lines = 0usize;
         let mut excerpt_lines: Vec<(usize, String)> = Vec::with_capacity(limit);
         let want_end = offset.saturating_add(limit);
+        let mut first_line = true;
         while let Some(line) = lines.next_line().await.transpose() {
             let mut line = line?;
+            // F19: strip UTF-8 BOM from the FIRST line only. Old
+            // Windows-saved files start with U+FEFF (0xEF 0xBB 0xBF);
+            // when present, the BOM ended up as a leading 3-byte
+            // invisible-character prefix in the LLM context.
+            // opencode `read.ts` uses `Bom.readFile()` for the same
+            // reason.
+            if first_line {
+                if let Some(stripped) = line.strip_prefix('\u{FEFF}') {
+                    line = stripped.to_string();
+                }
+                first_line = false;
+            }
             if line.len() > MAX_LINE_BYTES {
                 // Truncate by byte index — careful to land on a UTF-8
                 // boundary. Drop bytes until we find one.
@@ -275,5 +288,61 @@ mod tests {
         // Only the first 5 are in the excerpt.
         let body_lines: Vec<&str> = out.lines().skip(2).collect();
         assert_eq!(body_lines.len(), 5);
+    }
+
+    /// F19: UTF-8 BOM (U+FEFF, bytes 0xEF 0xBB 0xBF) at the start
+    /// of a file is stripped before the line reaches the LLM. The
+    /// raw 3-byte prefix would otherwise render as an
+    /// invisible-character at the start of line 1.
+    #[tokio::test]
+    async fn read_strips_utf8_bom_from_first_line() {
+        let path = temp_path("bom");
+        let bom = "\u{FEFF}";
+        std::fs::write(&path, format!("{bom}first\nsecond")).unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // Body lines (after the "File: …" header + blank line).
+        let body: Vec<&str> = out.lines().skip(2).collect();
+        assert_eq!(body, vec!["1: first", "2: second"]);
+        // No BOM byte anywhere in the output.
+        assert!(
+            !out.contains('\u{FEFF}'),
+            "BOM should be stripped: {:?}",
+            out,
+        );
+    }
+
+    /// F19: only the FIRST line gets BOM-stripped. A mid-file BOM
+    /// (extremely rare but possible) is preserved as a regular
+    /// character.
+    #[tokio::test]
+    async fn read_only_strips_bom_at_start_of_file() {
+        let path = temp_path("bom-mid");
+        let bom = "\u{FEFF}";
+        std::fs::write(&path, format!("first\n{bom}second")).unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // The mid-file BOM stays.
+        assert!(out.contains('\u{FEFF}'));
     }
 }

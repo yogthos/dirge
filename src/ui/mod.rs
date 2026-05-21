@@ -457,7 +457,10 @@ pub async fn run_interactive(
     // Sender into the running agent's interjection channel. The UI signals
     // (unit-only payload) when a user-typed interjection is queued; the
     // runner honors it at the next tool-result boundary.
-    let mut agent_interject: Option<mpsc::UnboundedSender<()>> = None;
+    // F20: bounded mpsc::Sender. Multiple interject signals while
+    // the runner is mid-call get coalesced — only the first wakeup
+    // matters since the runner drains via try_recv() after waking.
+    let mut agent_interject: Option<mpsc::Sender<()>> = None;
     let mut agent_line_started = false;
     let mut response_buf = String::new();
     // Count of `AgentEvent::ToolCall` events observed during the
@@ -1385,7 +1388,12 @@ pub async fn run_interactive(
                                 // (race with Done) — harmless, queue still
                                 // drains on the Done handler.
                                 if let Some(tx) = agent_interject.as_ref() {
-                                    let _ = tx.send(());
+                                    // F20: try_send so a full channel
+                                    // (already-queued wakeup) is a
+                                    // no-op rather than blocking the
+                                    // UI thread. We only need ONE
+                                    // wakeup queued at a time.
+                                    let _ = tx.try_send(());
                                 }
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);

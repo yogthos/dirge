@@ -119,7 +119,14 @@ pub struct AgentRunner {
     /// emits `AgentEvent::Interjected` with whatever assistant text had
     /// streamed so far, and the UI is responsible for queueing the next
     /// user turn. Unbounded because the signal payload is just `()`.
-    pub interject_tx: mpsc::UnboundedSender<()>,
+    /// F20: bounded so a user who hammers the interject keybind
+    /// can't fill an unbounded queue while the runner is in a long
+    /// LLM call. Only the FIRST signal needs to be received — all
+    /// subsequent ones are noise (the runner drains via
+    /// `try_recv()` after the first wakeup). 64 is generous; if
+    /// the channel is full, `try_send` silently no-ops (we already
+    /// have one queued).
+    pub interject_tx: mpsc::Sender<()>,
 }
 
 pub fn convert_history(session: &Session) -> Vec<Message> {
@@ -220,7 +227,7 @@ async fn run_stream<M, P>(
     prompt: &str,
     history: Vec<Message>,
     event_tx: &mpsc::Sender<AgentEvent>,
-    interject_rx: &mut mpsc::UnboundedReceiver<()>,
+    interject_rx: &mut mpsc::Receiver<()>,
 ) -> StreamOutcome
 where
     M: CompletionModel + 'static,
@@ -361,7 +368,8 @@ where
 {
     cache.clear();
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
-    let (interject_tx, mut interject_rx) = mpsc::unbounded_channel::<()>();
+    // F20: bounded channel. See `AgentRunner::interject_tx` doc.
+    let (interject_tx, mut interject_rx) = mpsc::channel::<()>(64);
 
     let task = tokio::spawn(async move {
         let policy = RecoveryPolicy::default();
