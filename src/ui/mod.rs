@@ -84,6 +84,14 @@ fn with_queue(s: String, n: usize) -> String {
 /// when a partial was actually stashed; `false` when nothing had
 /// streamed yet (no-op).
 ///
+/// `tool_calls_in_turn` is the count of `AgentEvent::ToolCall` events
+/// the UI saw during the aborted turn. When non-zero, the trailer
+/// notes that tool calls ran but their results are NOT in the
+/// preserved text (since only Token events accumulate into
+/// `response_buf`). Without this hint, the next turn's LLM context
+/// would treat the partial as a complete reply and could re-run
+/// side-effecting tools.
+///
 /// Mirrors opencode's `finalizeInterruptedAssistant` in
 /// `packages/opencode/src/session/prompt.ts` — the streamed parts
 /// are already on-screen, so the partial is preserved by virtue of
@@ -95,14 +103,36 @@ fn capture_partial_on_abort(
     response_buf: &mut String,
     session: &mut crate::session::Session,
     why: &str,
+    tool_calls_in_turn: u32,
 ) -> bool {
     let trimmed = response_buf.trim_end();
     if trimmed.is_empty() {
         response_buf.clear();
         return false;
     }
-    let stashed = format!("{}\n\n[interrupted by user ({})]", trimmed, why,);
+    let trailer = if tool_calls_in_turn > 0 {
+        let noun = if tool_calls_in_turn == 1 {
+            "tool call ran"
+        } else {
+            "tool calls ran"
+        };
+        format!(
+            "[interrupted by user ({}); {} {} in this turn — results not preserved]",
+            why, tool_calls_in_turn, noun,
+        )
+    } else {
+        format!("[interrupted by user ({})]", why)
+    };
+    let stashed = format!("{}\n\n{}", trimmed, trailer);
+    // Capture the message's token estimate before add_message so we
+    // can also bump `total_tokens` in lockstep with
+    // `total_estimated_tokens` — matches the Done / Interjected
+    // branches which both update total_tokens (a TODO(cost-tracking)
+    // placeholder; kept consistent so the abort case doesn't look
+    // like a zero-token turn).
+    let est = crate::session::Session::estimate_tokens(&stashed);
     session.add_message(crate::session::MessageRole::Assistant, &stashed);
+    session.total_tokens = session.total_tokens.saturating_add(est);
     response_buf.clear();
     true
 }
@@ -418,6 +448,12 @@ pub async fn run_interactive(
     let mut agent_interject: Option<mpsc::UnboundedSender<()>> = None;
     let mut agent_line_started = false;
     let mut response_buf = String::new();
+    // Count of `AgentEvent::ToolCall` events observed during the
+    // current run. Used by `capture_partial_on_abort` so the
+    // saved partial's trailer can warn the LLM that tool calls
+    // ran but their results aren't in the preserved text. Reset
+    // when a new agent run starts (alongside response_buf clear).
+    let mut tool_calls_this_run: u32 = 0;
     // Per-turn streaming state for the plugin hooks. The batcher
     // collects tokens since the last `on-message-update` dispatch so
     // we don't round-trip into Janet for every single token; the
@@ -768,7 +804,12 @@ pub async fn run_interactive(
                                     &mut response_buf,
                                     session,
                                     "Ctrl+C",
+                                    tool_calls_this_run,
                                 );
+                                // Whether or not we stashed, the run
+                                // is over — reset the counter so a
+                                // subsequent run starts at zero.
+                                tool_calls_this_run = 0;
                                 let dropped = interjection_queue.len();
                                 interjection_queue.clear();
                                 let mut msg = String::from("interrupted");
@@ -940,7 +981,9 @@ pub async fn run_interactive(
                                 &mut response_buf,
                                 session,
                                 "Esc",
+                                tool_calls_this_run,
                             );
+                            tool_calls_this_run = 0;
                             let msg = if stashed {
                                 "interrupted (Esc) — partial reply preserved in session"
                             } else {
@@ -1511,6 +1554,12 @@ pub async fn run_interactive(
                     }
                     AgentEvent::ToolCall { name, args } => {
                         was_reasoning = false;
+                        // Track for the abort-trailer warning: when
+                        // the user later hits Ctrl+C / Esc, the
+                        // saved partial reply notes how many tool
+                        // calls ran (and didn't have their results
+                        // preserved in the message text).
+                        tool_calls_this_run = tool_calls_this_run.saturating_add(1);
                         renderer.set_avatar_state(avatar::AvatarState::from_tool_name(&name));
                         // If a previous tool's chamber never closed
                         // (errored without a ToolResult, etc.), close
@@ -1738,6 +1787,11 @@ pub async fn run_interactive(
                         // the wiring is in place when real values arrive.
                         session.total_tokens = session.total_tokens.saturating_add(tokens);
                         session.total_cost += cost;
+                        // Run ended cleanly — reset the per-run tool-
+                        // call counter so the next user submission
+                        // starts at zero. Mirrored in the Interjected
+                        // branch + both abort paths below.
+                        tool_calls_this_run = 0;
                         agent_line_started = false;
                         response_buf.clear();
                         response_start_line = None;
@@ -2006,6 +2060,10 @@ pub async fn run_interactive(
                             // provider usage. Wire after rig usage plumbing.
                             session.total_tokens = session.total_tokens.saturating_add(tokens);
                         }
+                        // Run ended (interjection-style) — reset the
+                        // per-run tool-call counter alongside the
+                        // other per-run state.
+                        tool_calls_this_run = 0;
                         agent_line_started = false;
                         response_buf.clear();
                         response_start_line = None;
@@ -3163,7 +3221,7 @@ mod tests {
         let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
         let baseline = session.messages.len();
         let mut buf = String::from("I was about to explain that");
-        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C");
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0);
         assert!(stashed);
         assert_eq!(session.messages.len(), baseline + 1);
         let last = session.messages.last().unwrap();
@@ -3189,7 +3247,7 @@ mod tests {
         let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
         let baseline = session.messages.len();
         let mut buf = String::new();
-        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C");
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0);
         assert!(!stashed);
         assert_eq!(session.messages.len(), baseline);
     }
@@ -3201,9 +3259,88 @@ mod tests {
         let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
         let baseline = session.messages.len();
         let mut buf = String::from("   \n\n\t  ");
-        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Esc");
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Esc", 0);
         assert!(!stashed);
         assert_eq!(session.messages.len(), baseline);
+    }
+
+    // When tool calls ran in the same turn as the abort, the trailer
+    // must say so. The agent's preserved text only covers what was
+    // streamed via `AgentEvent::Token`; tool calls + results emitted
+    // separately are NOT in `response_buf`. Without this hint the
+    // next turn's LLM would see the partial as a definitive "this
+    // was the assistant's response" and could re-run side-effecting
+    // tool calls.
+    #[test]
+    fn capture_partial_on_abort_trailer_notes_tool_calls() {
+        let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
+        let mut buf = String::from("I deleted the file");
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 2);
+        assert!(stashed);
+        let content = &session.messages.last().unwrap().content;
+        assert!(
+            content.contains("I deleted the file"),
+            "partial text dropped: {content:?}",
+        );
+        assert!(
+            content.contains("[interrupted by user (Ctrl+C);"),
+            "trailer prefix changed: {content:?}",
+        );
+        assert!(
+            content.contains("2 tool call"),
+            "trailer must mention tool call count: {content:?}",
+        );
+        assert!(
+            content.contains("not preserved"),
+            "trailer must warn that tool calls were not preserved: {content:?}",
+        );
+    }
+
+    // Single tool call uses singular phrasing — "1 tool call ran" not
+    // "1 tool calls ran". Tiny but the LLM is reading this verbatim.
+    #[test]
+    fn capture_partial_on_abort_trailer_handles_singular_tool_call() {
+        let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
+        let mut buf = String::from("Running tests now");
+        capture_partial_on_abort(&mut buf, &mut session, "Esc", 1);
+        let content = &session.messages.last().unwrap().content;
+        assert!(
+            content.contains("1 tool call ran"),
+            "expected singular phrasing for 1 tool call: {content:?}",
+        );
+        assert!(
+            !content.contains("1 tool calls ran"),
+            "leaked plural for singular case: {content:?}",
+        );
+    }
+
+    // The token accumulator on the abort path keeps `total_tokens`
+    // in sync with `total_estimated_tokens`. Both fields are
+    // TODO(cost-tracking) placeholders today but the inconsistency
+    // between Done/Interjected (which both update total_tokens) and
+    // abort (which didn't) made the abort case look like the agent
+    // produced zero tokens that turn.
+    #[test]
+    fn capture_partial_on_abort_keeps_total_tokens_in_sync() {
+        let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
+        let baseline_total = session.total_tokens;
+        let baseline_est = session.total_estimated_tokens;
+        let mut buf = String::from(
+            "A reasonably long partial response that should produce a non-zero token estimate.",
+        );
+        capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C", 0);
+        // Both fields advanced by the same amount (the stashed
+        // message's estimated_tokens). Without the parity fix, only
+        // total_estimated_tokens moved.
+        assert!(
+            session.total_estimated_tokens > baseline_est,
+            "total_estimated_tokens should advance on stash",
+        );
+        assert_eq!(
+            session.total_tokens.saturating_sub(baseline_total),
+            session.total_estimated_tokens.saturating_sub(baseline_est),
+            "total_tokens must advance in lockstep with total_estimated_tokens",
+        );
     }
 
     // Regression H1: lifecycle line for a failed task previously embedded the

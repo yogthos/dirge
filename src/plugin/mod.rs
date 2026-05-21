@@ -1337,6 +1337,121 @@ mod tests {
         assert!(out.contains(&"from-beta".to_string()));
     }
 
+    /// Multi-line and tab-containing Janet error messages must not
+    /// break the `level\tmsg\n` notification format. drain_notifications
+    /// splits on `\n` per entry and on the first `\t` per level/msg,
+    /// so embedded control chars would corrupt parsing — show up as
+    /// truncated entries and orphaned "malformed" lines. The catch
+    /// arm now sanitizes via `string/replace-all` before the push.
+    #[test]
+    fn dispatch_sanitizes_multi_line_and_tab_in_hook_errors() {
+        let path = tmpfile(
+            "multiline-err",
+            r#"(defn on-prompt [ctx] (error "line one\nline two\tline three"))"#,
+        );
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let _ = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        let pending = mgr.drain_notifications();
+
+        // Exactly one entry, even though the error contained both \n
+        // and \t. Without sanitization the multi-line error would
+        // either produce multiple malformed entries (one per source
+        // line) or split level/msg incorrectly at the embedded tab.
+        let err_entries: Vec<_> = pending.iter().filter(|(lvl, _)| lvl == "error").collect();
+        assert_eq!(err_entries.len(), 1, "got entries: {:?}", pending);
+        let (_, msg) = err_entries[0];
+        assert!(msg.contains("line one"), "msg missing 'line one': {msg}");
+        assert!(msg.contains("line two"), "msg missing 'line two': {msg}");
+        assert!(
+            msg.contains("line three"),
+            "msg missing 'line three': {msg}"
+        );
+        // The msg field on the *Rust side* has already been split out
+        // of the wire format, so newlines/tabs inside it would only
+        // appear if our Janet sanitization missed them. Assert none.
+        assert!(!msg.contains('\n'), "msg leaked '\\n': {msg:?}");
+        assert!(!msg.contains('\t'), "msg leaked '\\t': {msg:?}");
+    }
+
+    /// Consecutive identical hook errors (e.g. a buggy
+    /// on-message-update firing ~16x per response) must dedupe into a
+    /// single notification with a repeat-count suffix instead of
+    /// flooding the chat with 50+ identical banners.
+    #[test]
+    fn dispatch_dedupes_consecutive_identical_hook_errors() {
+        let path = tmpfile(
+            "repeat-err",
+            r#"(defn on-prompt [ctx] (error "always the same"))"#,
+        );
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        for _ in 0..50 {
+            let _ = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        }
+        let pending = mgr.drain_notifications();
+
+        let err_entries: Vec<_> = pending.iter().filter(|(lvl, _)| lvl == "error").collect();
+        // At most 2 entries (the first push + a "repeated N times"
+        // summary that flushes on drain). Definitely not 50.
+        assert!(
+            err_entries.len() <= 2,
+            "expected dedup (≤2 error entries); got {}: {:?}",
+            err_entries.len(),
+            pending,
+        );
+        let combined: String = err_entries
+            .iter()
+            .map(|(l, m)| format!("{l}\t{m}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            combined.contains("always the same"),
+            "msg dropped: {combined}",
+        );
+        // The repeat-count summary must mention the number.
+        assert!(
+            combined.contains("repeated") && combined.contains("50"),
+            "expected repeat-count summary mentioning 50; got: {combined}",
+        );
+    }
+
+    /// Distinct hook errors must NOT be deduped — only consecutive
+    /// identical ones. A "B-error after A-error" should produce two
+    /// notifications, not one collapsed into the other.
+    #[test]
+    fn dispatch_distinct_hook_errors_are_not_deduped() {
+        let path_a = tmpfile(
+            "distinct-err-a",
+            r#"(defn on-prompt [ctx] (error "alpha error"))"#,
+        );
+        let path_b = tmpfile(
+            "distinct-err-b",
+            r#"(defn on-response [ctx] (error "beta error"))"#,
+        );
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &path_a).unwrap();
+        super::load_plugin(&mut mgr, &path_b).unwrap();
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let _ = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        let _ = mgr.dispatch("on-response", "@{:response \"y\"}").unwrap();
+        let pending = mgr.drain_notifications();
+
+        let combined: String = pending
+            .iter()
+            .map(|(l, m)| format!("{l}\t{m}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(combined.contains("alpha"), "alpha missing: {combined}");
+        assert!(combined.contains("beta"), "beta missing: {combined}");
+    }
+
     /// A hook that throws is caught: dispatch continues (no panic,
     /// no propagated error to the caller), `nil` is the effective
     /// return value (filtered out of the results vec), AND the
@@ -1712,16 +1827,17 @@ impl PluginManager {
             let code = format!(
                 r#"(try (do (def ctx {ctx}) ({fname} ctx))
                        ([err fib]
-                         (set harness-notif-list
-                              (string harness-notif-list
-                                      "error\t[plugin] hook "
-                                      {hook_lit}
-                                      "."
-                                      {fname_lit}
-                                      " errored: "
-                                      err
-                                      "\n"))
-                         (string "DIRGE_HOOK_ERR:" err)))"#,
+                         (do
+                           (def sanitized
+                             (harness/sanitize-hook-err
+                               (string "[plugin] hook "
+                                       {hook_lit}
+                                       "."
+                                       {fname_lit}
+                                       " errored: "
+                                       err)))
+                           (harness/push-hook-err sanitized)
+                           (string "DIRGE_HOOK_ERR:" err))))"#,
                 ctx = context_janet,
                 fname = name,
                 hook_lit = format!("\"{}\"", escape_janet_string(hook)),
@@ -1922,6 +2038,29 @@ impl PluginManager {
     /// renders entries as colored chat lines. Returns an empty Vec when
     /// no plugin has posted anything.
     pub fn drain_notifications(&mut self) -> Vec<(String, String)> {
+        // Flush any pending hook-error dedup count BEFORE reading
+        // `harness-notif-list`. If a hook errored 50 times in a row,
+        // the first error is already on the list and the next 49
+        // got coalesced into `harness-last-hook-err-count`. The
+        // flush appends a single "(repeated 49 times)" entry so the
+        // count shows up in the next drain instead of being lost.
+        // Resets the dedup slots regardless so a future drain
+        // starts fresh.
+        let _ = self.worker.eval(
+            r#"(do
+                 (when (and harness-last-hook-err-msg
+                            (> harness-last-hook-err-count 1))
+                   (set harness-notif-list
+                        (string harness-notif-list
+                                "error\t"
+                                harness-last-hook-err-msg
+                                " (repeated "
+                                harness-last-hook-err-count
+                                " times)\n")))
+                 (set harness-last-hook-err-msg nil)
+                 (set harness-last-hook-err-count 0))"#,
+        );
+
         let raw = match self.worker.eval("harness-notif-list") {
             Ok(s) => s,
             Err(_) => return Vec::new(),

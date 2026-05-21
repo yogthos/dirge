@@ -112,6 +112,57 @@ const HARNESS_INIT: &str = r#"
       (set harness-notif-list
            (string harness-notif-list lvl "\t" msg "\n")))))
 
+# Hook-error dedup slots. `harness-last-hook-err-msg` is the most
+# recently pushed sanitized hook-error message; `harness-last-hook-err-count`
+# is how many consecutive identical errors followed it. When a
+# DIFFERENT error arrives (or any other notification fires), the
+# count is flushed as a "(repeated N times)" entry. Drained alongside
+# the regular notif list. See `harness/push-hook-err` below + the
+# Rust-side dispatch wrapper in `plugin/mod.rs::dispatch`.
+(var harness-last-hook-err-msg nil)
+(var harness-last-hook-err-count 0)
+
+# Sanitize a hook-error message for the `level\tmsg\n` wire format.
+# Embedded tabs become spaces (so they don't get parsed as a second
+# `level` field) and newlines become ` | ` (so a multi-line Janet
+# stack trace stays on one notification entry).
+#
+# `string/replace-all` takes args as (patt subst str), so threading
+# with `->` (first-position) would pass the wrong arg as the
+# subject. Explicit nesting from inside out is the safest spelling.
+(defn harness/sanitize-hook-err [s]
+  (string/replace-all
+    "\n" " | "
+    (string/replace-all
+      "\r\n" " | "
+      (string/replace-all "\t" " " (string s)))))
+
+# Push a hook error onto the notif list, deduplicating consecutive
+# identical messages. The catch arm in dispatch calls this rather
+# than appending directly so a buggy on-message-update hook can't
+# flood the chat with thousands of identical banners.
+(defn harness/push-hook-err [sanitized-msg]
+  (if (= sanitized-msg harness-last-hook-err-msg)
+    # Same as last — increment in place; do not push.
+    (set harness-last-hook-err-count (+ harness-last-hook-err-count 1))
+    # Different message (or first one). If the previous one had
+    # been repeated, flush its summary now; then push the new msg
+    # and reset the dedup state.
+    (do
+      (when (and harness-last-hook-err-msg
+                 (> harness-last-hook-err-count 1))
+        (set harness-notif-list
+             (string harness-notif-list
+                     "error\t"
+                     harness-last-hook-err-msg
+                     " (repeated "
+                     harness-last-hook-err-count
+                     " times)\n")))
+      (set harness-notif-list
+           (string harness-notif-list "error\t" sanitized-msg "\n"))
+      (set harness-last-hook-err-msg sanitized-msg)
+      (set harness-last-hook-err-count 1))))
+
 # Plugin entries on the session timeline. Plugins call
 # (harness/append-entry type data &opt display) to record
 # bookmarks, telemetry, or custom state that should survive
