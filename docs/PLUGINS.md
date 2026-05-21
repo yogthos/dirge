@@ -456,27 +456,42 @@ State persists for the life of the session — survives between turns.
   freely.
 - **Janet errors** in a hook are caught (so a broken hook can never
   crash the host or block other plugins from dispatching), and the
-  error is emitted via the structured logger as a `warn`-level event
-  with target `dirge::plugin` so it shows up under
-  `RUST_LOG=dirge::plugin=warn dirge ...` or under the catch-all
-  `RUST_LOG=warn`. The error line/file from Janet's stack appears in
-  the message. The hook's return value is treated as `nil` (i.e. no
-  effect on the host) and dispatch continues to the next plugin.
+  error surfaces in TWO places:
 
-  **Why "log-and-continue" rather than "abort the turn"**: a single
-  misbehaving plugin shouldn't be able to wedge the user out of their
-  session. This matches how opencode handles plugin errors
-  (`log.error("plugin config hook failed", { error })` then
-  `Effect.ignore`). pi is a step further and emits a structured
-  `ExtensionError` event the host UI can render as a chat
-  notification — dirge stops short of that today (a plugin gets no
-  user-visible signal beyond the log) but the structured log payload
-  makes it straightforward to wire later.
+  1. **Chat banner** — a red `[plugin] hook <hook>.<fn> errored:
+     <message>` notification appears at the next loop tick (drained
+     out of `harness-notif-list` like a regular `harness/notify`
+     `:error` call). The user sees it inline with the chat without
+     having to know about logs.
+  2. **Structured log** — a `tracing::warn!` with target
+     `dirge::plugin` and fields `hook` / `function` / `error`.
+     Visible via `dirge --verbose` (or
+     `RUST_LOG=dirge::plugin=warn`). Includes the Janet stack line
+     so you can jump straight to the offending form.
 
-  **Implication for plugin authors**: if your hook isn't taking
-  effect, run dirge with `RUST_LOG=dirge::plugin=warn` and look for
-  `plugin hook errored — continuing dispatch` lines. Don't expect
-  the chat to surface plugin errors automatically.
+  The hook's return value is treated as `nil` (no effect on the
+  host) and dispatch continues to the next plugin.
+
+  **Why "log + notify + continue" rather than "abort the turn"**: a
+  single misbehaving plugin shouldn't be able to wedge the user out
+  of their session. The two-surface approach is modeled on pi's
+  `ExtensionError` flow (see
+  `packages/coding-agent/src/core/extensions/runner.ts` —
+  `emitError` calls registered listeners, hosts wire
+  `onError: (e) => ctx.ui.notify("Compaction failed: ...", "error")`).
+  opencode logs only (`log.error("plugin config hook failed", …)`
+  in `packages/opencode/src/plugin/index.ts`); dirge does both so
+  plugin authors get the visible signal without having to enable
+  logs.
+
+  **Quick debugging recipe**:
+  - Notice the red `[plugin] hook X.Y errored: ...` in the chat?
+    Your plugin's `Y` hook threw. The message is the Janet error.
+  - Run with `dirge --verbose` for the full Rust-side log including
+    `dirge::plugin` warn events plus dirge's own debug-level traces.
+  - Use `(harness/log "...")` from inside your hook to add ad-hoc
+    breadcrumbs — these appear in the same `dirge::plugin` log
+    stream when verbose mode is on.
 - **Hook didn't fire?** Double-check the function name matches the
   hook reference exactly — `on_prompt` (underscore) is a different
   symbol than `on-prompt`.

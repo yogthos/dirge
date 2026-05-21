@@ -59,6 +59,13 @@ pub struct Cli {
     pub no_color: bool,
 
     #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Enable verbose logging (debug for dirge, warn for plugin hooks; equivalent to RUST_LOG=dirge=debug,dirge::plugin=warn). RUST_LOG env takes precedence if set."
+    )]
+    pub verbose: bool,
+
+    #[arg(
         long = "restrictive",
         short = 'R',
         help = "Default all tools to ask for approval"

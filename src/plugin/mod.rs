@@ -1337,6 +1337,38 @@ mod tests {
         assert!(out.contains(&"from-beta".to_string()));
     }
 
+    /// A hook that throws is caught: dispatch continues (no panic,
+    /// no propagated error to the caller), `nil` is the effective
+    /// return value (filtered out of the results vec), AND the
+    /// error is pushed onto `harness-notif-list` with `error`
+    /// level so the next drain surfaces a chat-visible notification
+    /// — pi-style behavior layered on top of the structured
+    /// tracing::warn already emitted on the Rust side.
+    #[test]
+    fn dispatch_chat_surfaces_hook_errors_via_notification_queue() {
+        let path = tmpfile("errored-hook", r#"(defn on-prompt [ctx] (error "boom"))"#);
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // Dispatch must NOT propagate the error — the host should
+        // continue regardless of a broken plugin.
+        let out = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        // Hook returned nil after the catch, so no results.
+        assert!(out.is_empty(), "errored hook should produce no result");
+
+        // The error landed on the notification queue and shows up
+        // in the next drain as an `error`-level entry.
+        let pending = mgr.drain_notifications();
+        assert!(
+            pending.iter().any(|(level, msg)| level == "error"
+                && msg.contains("on-prompt")
+                && msg.contains("boom")),
+            "expected an error notification mentioning on-prompt and boom; got: {:?}",
+            pending,
+        );
+    }
+
     /// A directory plugin loads every `*.janet` file inside in
     /// alphabetical order. The stem is the directory name; multi-file
     /// plugins share the same Janet env so files can collaborate.
@@ -1660,24 +1692,40 @@ impl PluginManager {
         for name in &names {
             // Wrap the call so plugin runtime errors don't print
             // Janet stack traces to stderr OR vanish silently. On
-            // error, format the message as `DIRGE_HOOK_ERR:<msg>`
-            // so the Rust side can pick it out and emit a
-            // `tracing::warn!` (visible via RUST_LOG=warn).
+            // error, the catch arm does TWO things:
+            //   1. Push an entry onto `harness-notif-list` with
+            //      `error` level so the next drain surfaces a
+            //      chat-visible "[plugin] hook X.Y errored: ..."
+            //      banner (pi-style — see
+            //      `packages/coding-agent/src/core/extensions/runner.ts`
+            //      which emits structured `ExtensionError` events
+            //      the host renders as `ctx.ui.notify("...","error")`).
+            //   2. Return `DIRGE_HOOK_ERR:<msg>` so the Rust side
+            //      can also log a structured `tracing::warn!` —
+            //      surfaces via `--verbose` or `RUST_LOG=warn`.
             //
-            // Prior behavior: pure `(try ... ([err fib] nil))` which
-            // swallowed errors entirely. Plugin authors got no
-            // feedback on broken hooks — strictly worse than both
-            // opencode (`log.error("plugin config hook failed", …)`
-            // in `packages/opencode/src/plugin/index.ts`) and pi
-            // (which emits structured `ExtensionError` events the
-            // host UI can render — see
-            // `packages/coding-agent/src/core/extensions/runner.ts`).
-            // dirge now mirrors opencode's behavior: log structured,
-            // continue dispatch.
+            // Prior behavior (now retired): pure
+            // `(try ... ([err fib] nil))` which swallowed errors
+            // entirely. Plugin authors got no feedback on broken
+            // hooks. opencode logged but didn't notify; pi notified.
+            // dirge now does both.
             let code = format!(
-                r#"(try (do (def ctx {ctx}) ({fname} ctx)) ([err fib] (string "DIRGE_HOOK_ERR:" err)))"#,
+                r#"(try (do (def ctx {ctx}) ({fname} ctx))
+                       ([err fib]
+                         (set harness-notif-list
+                              (string harness-notif-list
+                                      "error\t[plugin] hook "
+                                      {hook_lit}
+                                      "."
+                                      {fname_lit}
+                                      " errored: "
+                                      err
+                                      "\n"))
+                         (string "DIRGE_HOOK_ERR:" err)))"#,
                 ctx = context_janet,
                 fname = name,
+                hook_lit = format!("\"{}\"", escape_janet_string(hook)),
+                fname_lit = format!("\"{}\"", escape_janet_string(name)),
             );
             if let Ok(s) = self.eval(&code) {
                 if let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:") {

@@ -185,14 +185,25 @@ fn compile_lsp_commands(cfg: &config::Config) -> std::collections::HashMap<Strin
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    let cli = cli::Cli::parse();
+
+    // Tracing filter precedence: RUST_LOG (always wins) > --verbose
+    // (debug for dirge + warn for plugin hooks) > default
+    // (warn, rig silenced). `--verbose` exists primarily so plugin
+    // authors can see hook-error logs without having to know the
+    // RUST_LOG syntax. Logs go to stderr; the interactive TUI
+    // captures stdout but leaves stderr passthrough.
+    let default_filter = if cli.verbose {
+        "dirge=debug,dirge::plugin=warn,rig=off"
+    } else {
+        "warn,rig=off"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,rig=off")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
         .init();
-
-    let cli = cli::Cli::parse();
     let cfg = config::load();
     // Initialize the global UI theme before any rendering happens. The
     // theme is global state; setting it once at boot keeps every

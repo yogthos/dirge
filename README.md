@@ -94,6 +94,11 @@ dirge --provider deepseek  # defaults to deepseek-v4-pro
 
 export GLM_API_KEY="..."
 dirge --provider glm       # defaults to glm-4
+
+# Verbose mode — debug-level dirge logs + warn-level plugin hook
+# errors (useful when authoring a plugin or filing a bug report).
+# RUST_LOG env still takes precedence if set.
+dirge --verbose
 ```
 
 ## Slash commands
