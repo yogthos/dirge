@@ -155,7 +155,11 @@ impl Tool for GlobTool {
         let walker = WalkBuilder::new(root)
             // Hide dotfiles by default. See `FindFilesArgs::include_hidden`.
             .hidden(!args.include_hidden)
-            .git_global(false)
+            // Honor the user's global `~/.gitignore` to match the
+            // behavior of grep / find_files / list_dir. Previously
+            // glob set this to `false`, silently surfacing files
+            // the user had globally excluded.
+            .git_global(true)
             .git_ignore(true)
             .git_exclude(true)
             .build();
