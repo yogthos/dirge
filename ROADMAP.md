@@ -198,42 +198,55 @@ actual issue.
 
 | Phase | Description | Size | Source |
 |---|---|---|---|
-| 📋 F1 | **ACP permission asks silently dropped.** `extras/acp/mod.rs:287` builds `(ask_tx, _ask_rx)` and immediately drops `ask_rx`. Tools needing `Ask` confirmation in ACP mode time out at 30s with no notification. Tools requiring permission cannot run from a Zed/editor client. | MEDIUM | opencode permission dispatch via SessionBus |
-| 📋 F2 | **Hidden files exposed by `find_files` / `glob` / `list_dir`.** All three set `.hidden(false)` on the ignore walker. Agents reading the filesystem see `.env`, `.git/`, `.DS_Store` and silently pick them up in greps/listings — security + privacy leak. | SMALL | pi + opencode default to hidden-skip; opt-in only |
+| ✅ F1 | **ACP permission asks silently dropped.** `extras/acp/mod.rs:287` builds `(ask_tx, _ask_rx)` and immediately drops `ask_rx`. Tools needing `Ask` confirmation in ACP mode time out at 30s with no notification. Tools requiring permission cannot run from a Zed/editor client. | MEDIUM | opencode permission dispatch via SessionBus |
+| ✅ F2 | **Hidden files exposed by `find_files` / `glob` / `list_dir`.** All three set `.hidden(false)` on the ignore walker. Agents reading the filesystem see `.env`, `.git/`, `.DS_Store` and silently pick them up in greps/listings — security + privacy leak. | SMALL | pi + opencode default to hidden-skip; opt-in only |
 
 ### F-HIGH — real correctness gaps
 
 | Phase | Description | Size | Source |
 |---|---|---|---|
-| 📋 F3 | **Compress cut-point can split a tool_use/tool_result pair.** `handle_compress` (`ui/slash.rs:93-101`) does a reverse token-budget scan but doesn't check whether the cut-boundary message has `Interrupted` / pending tool calls. After compress the LLM may see an orphan `tool_use` block. | MEDIUM | opencode `splitTurn` (`compaction.ts:161-184`) respects turn boundaries |
-| 📋 F4 | **`read` capped at 10MB with no streaming.** `read.rs:98` does `read_to_string()` whole-file; refuses anything bigger. Large logs / generated files fail. | MEDIUM | opencode `read.ts:119-150` streams + early-terminates; pi `read.ts:215-328` smart-truncates |
-| 📋 F5 | **ACP parallel tool calls lose id correlation.** `acp/mod.rs:229-231` uses a single `last_tool_call_id`. Two parallel tool calls + two results → only the second pairs correctly; the first becomes an orphan with an empty id. | SMALL | opencode tracks callID on each ToolPart |
-| 📋 F6 | **Bash has no process-group cleanup on timeout/abort.** `bash.rs:76-87` spawns via tokio `.output()` without `setpgid`. Timeout kills only the parent; subprocess tree orphans. | MEDIUM | pi `bash.ts:76-81` uses `detached: true` + `killProcessTree(pid)` |
-| 📋 F7 | **Permission `check_path` doesn't canonicalize symlinks.** `resolve_absolute` (`checker.rs:370-376`) joins paths but doesn't follow symlinks. Symlink to `/etc` bypasses `/etc/**` deny. | SMALL | symlink-aware canonicalize at check time |
-| 📋 F8 | **No session schema versioning / corruption recovery.** `storage.rs::load_session` deserializes raw JSON; one truncated byte breaks the whole session. No migration path for schema bumps. | MEDIUM | opencode versions message metadata; pi has explicit migration fns |
-| 📋 F9 | **Mid-stream decode failure suppresses retry when `had_tool_calls=true`.** `runner.rs:418-427` skips retry if any tool ran. But "tool dispatched, result pending, stream died mid-decode" is the case we DO want to retry — the result event never arrived. | MEDIUM | pi distinguishes "tool dispatched + result received" from "tool dispatched + still pending" |
-| 📋 F10 | **Bash fallback splitter (no `semantic-bash` feature) doesn't respect quotes.** `bash.rs:145-163` splits `;`/`&&`/`||` literally. `echo "; rm -rf /"` splits inside the quoted string. Default builds have `semantic-bash` enabled so this only affects `--no-default-features`. | SMALL (mandate semantic-bash) | opencode arity tokenizer handles quotes |
+| ✅ F3 | **Compress cut-point can split a tool_use/tool_result pair.** `handle_compress` (`ui/slash.rs:93-101`) does a reverse token-budget scan but doesn't check whether the cut-boundary message has `Interrupted` / pending tool calls. After compress the LLM may see an orphan `tool_use` block. | MEDIUM | opencode `splitTurn` (`compaction.ts:161-184`) respects turn boundaries |
+| ✅ F4 | **`read` capped at 10MB with no streaming.** `read.rs:98` does `read_to_string()` whole-file; refuses anything bigger. Large logs / generated files fail. | MEDIUM | opencode `read.ts:119-150` streams + early-terminates; pi `read.ts:215-328` smart-truncates |
+| ✅ F5 | **ACP parallel tool calls lose id correlation.** `acp/mod.rs:229-231` uses a single `last_tool_call_id`. Two parallel tool calls + two results → only the second pairs correctly; the first becomes an orphan with an empty id. | SMALL | opencode tracks callID on each ToolPart |
+| ✅ F6 | **Bash has no process-group cleanup on timeout/abort.** `bash.rs:76-87` spawns via tokio `.output()` without `setpgid`. Timeout kills only the parent; subprocess tree orphans. | MEDIUM | pi `bash.ts:76-81` uses `detached: true` + `killProcessTree(pid)` |
+| ✅ F7 | **Permission `check_path` doesn't canonicalize symlinks.** `resolve_absolute` (`checker.rs:370-376`) joins paths but doesn't follow symlinks. Symlink to `/etc` bypasses `/etc/**` deny. | SMALL | symlink-aware canonicalize at check time |
+| ✅ F8 | **No session schema versioning / corruption recovery.** `storage.rs::load_session` deserializes raw JSON; one truncated byte breaks the whole session. No migration path for schema bumps. | MEDIUM | opencode versions message metadata; pi has explicit migration fns |
+| 🚫 F9 | **Mid-stream decode failure suppresses retry when `had_tool_calls=true`.** `runner.rs:418-427` skips retry if any tool ran. But "tool dispatched, result pending, stream died mid-decode" is the case we DO want to retry — the result event never arrived. | MEDIUM | pi distinguishes "tool dispatched + result received" from "tool dispatched + still pending" |
+| ✅ F10 | **Bash fallback splitter (no `semantic-bash` feature) doesn't respect quotes.** `bash.rs:145-163` splits `;`/`&&`/`||` literally. `echo "; rm -rf /"` splits inside the quoted string. Default builds have `semantic-bash` enabled so this only affects `--no-default-features`. | SMALL (mandate semantic-bash) | opencode arity tokenizer handles quotes |
 
 ### F-MEDIUM — robustness + edge cases
 
 | Phase | Description | Size | Source |
 |---|---|---|---|
-| 📋 F11 | **`edit` allows in-call overlapping ranges.** Multi-region replace doesn't check that two `old_text` substrings don't overlap. Order-of-application matters; user is expected to know. | SMALL | pi `edit.ts:31-50` rejects overlaps in schema |
-| 📋 F12 | **Bash output is sequential, not interleaved.** `bash.rs:89-102` reads stdout then stderr and concatenates. Time-order lost. | SMALL | pi streams both via `onData()` |
-| 📋 F13 | **Compress token math can report negative net savings.** When new summary > replaced messages, `compress_reporting` still reports "saved N tokens" misleadingly. | SMALL | opencode validates `tail+summary` fits budget before issuing call |
-| 📋 F14 | **`Retry-After` provider header ignored.** `recovery.rs:38-48` uses fixed exponential backoff regardless of what the API asked. Anthropic + OpenAI send retry-after. | SMALL | opencode reads `retry-after-ms` header |
-| 📋 F15 | **`capture_partial_on_abort` doesn't distinguish failed vs interrupted tools.** Tool entries that errored stay `Interrupted` instead of `Failed`. `convert_history` emits different text per state, so the LLM sees "interrupted" when it should see the error. | SMALL | opencode `finalizeInterruptedAssistant` preserves tool state |
-| 📋 F16 | **Plugin load order is lexicographic, undocumented.** Multi-file plugin directories sort by filename. Author renames trigger silent order changes. | SMALL | document + recommend numeric prefixes (`00-`); future C3 manifest |
-| 📋 F17 | **Plugin context mutability across hooks not documented.** `dispatch_tool_hook` clears slots before the loop, so hook B sees hook A's mutations. Intentional but undocumented. | SMALL | doc comment |
-| 📋 F18 | **No relative-path normalization in `is_external_path`.** `checker.rs:334-341` returns `false` for relative paths. In `Accept` mode, `../../etc/passwd` bypasses external_directory rules. | SMALL | normalize via `resolve_absolute` first |
-| 📋 F19 | **`read` doesn't strip UTF-8 BOM.** Old Windows files render as invisible-byte-prefix in the LLM context. | SMALL | opencode `Bom.readFile()` detects + strips |
-| 📋 F20 | **Unbounded interjection channel.** `mpsc::UnboundedSender<()>` accumulates if user types ahead of the runner. Only the first wakeup matters; channel grows. | SMALL | switch to bounded(64) with `try_send` |
+| 🚫 F11 | **`edit` allows in-call overlapping ranges.** Multi-region replace doesn't check that two `old_text` substrings don't overlap. Order-of-application matters; user is expected to know. | SMALL | pi `edit.ts:31-50` rejects overlaps in schema |
+| ✅ F12 | **Bash output is sequential, not interleaved.** `bash.rs:89-102` reads stdout then stderr and concatenates. Time-order lost. | SMALL | pi streams both via `onData()` |
+| ✅ F13 | **Compress token math can report negative net savings.** When new summary > replaced messages, `compress_reporting` still reports "saved N tokens" misleadingly. | SMALL | opencode validates `tail+summary` fits budget before issuing call |
+| ✅ F14 | **`Retry-After` provider header ignored.** `recovery.rs:38-48` uses fixed exponential backoff regardless of what the API asked. Anthropic + OpenAI send retry-after. | SMALL | opencode reads `retry-after-ms` header |
+| 🚫 F15 | **`capture_partial_on_abort` doesn't distinguish failed vs interrupted tools.** Tool entries that errored stay `Interrupted` instead of `Failed`. `convert_history` emits different text per state, so the LLM sees "interrupted" when it should see the error. | SMALL | opencode `finalizeInterruptedAssistant` preserves tool state |
+| ✅ F16 | **Plugin load order is lexicographic, undocumented.** Multi-file plugin directories sort by filename. Author renames trigger silent order changes. | SMALL | document + recommend numeric prefixes (`00-`); future C3 manifest |
+| ✅ F17 | **Plugin context mutability across hooks not documented.** `dispatch_tool_hook` clears slots before the loop, so hook B sees hook A's mutations. Intentional but undocumented. | SMALL | doc comment |
+| ✅ F18 | **No relative-path normalization in `is_external_path`.** `checker.rs:334-341` returns `false` for relative paths. In `Accept` mode, `../../etc/passwd` bypasses external_directory rules. | SMALL | normalize via `resolve_absolute` first |
+| ✅ F19 | **`read` doesn't strip UTF-8 BOM.** Old Windows files render as invisible-byte-prefix in the LLM context. | SMALL | opencode `Bom.readFile()` detects + strips |
+| ✅ F20 | **Unbounded interjection channel.** `mpsc::UnboundedSender<()>` accumulates if user types ahead of the runner. Only the first wakeup matters; channel grows. | SMALL | switch to bounded(64) with `try_send` |
 
-### F-SKIP — verified false positives or design choices
+### F-SKIP — verified false positives, design choices, or N/A
 
 Came back from the surveys but NOT real issues after verification.
 Documented here so future audits don't re-raise:
 
+- **🚫 F9 — Mid-stream decode retry**: rig dispatches tools
+  synchronously inside its stream loop. By the time we observe
+  `ToolCall`, side effects are applied; retry would re-execute.
+  `had_tool_calls=true → no retry` is the correct safe behavior.
+- **🚫 F11 — Edit overlap detection**: dirge's edit tool is
+  single-region (one `old_text` / `new_text` per call). The
+  overlap concern applies to the future multi-file atomic edit
+  (Track A3), not the current tool.
+- **🚫 F15 — Failed vs Interrupted tool state**: rig's
+  `ToolResult` has no `is_error` field; dirge can't reliably
+  distinguish "tool ran and returned error text" from "tool ran
+  successfully" without heuristic string-sniffing. Error text
+  still reaches the LLM via `Completed{result=error_text}`.
 - **System message position violation**: dirge already prepends the
   compaction summary as the single System message at index 0;
   `convert_history` loops from `first_kept` (typically 1).
@@ -251,12 +264,15 @@ Documented here so future audits don't re-raise:
 - **Empty / consecutive assistant messages**: rig filters before
   `convert_history` sees them.
 
-### Ordering recommendation
+### Status
 
-Ship F1 + F2 first (CRITICAL — one functional break in ACP mode,
-one security leak). Then F3–F10 (HIGH) as a single audit-fix PR
-series, one phase per PR with TDD per CLAUDE.md global. F11–F20
-(MEDIUM) batched into a second wave.
+All actionable Track F items shipped:
+
+- F1 / F2 (CRITICAL): PRs #76, #77.
+- F3 / F4 / F5 / F6 / F7 / F8 / F10 (HIGH): PRs #78–#84.
+- F12 / F13 / F14 / F16 / F17 / F18 / F19 / F20 (MEDIUM):
+  PRs #85, #86, #87, #89, #90, #91.
+- F9 / F11 / F15: verified false positives / N/A — see F-SKIP.
 
 ## Ideas queue (re-evaluate before scheduling)
 
