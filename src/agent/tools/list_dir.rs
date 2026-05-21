@@ -76,6 +76,10 @@ impl Tool for ListDirTool {
                     "path": {
                         "type": "string",
                         "description": "Directory path (defaults to current working directory)"
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "description": "Include dotfiles (.env, .gitignore, etc.) in the listing. Default false to avoid surfacing secrets and config files."
                     }
                 },
                 "required": []
@@ -87,7 +91,7 @@ impl Tool for ListDirTool {
         let path = args.path.as_deref().unwrap_or(".");
         check_perm_path(&self.permission, &self.ask_tx, "list_dir", path).await?;
 
-        let cache_key = format!("list_dir:{}", path);
+        let cache_key = format!("list_dir:{}:hidden={}", path, args.include_hidden);
 
         if let Some(ref cache) = self.cache {
             if let Some(cached) = cache.get(&cache_key) {
@@ -100,7 +104,9 @@ impl Tool for ListDirTool {
             .git_global(true)
             .git_exclude(true)
             .require_git(false)
-            .hidden(false)
+            // Hide dotfiles by default to avoid leaking .env etc.
+            // into LLM context. See `FindFilesArgs::include_hidden`.
+            .hidden(!args.include_hidden)
             .max_depth(Some(1))
             .filter_entry(|entry| {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {

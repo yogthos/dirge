@@ -48,6 +48,10 @@ impl GlobTool {
 pub struct GlobArgs {
     pub pattern: String,
     pub path: Option<String>,
+    /// Include dotfiles in the walk. Default `false`. See the
+    /// equivalent doc on `FindFilesArgs::include_hidden`.
+    #[serde(default)]
+    pub include_hidden: bool,
 }
 
 fn glob_to_regex(pattern: &str) -> Result<regex::Regex, String> {
@@ -105,6 +109,10 @@ impl Tool for GlobTool {
                     "path": {
                         "type": "string",
                         "description": "Root directory to search in (default: current working directory)"
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "description": "Include dotfiles (.env, .gitignore, etc.). Default false to avoid surfacing secrets and config files."
                     }
                 },
                 "required": ["pattern"]
@@ -122,9 +130,10 @@ impl Tool for GlobTool {
         .await?;
 
         let cache_key = format!(
-            "glob:{}:{}",
+            "glob:{}:{}:hidden={}",
             args.pattern,
             args.path.as_deref().unwrap_or("."),
+            args.include_hidden,
         );
         if let Some(ref cache) = self.cache
             && let Some(cached) = cache.get(&cache_key)
@@ -144,7 +153,8 @@ impl Tool for GlobTool {
         let mut matches: Vec<(String, std::path::PathBuf)> = Vec::new();
 
         let walker = WalkBuilder::new(root)
-            .hidden(false)
+            // Hide dotfiles by default. See `FindFilesArgs::include_hidden`.
+            .hidden(!args.include_hidden)
             .git_global(false)
             .git_ignore(true)
             .git_exclude(true)
@@ -297,6 +307,7 @@ mod tests {
             .call(GlobArgs {
                 pattern: "**/*.rs".into(),
                 path: Some(tree.root_str()),
+                include_hidden: false,
             })
             .await
             .unwrap();
@@ -323,6 +334,7 @@ mod tests {
             .call(GlobArgs {
                 pattern: "**/*.nonexistent".into(),
                 path: Some(tree.root_str()),
+                include_hidden: false,
             })
             .await
             .unwrap();
@@ -348,6 +360,7 @@ mod tests {
             .call(GlobArgs {
                 pattern: "*.rs".into(),
                 path: Some(tree.root_str()),
+                include_hidden: false,
             })
             .await
             .unwrap();
@@ -372,6 +385,7 @@ mod tests {
             .call(GlobArgs {
                 pattern: "*.rs".into(),
                 path: Some(tree.root_str()),
+                include_hidden: false,
             })
             .await
             .unwrap();
@@ -399,5 +413,58 @@ mod tests {
         let re = glob_to_regex("*.rs").unwrap();
         assert!(re.is_match("main.rs"));
         assert!(!re.is_match("src/main.rs"));
+    }
+
+    /// F2: dotfiles must be skipped by default. `.env`, `.gitignore`,
+    /// `.DS_Store` etc. previously appeared in glob results,
+    /// risking secret leakage into the LLM context.
+    #[tokio::test]
+    async fn glob_skips_dotfiles_by_default() {
+        let tree = TempTree::new("hidden-default");
+        tree.write("main.rs", "");
+        tree.write(".env", "SECRET=hunter2");
+        tree.write(".gitignore", "target/");
+
+        let tool = GlobTool::new(None, None);
+        let out = tool
+            .call(GlobArgs {
+                pattern: "*".into(),
+                path: Some(tree.root_str()),
+                include_hidden: false,
+            })
+            .await
+            .unwrap();
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.contains(&"main.rs"), "main.rs missing: {out}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with('.')),
+            "dotfile leaked into default glob: {out}",
+        );
+    }
+
+    /// F2: setting `include_hidden: true` opts back in to seeing
+    /// dotfiles. The LLM uses this when it explicitly needs to
+    /// inspect `.gitignore`, `.env.example`, etc.
+    #[tokio::test]
+    async fn glob_includes_dotfiles_when_asked() {
+        let tree = TempTree::new("hidden-opt-in");
+        tree.write("main.rs", "");
+        tree.write(".gitignore", "target/");
+
+        let tool = GlobTool::new(None, None);
+        let out = tool
+            .call(GlobArgs {
+                pattern: "*".into(),
+                path: Some(tree.root_str()),
+                include_hidden: true,
+            })
+            .await
+            .unwrap();
+        assert!(out.contains("main.rs"), "main.rs missing: {out}");
+        assert!(
+            out.contains(".gitignore"),
+            "dotfile missing when opt-in: {out}"
+        );
     }
 }
