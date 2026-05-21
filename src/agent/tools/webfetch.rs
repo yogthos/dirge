@@ -31,10 +31,20 @@ fn html_to_markdown(html: &str) -> String {
     html2text::from_read(html.as_bytes(), 100).unwrap_or_else(|_| html.to_string())
 }
 
+/// True if `url` has an explicit `http://` or `https://` scheme,
+/// case-insensitively. URL schemes are case-insensitive per RFC
+/// 3986; checking only the lowercase form let `HTTP://...` and
+/// other case variants bypass scheme + SSRF defenses entirely.
+fn has_http_scheme(url: &str) -> bool {
+    let prefix = url.get(..7).map(str::to_ascii_lowercase);
+    let prefix8 = url.get(..8).map(str::to_ascii_lowercase);
+    matches!(prefix.as_deref(), Some("http://")) || matches!(prefix8.as_deref(), Some("https://"))
+}
+
 /// Normalize a URL. Respects explicit http:// (localhost, internal services).
 /// Only prepends https:// when no scheme is present.
 fn normalize_url(url: &str) -> String {
-    if url.starts_with("http://") || url.starts_with("https://") {
+    if has_http_scheme(url) {
         url.to_string()
     } else {
         format!("https://{}", url)
@@ -47,7 +57,7 @@ fn normalize_url(url: &str) -> String {
 /// explicit at the dirge boundary rather than relying on the HTTP
 /// client's policy.
 fn validate_url_scheme(url: &str) -> Result<(), String> {
-    if url.starts_with("http://") || url.starts_with("https://") {
+    if has_http_scheme(url) {
         Ok(())
     } else {
         Err(format!(
@@ -71,13 +81,18 @@ fn validate_url_host_safety(url: &str) -> Result<(), String> {
     if std::env::var("DIRGE_WEBFETCH_ALLOW_PRIVATE").as_deref() == Ok("1") {
         return Ok(());
     }
-    // Strip scheme to extract host. We don't pull in a URL parser
-    // crate here; webfetch's URL handling is already string-based
-    // and this is one more check at the boundary.
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
+    // Strip scheme to extract host. Case-insensitive — URL schemes
+    // are case-insensitive per RFC 3986, and an attacker using
+    // `HTTPS://1.2.3.4/` would otherwise skip past the strip and
+    // get the scheme treated as host text.
+    let scheme_len = if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
+        8
+    } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
+        7
+    } else {
+        0
+    };
+    let after_scheme = &url[scheme_len..];
     // Host extraction handles bracketed IPv6 (`[::1]`) before
     // falling back to the bare host:port form. Without the
     // bracket-aware path, `rsplit_once(':')` would chop `[::1]`
@@ -392,6 +407,26 @@ mod tests {
         assert!(validate_url_scheme("javascript:alert(1)").is_err());
         // Empty string also blocked.
         assert!(validate_url_scheme("").is_err());
+    }
+
+    /// Regression: scheme matching must be case-insensitive (RFC
+    /// 3986). Previously `starts_with("http://")` only matched
+    /// lowercase, so `HTTP://169.254.169.254` bypassed scheme
+    /// + SSRF defenses entirely.
+    #[test]
+    fn scheme_matching_is_case_insensitive() {
+        // Accepted forms.
+        assert!(validate_url_scheme("HTTP://example.com").is_ok());
+        assert!(validate_url_scheme("HTTPS://example.com").is_ok());
+        assert!(validate_url_scheme("Http://Example.Com").is_ok());
+        assert!(validate_url_scheme("HtTpS://x").is_ok());
+        // Rejected (no http/https scheme prefix).
+        assert!(validate_url_scheme("FILE:///etc/passwd").is_err());
+        // SSRF defense must still trigger for case-variant schemes.
+        if std::env::var("DIRGE_WEBFETCH_ALLOW_PRIVATE").as_deref() != Ok("1") {
+            assert!(validate_url_host_safety("HTTP://169.254.169.254/").is_err());
+            assert!(validate_url_host_safety("HTTPS://127.0.0.1/").is_err());
+        }
     }
 
     /// SSRF defense: AWS metadata + private + loopback + link-local

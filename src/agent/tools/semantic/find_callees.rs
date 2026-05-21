@@ -5,7 +5,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
 use crate::semantic::SymbolIndex;
 
 pub struct FindCalleesTool {
@@ -63,7 +63,9 @@ impl Tool for FindCalleesTool {
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {
-        check_perm(&self.permission, &self.ask_tx, "find_callees", &args.path).await?;
+        // `args.path` is a real file path; use the path-aware
+        // permission check so external_directory rules apply.
+        check_perm_path(&self.permission, &self.ask_tx, "find_callees", &args.path).await?;
 
         let file_path = PathBuf::from(&args.path);
 

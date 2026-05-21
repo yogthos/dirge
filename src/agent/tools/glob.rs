@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::agent::tools::MAX_FIND_RESULTS;
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm, check_perm_path};
 
 pub struct GlobTool {
     pub permission: Option<PermCheck>,
@@ -128,6 +128,11 @@ impl Tool for GlobTool {
             &format!("pattern:{}", args.pattern),
         )
         .await?;
+        // Path-side check: external_directory rules + Accept-mode
+        // working-dir gating live in check_perm_path. Without this
+        // a glob over `/etc` or `~/.ssh` skipped the rules entirely.
+        let perm_path = args.path.as_deref().unwrap_or(".");
+        check_perm_path(&self.permission, &self.ask_tx, "glob", perm_path).await?;
 
         let cache_key = format!(
             "glob:{}:{}:hidden={}",

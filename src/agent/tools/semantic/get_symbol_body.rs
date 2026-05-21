@@ -5,7 +5,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
 use crate::semantic::SymbolIndex;
 
 pub struct GetSymbolBodyTool {
@@ -63,7 +63,9 @@ impl Tool for GetSymbolBodyTool {
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {
-        check_perm(
+        // Path-aware check so external_directory rules apply —
+        // `args.path` is the real file path we'll read symbols from.
+        check_perm_path(
             &self.permission,
             &self.ask_tx,
             "get_symbol_body",

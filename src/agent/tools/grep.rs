@@ -5,7 +5,8 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, GrepArgs, MAX_GREP_RESULTS, PermCheck, ToolError, check_perm, is_skip_dir,
+    AskSender, GrepArgs, MAX_GREP_RESULTS, PermCheck, ToolError, check_perm, check_perm_path,
+    is_skip_dir,
 };
 
 pub struct GrepTool {
@@ -99,6 +100,13 @@ impl Tool for GrepTool {
 
     async fn call(&self, args: GrepArgs) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "grep", &args.pattern).await?;
+        // Path-side check: previously grep accepted any path
+        // (`grep("x", "/etc")`) because only the pattern was
+        // permission-checked. external_directory rules + the
+        // working-dir Accept-mode logic live in check_perm_path,
+        // so an extra call here closes the bypass.
+        let perm_path = args.path.as_deref().unwrap_or(".");
+        check_perm_path(&self.permission, &self.ask_tx, "grep", perm_path).await?;
 
         let cache_key = format!(
             "grep:{}:{}:{}:{}:hidden={}",

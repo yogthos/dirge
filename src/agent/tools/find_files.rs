@@ -5,7 +5,8 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, FindFilesArgs, MAX_FIND_RESULTS, PermCheck, ToolError, check_perm, is_skip_dir,
+    AskSender, FindFilesArgs, MAX_FIND_RESULTS, PermCheck, ToolError, check_perm, check_perm_path,
+    is_skip_dir,
 };
 
 pub struct FindFilesTool {
@@ -71,6 +72,11 @@ impl Tool for FindFilesTool {
 
     async fn call(&self, args: FindFilesArgs) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "find_files", &args.pattern).await?;
+        // Path-side check: external_directory rules + Accept-mode
+        // gating live in check_perm_path. Without this find_files
+        // over `/etc` skipped the rules entirely.
+        let perm_path = args.path.as_deref().unwrap_or(".");
+        check_perm_path(&self.permission, &self.ask_tx, "find_files", perm_path).await?;
 
         let cache_key = format!(
             "find_files:{}:{}:hidden={}",
