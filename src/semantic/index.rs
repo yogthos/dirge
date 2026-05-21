@@ -161,8 +161,13 @@ impl SymbolIndex {
             .hidden(false)
             .filter_entry(|entry| {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    // Share the central skip list with find_files /
+                    // glob / list_dir / grep — the previous inline
+                    // `matches!` only listed 4 dirs and diverged
+                    // silently from the canonical set in
+                    // `agent::tools::is_skip_dir`.
                     let name = entry.file_name().to_str().unwrap_or("");
-                    !matches!(name, "node_modules" | "target" | ".git" | "__pycache__")
+                    !crate::agent::tools::is_skip_dir(name)
                 } else {
                     true
                 }

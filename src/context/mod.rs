@@ -42,10 +42,24 @@ pub fn load(no_context_files: bool) -> ContextFiles {
 }
 
 fn load_file(path: &PathBuf) -> Option<String> {
-    if path.exists() {
-        std::fs::read_to_string(path).ok()
-    } else {
-        None
+    if !path.exists() {
+        return None;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(e) => {
+            // Previously the error was silently swallowed via `.ok()`
+            // — a permission-denied AGENTS.md looked the same as a
+            // missing file. Surface the path + reason at warn so
+            // users can investigate when context they expected is
+            // missing.
+            eprintln!(
+                "warning: failed to read context file {}: {}",
+                path.display(),
+                e,
+            );
+            None
+        }
     }
 }
 

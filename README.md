@@ -99,6 +99,11 @@ dirge --provider glm       # defaults to glm-4
 # errors (useful when authoring a plugin or filing a bug report).
 # RUST_LOG env still takes precedence if set.
 dirge --verbose
+
+# Pass an API key inline (one-off testing, CI). Prefer env vars
+# in production — `--api-key` is visible to other processes via
+# the process list (`ps`).
+dirge --provider openai --api-key sk-...
 ```
 
 ## Slash commands
@@ -284,7 +289,7 @@ When built with `--features "semantic,semantic-ts,semantic-python"`, dirge gains
 | `list_symbols` | List functions, classes, methods, interfaces, and type aliases in a file or project. Filter by kind. |
 | `get_symbol_body` | Full source of a named symbol via precise byte-range extraction. |
 | `find_definition` | Locate where a symbol is defined across the project. |
-| `find_callers` | Find all call sites of a function/method (word-boundary regex, excludes definition site). |
+| `find_callers` | Find all call sites of a function/method via the tree-sitter symbol index (word-boundary semantics, excludes the definition site). |
 | `find_callees` | Extract all function/method calls made within a symbol's body (tree-sitter query). |
 
 Supports TypeScript/TSX and Python. Index is built lazily on first use and cached by file mtime.
