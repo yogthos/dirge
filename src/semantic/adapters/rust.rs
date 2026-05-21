@@ -4,7 +4,8 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 use crate::semantic::adapter::LanguageAdapter;
-use crate::semantic::types::{ByteRange, ExtractedFile, Import, Symbol, SymbolKind};
+use crate::semantic::common::{find_node_at_range, node_text, signature_up_to_body};
+use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbol, SymbolKind};
 
 /// Tree-sitter adapter for Rust. dirge itself is written in Rust;
 /// this was a glaring gap — list_symbols / find_callers worked for
@@ -18,33 +19,13 @@ pub struct RustAdapter;
 
 impl RustAdapter {
     fn text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        n.utf8_text(s).unwrap_or("")
+        node_text(n, s)
     }
-
     fn range(&self, n: Node) -> ByteRange {
-        ByteRange {
-            start_byte: n.start_byte(),
-            end_byte: n.end_byte(),
-            start_line: n.start_position().row + 1,
-            end_line: n.end_position().row + 1,
-        }
+        ByteRange::from(n)
     }
-
     fn signature(&self, n: Node, s: &[u8]) -> String {
-        // Function signature is everything up to the body's `{`.
-        if let Some(body) = n.child_by_field_name("body") {
-            return String::from_utf8_lossy(&s[n.start_byte()..body.start_byte()])
-                .trim()
-                .to_string();
-        }
-        // Fall back to first line capped at 80.
-        let first = self.text(n, s).lines().next().unwrap_or("");
-        if first.chars().count() > 80 {
-            let p: String = first.chars().take(80).collect();
-            format!("{p}…")
-        } else {
-            first.to_string()
-        }
+        signature_up_to_body(n, s)
     }
 
     /// True if any direct child is a `visibility_modifier`.
@@ -360,28 +341,13 @@ impl RustAdapter {
                     imports.push(Import {
                         names: vec![path.clone()],
                         source: path,
+                        kind: ImportKind::Qualified,
                     });
                     break;
                 }
                 _ => {}
             }
         }
-    }
-
-    fn find_node_at_range<'a>(&self, n: Node<'a>, start: usize, end: usize) -> Option<Node<'a>> {
-        if n.start_byte() == start && n.end_byte() == end {
-            return Some(n);
-        }
-        for i in 0..n.named_child_count() {
-            if let Some(c) = n.named_child(i)
-                && c.start_byte() <= start
-                && c.end_byte() >= end
-                && let Some(f) = self.find_node_at_range(c, start, end)
-            {
-                return Some(f);
-            }
-        }
-        None
     }
 }
 
@@ -402,7 +368,6 @@ impl LanguageAdapter for RustAdapter {
 
         let mut symbols = Vec::new();
         let mut imports = Vec::new();
-        let exports = Vec::new();
         let mut warnings = Vec::new();
 
         if root.has_error() {
@@ -440,6 +405,14 @@ impl LanguageAdapter for RustAdapter {
             }
         }
 
+        // Populate `exports` from is_exported symbols (each adapter
+        // does this so consumers don't re-iterate the symbol vec).
+        let exports: Vec<String> = symbols
+            .iter()
+            .filter(|s| s.is_exported)
+            .map(|s| s.name.clone())
+            .collect();
+
         Ok(ExtractedFile {
             file_path: file_path.to_path_buf(),
             symbols,
@@ -465,8 +438,7 @@ impl LanguageAdapter for RustAdapter {
         let root = tree.root_node();
         let bytes = source.as_bytes();
 
-        let target = self
-            .find_node_at_range(root, range.start_byte, range.end_byte)
+        let target = find_node_at_range(root, range.start_byte, range.end_byte)
             .ok_or("Could not find node at given range")?;
 
         // Direct call: `foo(...)`. Method call: `obj.bar(...)` —

@@ -1,5 +1,6 @@
 mod adapter;
 pub mod adapters;
+pub(crate) mod common;
 mod index;
 pub mod types;
 

@@ -4,7 +4,8 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 use crate::semantic::adapter::LanguageAdapter;
-use crate::semantic::types::{ByteRange, ExtractedFile, Import, Symbol, SymbolKind};
+use crate::semantic::common::{find_node_at_range, node_text};
+use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbol, SymbolKind};
 
 /// Tree-sitter adapter for Clojure / ClojureScript / cljc / edn / bb.
 /// Uses `tree-sitter-clojure` (sogaiu's grammar, packaged on crates.io).
@@ -18,17 +19,15 @@ use crate::semantic::types::{ByteRange, ExtractedFile, Import, Symbol, SymbolKin
 pub struct ClojureAdapter;
 
 impl ClojureAdapter {
-    fn node_text<'a>(&self, node: Node<'a>, source: &'a [u8]) -> &'a str {
-        node.utf8_text(source).unwrap_or("")
+    // `node_text` and `make_range` previously lived here; now from
+    // `crate::semantic::common`. The local wrapper functions are
+    // kept as thin shims so the rest of this adapter reads
+    // unchanged — `self.node_text(n, s)` etc.
+    fn node_text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
+        node_text(n, s)
     }
-
-    fn make_range(&self, node: Node) -> ByteRange {
-        ByteRange {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            start_line: node.start_position().row + 1,
-            end_line: node.end_position().row + 1,
-        }
+    fn make_range(&self, n: Node) -> ByteRange {
+        ByteRange::from(n)
     }
 
     /// The text of a `sym_lit` is in its `sym_name` child. For
@@ -254,6 +253,7 @@ impl ClojureAdapter {
                                     imports.push(Import {
                                         names: vec![name.to_string()],
                                         source: name.to_string(),
+                                        kind: ImportKind::Module,
                                     });
                                 }
                             }
@@ -268,6 +268,7 @@ impl ClojureAdapter {
                                         imports.push(Import {
                                             names: vec![name.to_string()],
                                             source: name.to_string(),
+                                            kind: ImportKind::Module,
                                         });
                                         break;
                                     }
@@ -288,22 +289,6 @@ impl ClojureAdapter {
                 let _ = exports;
             }
         }
-    }
-
-    fn find_node_at_range<'a>(&self, node: Node<'a>, start: usize, end: usize) -> Option<Node<'a>> {
-        if node.start_byte() == start && node.end_byte() == end {
-            return Some(node);
-        }
-        for i in 0..node.named_child_count() {
-            if let Some(child) = node.named_child(i)
-                && child.start_byte() <= start
-                && child.end_byte() >= end
-                && let Some(found) = self.find_node_at_range(child, start, end)
-            {
-                return Some(found);
-            }
-        }
-        None
     }
 }
 
@@ -348,6 +333,20 @@ impl LanguageAdapter for ClojureAdapter {
             }
         }
 
+        // Backfill exports from is_exported symbols. Adapters that
+        // have an explicit export list (TS index re-exports, etc.)
+        // populate `exports` directly; for everything else, the
+        // is_exported flag on each symbol is authoritative and we
+        // mirror it here so consumers don't have to re-iterate.
+        if exports.is_empty() {
+            exports.extend(
+                symbols
+                    .iter()
+                    .filter(|s| s.is_exported)
+                    .map(|s| s.name.clone()),
+            );
+        }
+
         Ok(ExtractedFile {
             file_path: file_path.to_path_buf(),
             symbols,
@@ -373,8 +372,7 @@ impl LanguageAdapter for ClojureAdapter {
         let root = tree.root_node();
         let source_bytes = source.as_bytes();
 
-        let target = self
-            .find_node_at_range(root, range.start_byte, range.end_byte)
+        let target = find_node_at_range(root, range.start_byte, range.end_byte)
             .ok_or("Could not find node at given range")?;
 
         // Match every `list_lit` and pull its leading symbol — the
@@ -586,5 +584,28 @@ mod tests {
             !callees.iter().any(|c| c.contains('/')),
             "no callee should contain a /: {callees:?}",
         );
+    }
+
+    /// Imports are tagged with `ImportKind::Module` (Clojure
+    /// namespaces look like single dotted tokens, not the scoped
+    /// `Foo::Bar` syntax used by Rust/Java).
+    #[test]
+    fn imports_are_tagged_module_kind() {
+        let src = "(ns app (:require [clojure.string :as str]))\n";
+        let f = adapter().extract(&pb("a.clj"), src).unwrap();
+        assert!(!f.imports.is_empty());
+        for imp in &f.imports {
+            assert_eq!(imp.kind, ImportKind::Module);
+        }
+    }
+
+    /// Exports are populated from `is_exported=true` symbols.
+    /// `defn` is exported; `defn-` private.
+    #[test]
+    fn exports_mirror_is_exported_symbols() {
+        let src = "(defn public-thing [] :ok)\n(defn- private-thing [] :no)\n";
+        let f = adapter().extract(&pb("a.clj"), src).unwrap();
+        assert!(f.exports.iter().any(|n| n == "public-thing"));
+        assert!(!f.exports.iter().any(|n| n == "private-thing"));
     }
 }

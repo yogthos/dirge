@@ -4,22 +4,17 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query};
 
 use crate::semantic::adapter::LanguageAdapter;
-use crate::semantic::types::{ByteRange, ExtractedFile, Import, Symbol, SymbolKind};
+use crate::semantic::common::{find_node_at_range, node_text};
+use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbol, SymbolKind};
 
 pub struct PythonAdapter;
 
 impl PythonAdapter {
-    fn node_text<'a>(&self, node: Node<'a>, source: &'a [u8]) -> &'a str {
-        node.utf8_text(source).unwrap_or("")
+    fn node_text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
+        node_text(n, s)
     }
-
-    fn make_range(&self, node: Node) -> ByteRange {
-        ByteRange {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            start_line: node.start_position().row + 1,
-            end_line: node.end_position().row + 1,
-        }
+    fn make_range(&self, n: Node) -> ByteRange {
+        ByteRange::from(n)
     }
 
     fn signature_from_node(&self, node: Node, source: &[u8]) -> String {
@@ -131,6 +126,7 @@ impl PythonAdapter {
                     imports.push(Import {
                         names,
                         source: module,
+                        kind: ImportKind::Module,
                     });
                 }
                 "import_from_statement" => {
@@ -155,6 +151,7 @@ impl PythonAdapter {
                     imports.push(Import {
                         names,
                         source: module,
+                        kind: ImportKind::Module,
                     });
                 }
                 "function_definition" | "decorated_definition" => {
@@ -210,22 +207,6 @@ impl PythonAdapter {
             }
         }
     }
-
-    fn find_node_at_range<'a>(&self, node: Node<'a>, start: usize, end: usize) -> Option<Node<'a>> {
-        if node.start_byte() == start && node.end_byte() == end {
-            return Some(node);
-        }
-        for i in 0..node.named_child_count() {
-            if let Some(child) = node.named_child(i) {
-                if child.start_byte() <= start && child.end_byte() >= end {
-                    if let Some(found) = self.find_node_at_range(child, start, end) {
-                        return Some(found);
-                    }
-                }
-            }
-        }
-        None
-    }
 }
 
 impl LanguageAdapter for PythonAdapter {
@@ -256,6 +237,15 @@ impl LanguageAdapter for PythonAdapter {
 
         self.walk_top_level(root, source_bytes, &mut symbols, &mut imports, &mut exports);
 
+        if exports.is_empty() {
+            exports.extend(
+                symbols
+                    .iter()
+                    .filter(|s| s.is_exported)
+                    .map(|s| s.name.clone()),
+            );
+        }
+
         Ok(ExtractedFile {
             file_path: file_path.to_path_buf(),
             symbols,
@@ -283,8 +273,7 @@ impl LanguageAdapter for PythonAdapter {
         let root = tree.root_node();
         let source_bytes = source.as_bytes();
 
-        let target = self
-            .find_node_at_range(root, range.start_byte, range.end_byte)
+        let target = find_node_at_range(root, range.start_byte, range.end_byte)
             .ok_or("Could not find node at given range")?;
 
         let query_str = "(call function: (identifier) @callee)";
