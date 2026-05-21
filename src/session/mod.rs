@@ -360,6 +360,31 @@ impl Session {
     pub fn ensure_back_compat_initialized(&mut self) {
         self.ensure_message_store_initialized();
         self.ensure_tree_initialized();
+        self.ensure_next_entry_seq_initialized();
+    }
+
+    /// Recover `next_entry_seq` for sessions that have populated
+    /// `extra_entries` but a stale or default `next_entry_seq`
+    /// counter. The struct's doc comment promises this seeding, but
+    /// it was never actually wired up — a pre-versioned session,
+    /// corrupted file, or hand-edited JSON could end up with
+    /// `extra_entries = [seq=0, seq=1, seq=2]` and `next_entry_seq
+    /// = 0`, causing the next `append_plugin_entry` to assign seq=0
+    /// and collide with the existing entry.
+    ///
+    /// Seed `next_entry_seq` to `max(existing seqs + 1, len)` so
+    /// future appends always advance.
+    fn ensure_next_entry_seq_initialized(&mut self) {
+        if self.extra_entries.is_empty() {
+            return;
+        }
+        let max_seq = self.extra_entries.iter().map(|e| e.seq).max().unwrap_or(0);
+        let needed = max_seq
+            .saturating_add(1)
+            .max(self.extra_entries.len() as u64);
+        if self.next_entry_seq < needed {
+            self.next_entry_seq = needed;
+        }
     }
 
     /// Append a plugin entry to this session. Assigns the next
@@ -1365,6 +1390,54 @@ mod tests {
         assert_eq!(s.context_window, 200_000);
         // Lineage left blank when no parent passed.
         assert_eq!(s.name, "");
+    }
+
+    /// Regression: a session loaded with populated `extra_entries`
+    /// but stale `next_entry_seq` (corruption, hand-edit, or a
+    /// pre-version save) must re-seed the counter so the next
+    /// `append_plugin_entry` doesn't assign a colliding seq.
+    /// The Session struct's doc comment claimed this seeding
+    /// existed; this test pins it.
+    #[test]
+    fn ensure_back_compat_reseeds_next_entry_seq_from_stale_value() {
+        let mut s = Session::new("openai", "gpt-4", 200_000);
+        // Simulate a corrupted/hand-edited session: three plugin
+        // entries on disk but next_entry_seq still at 0.
+        s.extra_entries.push(PluginEntry {
+            seq: 0,
+            timestamp: 0,
+            display: true,
+            custom_type: "bookmark".to_string(),
+            data: "a".to_string(),
+        });
+        s.extra_entries.push(PluginEntry {
+            seq: 1,
+            timestamp: 0,
+            display: true,
+            custom_type: "bookmark".to_string(),
+            data: "b".to_string(),
+        });
+        s.extra_entries.push(PluginEntry {
+            seq: 2,
+            timestamp: 0,
+            display: true,
+            custom_type: "bookmark".to_string(),
+            data: "c".to_string(),
+        });
+        s.next_entry_seq = 0;
+        s.ensure_back_compat_initialized();
+        // After back-compat init, seq must be >= 3 so the next
+        // append doesn't collide with any existing entry.
+        assert!(
+            s.next_entry_seq >= 3,
+            "next_entry_seq must skip past existing seqs; got {}",
+            s.next_entry_seq,
+        );
+        let added_seq = s.append_plugin_entry("bookmark", "d", true).seq;
+        // The new entry's seq must be unique vs existing.
+        let seqs: std::collections::HashSet<u64> = s.extra_entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs.len(), 4, "all seqs must be unique; got {seqs:?}");
+        assert!(added_seq >= 3, "new entry's seq must skip past existing");
     }
 
     /// `reset_to_new` must clear `permission_allowlist` to avoid
