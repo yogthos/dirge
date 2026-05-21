@@ -603,10 +603,28 @@ impl Renderer {
             let mut stdout = io::stdout();
             let _ = stdout.execute(ScrollUp(1));
             self.lines = self.lines.saturating_sub(1);
-            for &r in &[max_content.saturating_sub(1), max_content] {
+            // After ScrollUp, the input row (with the avatar) and any
+            // continuation input rows + the status row all shifted up
+            // by 1. Their fragments now sit on `max_content - 1`
+            // through `rows - 2`. Clear EVERY row from the last chat
+            // row through the previous status row — anything else
+            // would leave avatar/status fragments visible at the
+            // wrong row, which is the symptom users see as "avatar
+            // duplicated on scroll." The bottom row (now blank from
+            // ScrollUp) doesn't need clearing.
+            let clear_start = max_content.saturating_sub(1);
+            let clear_end = rows.saturating_sub(1); // exclusive
+            for r in clear_start..clear_end {
                 let _ = stdout.execute(MoveTo(0, r));
                 let _ = write!(stdout, "{}", " ".repeat(content_cols as usize));
             }
+            // Repaint the avatar after the wipe — otherwise the
+            // avatar visibly blinks out between writes during
+            // streaming (until the next `draw_bottom` is called by
+            // the UI loop on a significant event). Cheap: one
+            // MoveTo + 5 chars at a known column.
+            let input_top = rows.saturating_sub(self.input_rows + 1);
+            let _ = self.draw_avatar(&mut stdout, input_top);
             let _ = stdout.flush();
         }
     }

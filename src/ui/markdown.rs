@@ -75,10 +75,15 @@ fn render_table(
     max_width: usize,
     out: &mut Vec<LineEntry>,
 ) {
+    use unicode_width::UnicodeWidthStr;
     if header.is_empty() && rows.is_empty() {
         return;
     }
-    // Compute per-column max char width.
+    // Compute per-column max DISPLAY width — emoji like ✅ occupy 2
+    // terminal cells but only 1 `char`. Counting chars previously
+    // produced narrow columns and the right border slid left by one
+    // per emoji. `unicode_width::UnicodeWidthStr::width` returns the
+    // terminal-cell width.
     let ncols = header
         .len()
         .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
@@ -87,11 +92,11 @@ fn render_table(
     }
     let mut widths = vec![0usize; ncols];
     for (i, cell) in header.iter().enumerate() {
-        widths[i] = widths[i].max(cell.chars().count());
+        widths[i] = widths[i].max(cell.as_str().width());
     }
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.chars().count());
+            widths[i] = widths[i].max(cell.as_str().width());
         }
     }
     // Minimum column width — ragged rows (one row has fewer cells
@@ -115,21 +120,32 @@ fn render_table(
         }
     }
 
+    // `fit` pads or truncates `cell` to occupy exactly `w` terminal
+    // cells. Char-based length undercounts emoji; we accumulate the
+    // per-character display width and pad with the actual cell deficit
+    // so right borders line up under cells of any width mix.
     let fit = |cell: &str, w: usize| -> String {
-        let chars: Vec<char> = cell.chars().collect();
-        if chars.len() <= w {
-            let mut s: String = chars.iter().collect();
-            for _ in chars.len()..w {
-                s.push(' ');
+        use unicode_width::UnicodeWidthChar;
+        let mut out = String::with_capacity(cell.len() + w);
+        let mut used = 0usize;
+        for c in cell.chars() {
+            let cw = c.width().unwrap_or(0);
+            // Truncate with ellipsis if the next char would overflow.
+            // The ellipsis itself is 1 cell wide.
+            if used + cw > w {
+                if w >= 1 && used + 1 <= w {
+                    out.push('…');
+                    used += 1;
+                }
+                break;
             }
-            s
-        } else if w <= 1 {
-            chars.iter().take(w).collect()
-        } else {
-            let mut s: String = chars.iter().take(w - 1).collect();
-            s.push('…');
-            s
+            out.push(c);
+            used += cw;
         }
+        for _ in used..w {
+            out.push(' ');
+        }
+        out
     };
 
     let render_row = |row: &[String], widths: &[usize]| -> String {
@@ -486,4 +502,79 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    /// Each rendered row must occupy the same number of terminal
+    /// cells so the right border `│` lines up vertically.
+    fn assert_rows_same_width(rows: &[LineEntry]) {
+        let widths: Vec<usize> = rows.iter().map(|r| r.text.as_str().width()).collect();
+        if widths.is_empty() {
+            return;
+        }
+        let first = widths[0];
+        for (i, w) in widths.iter().enumerate() {
+            assert_eq!(
+                *w, first,
+                "row {i} has width {w}, expected {first} (matching first row).\nrow: {:?}",
+                rows[i].text,
+            );
+        }
+    }
+
+    /// Tables with emoji cells used to misalign the right border:
+    /// `chars().count()` undercounted emoji like ✅ (2-cell-wide)
+    /// as 1 char, leaving the right border 1 cell short.
+    #[test]
+    fn table_with_emoji_aligns_right_border() {
+        let header = vec![
+            "File".to_string(),
+            "Action".to_string(),
+            "Status".to_string(),
+        ];
+        let rows = vec![
+            vec!["a.rs".to_string(), "CREATE".to_string(), "✅".to_string()],
+            vec!["b.rs".to_string(), "MODIFY".to_string(), "✅".to_string()],
+            vec!["c.rs".to_string(), "DELETE".to_string(), "❌".to_string()],
+        ];
+        let mut out = Vec::new();
+        render_table(&header, &rows, 80, &mut out);
+        // Drop the trailing empty line; everything else must align.
+        let non_empty: Vec<&LineEntry> = out.iter().filter(|e| !e.text.is_empty()).collect();
+        let owned: Vec<LineEntry> = non_empty.into_iter().cloned().collect();
+        assert_rows_same_width(&owned);
+    }
+
+    /// Plain ASCII rows continue to align (regression guard).
+    #[test]
+    fn table_with_ascii_only_aligns() {
+        let header = vec!["a".to_string(), "bb".to_string()];
+        let rows = vec![
+            vec!["1".to_string(), "22".to_string()],
+            vec!["3".to_string(), "44".to_string()],
+        ];
+        let mut out = Vec::new();
+        render_table(&header, &rows, 80, &mut out);
+        let owned: Vec<LineEntry> = out.iter().filter(|e| !e.text.is_empty()).cloned().collect();
+        assert_rows_same_width(&owned);
+    }
+
+    /// Mixed-width column (1-cell chars + emoji) still aligns.
+    #[test]
+    fn table_with_mixed_cell_widths_aligns() {
+        let header = vec!["Name".to_string(), "Status".to_string()];
+        let rows = vec![
+            vec!["short".to_string(), "✅ OK".to_string()],
+            vec!["longer one".to_string(), "—".to_string()],
+            vec!["🚀 emoji-first".to_string(), "?".to_string()],
+        ];
+        let mut out = Vec::new();
+        render_table(&header, &rows, 80, &mut out);
+        let owned: Vec<LineEntry> = out.iter().filter(|e| !e.text.is_empty()).cloned().collect();
+        assert_rows_same_width(&owned);
+    }
 }

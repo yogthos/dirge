@@ -1629,6 +1629,16 @@ pub async fn run_interactive(
                         let trimmed = summary
                             .strip_prefix(&format!("{} ", name))
                             .unwrap_or(&summary);
+                        // Blank line BEFORE the chamber top so the eye
+                        // has an anchor between dense prior output (a
+                        // permission alert + "allowed ..." lines) and
+                        // the new tool chamber. Without it, the
+                        // chamber's ╭─ tended to sit pressed against
+                        // the previous line and on small terminals
+                        // the ╭ row could scroll off-screen while the
+                        // chamber's content rows stayed visible —
+                        // looking like a "cut off at top" chamber.
+                        renderer.write_line("", Color::White)?;
                         let pre = format!("╭─ {} ─ {} ", upper, trimmed);
                         let pre_clean = sanitize_output(&pre).into_string();
                         let (frame_w, _) = chamber_widths(&renderer);
@@ -3080,41 +3090,23 @@ fn close_tool_chamber_if_open(
         // Abnormal close: this helper is only called when the tool's
         // chamber is closing without a `ToolResult` (permission
         // denied, interjected mid-execution, agent error, fresh tool
-        // call before the previous one finished). Surface that with
-        // a CRT-static "no signal" row so the empty chamber isn't a
-        // mute box. Two textured rows + one labelled row inside the
-        // chamber give it a distinct shape from a normal output
-        // chamber.
-        renderer.write_line(&static_row(inner, 0), theme::dim())?;
+        // call before the previous one finished). Previously we
+        // painted CRT-static dither rows here, but those used
+        // `static_row()` which was 2 chars narrower than the chamber
+        // frame so the right border never lined up, and the dithered
+        // noise was visually loud for a state the user just needs to
+        // SEE quickly. Now we emit a single centered alert row in
+        // the perm/error color (same orange tone as the permission
+        // ask), which lines up with the chamber border and reads at
+        // a glance.
         renderer.write_line(
-            &chamber_row_centered("░▒▓  NO OUTPUT  ▓▒░", inner),
-            theme::dim(),
+            &chamber_row_centered("⚠ tool denied · aborted · no result", inner),
+            theme::perm(),
         )?;
-        renderer.write_line(
-            &chamber_row_centered("tool denied · aborted · no result", inner),
-            theme::dim(),
-        )?;
-        renderer.write_line(&static_row(inner, 1), theme::dim())?;
         renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
         *last_tool_name = None;
     }
     Ok(())
-}
-
-/// Produce a "CRT signal noise" row inside a chamber: a deterministic
-/// `░▒▓` glyph mix padded to inner width. The `seed` selects between
-/// two pre-baked patterns so top vs bottom static rows differ slightly
-/// — the eye reads it as continuous noise rather than a duplicated row.
-fn static_row(inner: usize, seed: usize) -> String {
-    let glyphs = [
-        ['░', '▒', '░', '▓', '░', '▒', '▒', '░', '▓', '▒'],
-        ['▒', '░', '▓', '░', '▒', '▓', '░', '▒', '░', '▓'],
-    ];
-    let pattern = &glyphs[seed % 2];
-    // Body fills `inner` chars (the chamber inner is already the
-    // padded content width); the `│ ` and ` │` borders sit outside.
-    let body: String = (0..inner).map(|i| pattern[i % pattern.len()]).collect();
-    format!("│{}│", body)
 }
 
 /// `│   <content centered to inner>   │` — pad text on both sides so
