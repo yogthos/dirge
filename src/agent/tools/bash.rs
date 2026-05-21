@@ -1,6 +1,5 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
-use std::process::Output;
 use tokio::process::Command;
 use tokio::time::Duration;
 
@@ -11,18 +10,25 @@ use crate::sandbox::Sandbox;
 #[cfg(feature = "semantic-bash")]
 use crate::semantic::adapters::bash;
 
+/// Captured output with stdout + stderr lines preserved in arrival
+/// order. Replaces tokio's `Output` (which collects each stream as
+/// a separate blob, losing time ordering between them — F12).
+#[derive(Debug)]
+pub(crate) struct InterleavedOutput {
+    /// Lines in the order they arrived from EITHER pipe.
+    pub merged: String,
+    pub exit_code: i32,
+}
+
 /// Spawn `cmd` into its own process group and wait for it,
 /// capped at `secs`. On timeout, send SIGKILL to the process
 /// group so the whole subprocess tree dies — not just bash. On
 /// Windows we fall back to tokio's `kill_on_drop` which signals
 /// the direct child only (Windows job objects would be cleaner
-/// but require extra deps). F6 fix.
-async fn run_with_timeout(cmd: Command, secs: u64) -> Result<Output, ToolError> {
+/// but require extra deps). F6 + F12 fix.
+async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, ToolError> {
     use std::process::Stdio;
     let mut cmd = cmd;
-    // Pipe stdio so `wait_with_output` actually captures it. Default
-    // is inherit, which routes output to the parent's terminal and
-    // returns empty `output.stdout`/`stderr`.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -40,18 +46,78 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<Output, ToolError> 
         cmd.process_group(0);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| ToolError::Msg(format!("failed to spawn: {}", e)))?;
     let pid = child.id();
 
-    let wait = child.wait_with_output();
+    // F12: drain stdout + stderr concurrently into a single buffer
+    // so the order of lines reflects actual arrival time. The prior
+    // implementation (`wait_with_output`) buffered each stream
+    // separately and concatenated stdout + stderr at the end, which
+    // mis-ordered every command that wrote to both interleaved
+    // (e.g. `make`, `npm install`, `cargo build`).
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let drain = async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut merged = String::new();
+        let mut so = stdout.map(tokio::io::BufReader::new);
+        let mut se = stderr.map(tokio::io::BufReader::new);
+        loop {
+            // Decide presence BEFORE constructing futures — the
+            // `if` guards on select! borrow `so` and `se`, which
+            // would conflict with the futures' mutable borrows.
+            let has_so = so.is_some();
+            let has_se = se.is_some();
+            if !has_so && !has_se {
+                break;
+            }
+            let mut so_buf = String::new();
+            let mut se_buf = String::new();
+            // Build futures lazily; each is "noop" if its reader
+            // is None. We funnel both into `Result<usize>` so the
+            // select! arms have matching types.
+            let so_fut = async {
+                match so.as_mut() {
+                    Some(r) => r.read_line(&mut so_buf).await.map(Some),
+                    None => Ok::<_, std::io::Error>(None),
+                }
+            };
+            let se_fut = async {
+                match se.as_mut() {
+                    Some(r) => r.read_line(&mut se_buf).await.map(Some),
+                    None => Ok::<_, std::io::Error>(None),
+                }
+            };
+            tokio::select! {
+                biased;
+                r = so_fut, if has_so => match r {
+                    Ok(Some(0)) | Ok(None) | Err(_) => { so = None; }
+                    Ok(Some(_)) => merged.push_str(&so_buf),
+                },
+                r = se_fut, if has_se => match r {
+                    Ok(Some(0)) | Ok(None) | Err(_) => { se = None; }
+                    Ok(Some(_)) => merged.push_str(&se_buf),
+                },
+            }
+        }
+        merged
+    };
+
+    let wait = async {
+        let merged = drain.await;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((merged, status))
+    };
+
     match tokio::time::timeout(Duration::from_secs(secs), wait).await {
-        Ok(out) => out.map_err(|e| ToolError::Msg(format!("wait failed: {}", e))),
+        Ok(Ok((merged, status))) => Ok(InterleavedOutput {
+            merged,
+            exit_code: status.code().unwrap_or(-1),
+        }),
+        Ok(Err(e)) => Err(ToolError::Msg(format!("wait failed: {}", e))),
         Err(_) => {
-            // Timeout. Kill the whole group on Unix; on Windows
-            // kill_on_drop will signal the direct child when the
-            // returned error path drops the (now-dropped) child.
             #[cfg(unix)]
             if let Some(pid) = pid {
                 // SAFETY: killpg with negative pid sends to the
@@ -62,9 +128,7 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<Output, ToolError> 
                     let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                 }
             }
-            // We've requested the kill but tokio doesn't surface a
-            // post-kill output. Return the timeout error directly.
-            let _ = pid; // silence unused-on-windows warning
+            let _ = pid;
             Err(ToolError::Msg(format!("Command timed out after {}s", secs)))
         }
     }
@@ -142,22 +206,15 @@ impl Tool for BashTool {
         }
         let output = run_with_timeout(self.sandbox.wrap_command(&args.command), secs).await?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        let mut result = String::new();
-        if !stdout.is_empty() {
-            result.push_str(&stdout);
-        }
-        if !stderr.is_empty() {
-            if !result.is_empty() {
+        // F12: `merged` already contains stdout + stderr in arrival
+        // order. Previously we concatenated stdout then stderr,
+        // mis-ordering interleaved output.
+        let mut result = output.merged;
+        if output.exit_code != 0 {
+            if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
             }
-            result.push_str(&stderr);
-        }
-        if exit_code != 0 {
-            result.push_str(&format!("\nExit code: {}", exit_code));
+            result.push_str(&format!("Exit code: {}", output.exit_code));
         }
         // Bash may have mutated the filesystem; conservatively invalidate the
         // per-turn read/grep/list cache.
@@ -359,8 +416,42 @@ mod tests {
             c
         };
         let out = run_with_timeout(cmd, 5).await.expect("should succeed");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(stdout.trim(), "hi");
+        assert_eq!(out.merged.trim(), "hi");
+    }
+
+    /// F12: stdout + stderr interleave in true arrival order, not
+    /// stdout-then-stderr. Use a script that pings stderr between
+    /// stdout writes; the merged output must keep the order.
+    #[tokio::test]
+    async fn run_with_timeout_interleaves_stdout_stderr() {
+        let cmd = {
+            let mut c = Command::new("bash");
+            c.arg("-c")
+                // Print to alternating streams with small delays so
+                // the kernel actually buffers them in order. Without
+                // the delay, both lines might land in the same
+                // select! poll and ordering becomes about poll bias.
+                .arg(
+                    "echo OUT-A; \
+                     sleep 0.05; \
+                     echo ERR-1 >&2; \
+                     sleep 0.05; \
+                     echo OUT-B; \
+                     sleep 0.05; \
+                     echo ERR-2 >&2",
+                );
+            c
+        };
+        let out = run_with_timeout(cmd, 5).await.expect("should succeed");
+        let lines: Vec<&str> = out.merged.lines().collect();
+        // Pre-F12 we'd see [OUT-A, OUT-B, ERR-1, ERR-2] because
+        // stdout was concatenated before stderr. Post-F12 each line
+        // appears in arrival order.
+        assert_eq!(
+            lines,
+            vec!["OUT-A", "ERR-1", "OUT-B", "ERR-2"],
+            "stdout/stderr should interleave by arrival",
+        );
     }
 
     /// F10: a `;` inside double quotes is part of the string, not a
