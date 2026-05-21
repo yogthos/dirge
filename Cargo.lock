@@ -2696,6 +2696,7 @@ dependencies = [
  "include_dir",
  "indexmap 2.14.0",
  "janetrs",
+ "libc",
  "lsp-types",
  "pulldown-cmark",
  "regex",
