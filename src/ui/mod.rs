@@ -77,6 +77,36 @@ fn with_queue(s: String, n: usize) -> String {
     if n == 0 { s } else { format!("{} q:{}", s, n) }
 }
 
+/// Capture whatever assistant text had streamed in before an abort,
+/// store it on the session as the assistant's reply (with a
+/// `[interrupted by user]` trailer so the LLM sees on next turn
+/// that it was cut off), and clear `response_buf`. Returns `true`
+/// when a partial was actually stashed; `false` when nothing had
+/// streamed yet (no-op).
+///
+/// Mirrors opencode's `finalizeInterruptedAssistant` in
+/// `packages/opencode/src/session/prompt.ts` — the streamed parts
+/// are already on-screen, so the partial is preserved by virtue of
+/// being saved into the session rather than discarded. opencode
+/// uses `MessageV2.fromError(..., aborted: true)` to annotate the
+/// message; dirge appends the trailer as plain text since
+/// `SessionMessage` is content-only.
+fn capture_partial_on_abort(
+    response_buf: &mut String,
+    session: &mut crate::session::Session,
+    why: &str,
+) -> bool {
+    let trimmed = response_buf.trim_end();
+    if trimmed.is_empty() {
+        response_buf.clear();
+        return false;
+    }
+    let stashed = format!("{}\n\n[interrupted by user ({})]", trimmed, why,);
+    session.add_message(crate::session::MessageRole::Assistant, &stashed);
+    response_buf.clear();
+    true
+}
+
 /// Map a plugin-supplied color string ("cyan", "red", ...) to a
 /// crossterm `Color`. Falls back to dim grey for anything unrecognized
 /// so a typo in plugin code doesn't crash the UI.
@@ -724,16 +754,35 @@ pub async fn run_interactive(
                                     ls.active = false;
                                     loop_label = None;
                                 }
+                                // Persist whatever response had streamed in
+                                // before the abort. Matches opencode's
+                                // `finalizeInterruptedAssistant` pattern in
+                                // `packages/opencode/src/session/prompt.ts`:
+                                // the partial is already on-screen, so save
+                                // it to the session with a `[interrupted by
+                                // user]` marker so the next turn's LLM
+                                // context shows what was happening. Without
+                                // this, the user's next prompt referenced
+                                // an invisible reply.
+                                let stashed = capture_partial_on_abort(
+                                    &mut response_buf,
+                                    session,
+                                    "Ctrl+C",
+                                );
                                 let dropped = interjection_queue.len();
                                 interjection_queue.clear();
-                                if dropped > 0 {
-                                    renderer.write_line(
-                                        &format!("interrupted ({} queued message{} dropped)", dropped, if dropped == 1 { "" } else { "s" }),
-                                        c_error(),
-                                    )?;
-                                } else {
-                                    renderer.write_line("interrupted", c_error())?;
+                                let mut msg = String::from("interrupted");
+                                if stashed {
+                                    msg.push_str(" — partial reply preserved in session");
                                 }
+                                if dropped > 0 {
+                                    msg.push_str(&format!(
+                                        " ({} queued message{} dropped)",
+                                        dropped,
+                                        if dropped == 1 { "" } else { "s" },
+                                    ));
+                                }
+                                renderer.write_line(&msg, c_error())?;
                                 renderer.draw_bottom(
                                     &input,
                                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -885,7 +934,19 @@ pub async fn run_interactive(
                                 ls.active = false;
                                 loop_label = None;
                             }
-                            renderer.write_line("interrupted (Esc)", c_error())?;
+                            // Same partial-capture as Ctrl+C above —
+                            // see comment there for the opencode parallel.
+                            let stashed = capture_partial_on_abort(
+                                &mut response_buf,
+                                session,
+                                "Esc",
+                            );
+                            let msg = if stashed {
+                                "interrupted (Esc) — partial reply preserved in session"
+                            } else {
+                                "interrupted (Esc)"
+                            };
+                            renderer.write_line(msg, c_error())?;
                             renderer.draw_bottom(
                                 &input,
                                 &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -3091,6 +3152,59 @@ async fn run_shell_command(cmd: &str, sandbox: &Sandbox) -> anyhow::Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Partial assistant reply at abort time is preserved into the
+    // session with a trailer marking the interruption, so the LLM
+    // sees on the next turn what it had been saying. Mirrors
+    // opencode's `finalizeInterruptedAssistant` in
+    // `packages/opencode/src/session/prompt.ts`.
+    #[test]
+    fn capture_partial_on_abort_stashes_partial_with_trailer() {
+        let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
+        let baseline = session.messages.len();
+        let mut buf = String::from("I was about to explain that");
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C");
+        assert!(stashed);
+        assert_eq!(session.messages.len(), baseline + 1);
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.role, crate::session::MessageRole::Assistant);
+        assert!(
+            last.content.contains("I was about to explain that"),
+            "must keep the original partial: {:?}",
+            last.content,
+        );
+        assert!(
+            last.content.contains("[interrupted by user (Ctrl+C)]"),
+            "must include the interruption trailer: {:?}",
+            last.content,
+        );
+        assert!(buf.is_empty(), "buf must be cleared after stash");
+    }
+
+    // Aborting when nothing has streamed yet is a no-op — we don't
+    // want a session full of empty "[interrupted]" messages from
+    // mistaken Ctrl+C presses.
+    #[test]
+    fn capture_partial_on_abort_noop_on_empty_buf() {
+        let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
+        let baseline = session.messages.len();
+        let mut buf = String::new();
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Ctrl+C");
+        assert!(!stashed);
+        assert_eq!(session.messages.len(), baseline);
+    }
+
+    // Whitespace-only partial (e.g. agent had only emitted some
+    // leading newlines) is also a no-op — no useful text to save.
+    #[test]
+    fn capture_partial_on_abort_noop_on_whitespace_only() {
+        let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
+        let baseline = session.messages.len();
+        let mut buf = String::from("   \n\n\t  ");
+        let stashed = capture_partial_on_abort(&mut buf, &mut session, "Esc");
+        assert!(!stashed);
+        assert_eq!(session.messages.len(), baseline);
+    }
 
     // Regression H1: lifecycle line for a failed task previously embedded the
     // raw error string. Renderer.write_line splits on '\n', so a multi-line
