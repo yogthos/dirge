@@ -147,23 +147,51 @@ impl ToolDyn for McpTool {
                 return Err(ToolError::ToolCallError(Box::new(McpToolError(msg))));
             }
 
+            // Cap aggregate MCP result at 256 KiB before it
+            // reaches LLM context. A misbehaving MCP server
+            // returning a 200 KB+ blob would otherwise flood
+            // every subsequent turn until compaction. The cap
+            // matches the bash output cap below; tools wanting
+            // larger payloads should chunk or return resource
+            // URIs.
+            const MCP_RESULT_CAP_BYTES: usize = 256 * 1024;
             let mut content = String::new();
+            let mut truncated = false;
             for item in result.content {
-                match item.raw {
-                    RawContent::Text(t) => content.push_str(&t.text),
+                if truncated {
+                    break;
+                }
+                let chunk: String = match item.raw {
+                    RawContent::Text(t) => t.text,
                     RawContent::Image(img) => {
-                        content.push_str(&format!("data:{};base64,{}", img.mime_type, img.data));
+                        format!("data:{};base64,{}", img.mime_type, img.data)
                     }
                     RawContent::Resource(r) => match r.resource {
-                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
-                            content.push_str(&text);
-                        }
-                        rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => {
-                            content.push_str(&blob);
-                        }
+                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => text,
+                        rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => blob,
                     },
-                    _ => {}
+                    _ => continue,
+                };
+                let remaining = MCP_RESULT_CAP_BYTES.saturating_sub(content.len());
+                if chunk.len() <= remaining {
+                    content.push_str(&chunk);
+                } else {
+                    // Find a UTF-8 char boundary at or below
+                    // `remaining` so we don't slice through a
+                    // multi-byte codepoint.
+                    let mut cut = remaining;
+                    while cut > 0 && !chunk.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    content.push_str(&chunk[..cut]);
+                    truncated = true;
                 }
+            }
+            if truncated {
+                content.push_str(&format!(
+                    "\n…[MCP result truncated at {} bytes — {}::{} returned more]",
+                    MCP_RESULT_CAP_BYTES, server_name, tool_name,
+                ));
             }
             Ok(content)
         })

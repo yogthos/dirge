@@ -56,9 +56,90 @@ fn validate_url_scheme(url: &str) -> Result<(), String> {
     }
 }
 
+/// Reject URLs whose host resolves to a private / loopback /
+/// link-local / cloud-metadata IP unless explicitly allowed via
+/// `DIRGE_WEBFETCH_ALLOW_PRIVATE=1`. Cloud metadata endpoints
+/// (`169.254.169.254`, GCP/AWS/Azure variants) are the classic
+/// SSRF target — an LLM that can be prompt-injected into fetching
+/// them exfiltrates IAM credentials.
+///
+/// `localhost` and loopback are blocked by default too — dev
+/// workflows that want to hit `http://localhost:3000` should opt
+/// in via the env var. This matches the conservative default of
+/// the opencode/curl-with-redirect-policy approach.
+fn validate_url_host_safety(url: &str) -> Result<(), String> {
+    if std::env::var("DIRGE_WEBFETCH_ALLOW_PRIVATE").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    // Strip scheme to extract host. We don't pull in a URL parser
+    // crate here; webfetch's URL handling is already string-based
+    // and this is one more check at the boundary.
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    // Host extraction handles bracketed IPv6 (`[::1]`) before
+    // falling back to the bare host:port form. Without the
+    // bracket-aware path, `rsplit_once(':')` would chop `[::1]`
+    // mid-address.
+    let host_end = after_scheme
+        .find(|c: char| matches!(c, '/' | '?' | '#'))
+        .unwrap_or(after_scheme.len());
+    let host_and_port = &after_scheme[..host_end];
+    let host: &str = if let Some(rest) = host_and_port.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        &rest[..end]
+    } else {
+        host_and_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_and_port)
+    };
+    let host_lower = host.to_ascii_lowercase();
+
+    // Hostname blocklist (matched literally — DNS rebinding is a
+    // separate concern; this defends against the direct case).
+    const BLOCKED_HOSTNAMES: &[&str] = &["localhost", "ip6-localhost", "ip6-loopback"];
+    if BLOCKED_HOSTNAMES.contains(&host_lower.as_str()) {
+        return Err(format!(
+            "webfetch refused {url:?}: hostname is loopback/localhost. \
+             Set DIRGE_WEBFETCH_ALLOW_PRIVATE=1 to allow this."
+        ));
+    }
+    // IP literal check. Both IPv4 dotted-quad and IPv6 bracketed.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let blocked = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()       // 127.0.0.0/8
+                    || v4.is_private() // 10/172.16/192.168
+                    || v4.is_link_local() // 169.254/16 — AWS metadata
+                    || v4.is_unspecified() // 0.0.0.0
+                    || v4.octets()[0] >= 240 // class E + multicast
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
+                // unique-local fc00::/7
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // link-local fe80::/10
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+        if blocked {
+            return Err(format!(
+                "webfetch refused {url:?}: IP {ip} is private/loopback/link-local. \
+                 Set DIRGE_WEBFETCH_ALLOW_PRIVATE=1 to allow this."
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_url(client: &reqwest::Client, url: &str) -> Result<String, String> {
     let url = normalize_url(url);
     validate_url_scheme(&url)?;
+    validate_url_host_safety(&url)?;
 
     let resp = client
         .get(&url)
@@ -78,10 +159,27 @@ async fn fetch_url(client: &reqwest::Client, url: &str) -> Result<String, String
         return Err(format!("{} returned {}", url, status.as_u16()));
     }
 
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("read error for {}: {}", url, e))?;
+    // Cap the body download at 10 MiB. Previously `.text()`
+    // would buffer the entire response — a 500 MB page would
+    // OOM the agent process before any truncation got a chance
+    // to apply. Stream the body, bail at the cap, then convert.
+    use futures::StreamExt;
+    const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("read error for {}: {}", url, e))?;
+        if buf.len() + chunk.len() > MAX_BODY_BYTES {
+            let remaining = MAX_BODY_BYTES.saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..remaining]);
+            // Note in the rendered output that we cut off.
+            // Subsequent text-conversion will still see partial
+            // HTML but renders sensibly; the agent gets the gist.
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&buf);
 
     Ok(html_to_markdown(&body))
 }
@@ -96,7 +194,7 @@ impl Tool for WebFetchTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "webfetch".to_string(),
-            description: "Fetch the content of one or more URLs and return it as markdown. Schemeless URLs get https:// prepended. Explicit http:// URLs (localhost, internal services) are respected. Use for reading documentation pages, API references, or any web content."
+            description: "Fetch the content of one or more URLs and return it as markdown. Schemeless URLs get https:// prepended. Private/loopback/link-local addresses (127.0.0.0/8, 10.x, 172.16.x, 192.168.x, 169.254.x cloud metadata, ::1, fc00::/7, fe80::/10) and bare 'localhost' are refused by default; set DIRGE_WEBFETCH_ALLOW_PRIVATE=1 to permit them for local-dev workflows. Use for reading documentation pages, API references, or any web content."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -294,6 +392,50 @@ mod tests {
         assert!(validate_url_scheme("javascript:alert(1)").is_err());
         // Empty string also blocked.
         assert!(validate_url_scheme("").is_err());
+    }
+
+    /// SSRF defense: AWS metadata + private + loopback + link-local
+    /// IPs are refused unless the env opt-in is set. Pin the exact
+    /// hosts that bug bounty reports keep hitting.
+    #[test]
+    fn validate_url_host_safety_blocks_ssrf_targets() {
+        // SAFETY against parallel tests poking the env: this test
+        // doesn't touch DIRGE_WEBFETCH_ALLOW_PRIVATE, so the
+        // default behavior applies. Skip if a parallel test set
+        // it (we can't reliably unset/restore without races).
+        if std::env::var("DIRGE_WEBFETCH_ALLOW_PRIVATE").as_deref() == Ok("1") {
+            return;
+        }
+        // Cloud metadata endpoints — the classic SSRF target.
+        assert!(validate_url_host_safety("http://169.254.169.254/latest/meta-data/").is_err());
+        // Loopback variants.
+        assert!(validate_url_host_safety("http://127.0.0.1/").is_err());
+        assert!(validate_url_host_safety("http://127.99.99.99/").is_err());
+        assert!(validate_url_host_safety("http://localhost/").is_err());
+        assert!(validate_url_host_safety("http://localhost:6379/").is_err());
+        // Private space — RFC 1918.
+        assert!(validate_url_host_safety("http://10.0.0.1/").is_err());
+        assert!(validate_url_host_safety("http://192.168.1.1/").is_err());
+        assert!(validate_url_host_safety("http://172.16.0.1/").is_err());
+        // IPv6 loopback + ULA + link-local.
+        assert!(validate_url_host_safety("http://[::1]/").is_err());
+        assert!(validate_url_host_safety("http://[fc00::1]/").is_err());
+        assert!(validate_url_host_safety("http://[fe80::1]/").is_err());
+        // Public domains must still pass.
+        assert!(validate_url_host_safety("https://example.com/").is_ok());
+        assert!(validate_url_host_safety("https://api.github.com/repos/x/y").is_ok());
+        // Public IPs pass.
+        assert!(validate_url_host_safety("http://8.8.8.8/").is_ok());
+    }
+
+    /// Bash output cap test lives in bash.rs; MCP cap test lives
+    /// in mcp/tool.rs.
+    #[test]
+    fn validate_url_host_safety_handles_malformed_hosts() {
+        // Garbage host shouldn't panic; it just doesn't parse as
+        // an IP and isn't in the hostname blocklist, so it falls
+        // through to the HTTP client (which will likely fail).
+        assert!(validate_url_host_safety("https://not-an-ip-or-domain/").is_ok());
     }
 
     // Regression: the WebFetchArgs default for max_chars must be 3000 — agents

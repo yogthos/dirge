@@ -85,20 +85,30 @@ impl Tool for TaskTool {
             let store = self.bg_store.clone();
             let tid = task_id.clone();
 
+            // Cap the background subagent at 10 minutes. Without a
+            // timeout, a stuck subagent (provider hang, runaway
+            // multi-turn) would keep the task in `Running` state
+            // forever, hold its model/network handle open, and
+            // never deliver a system-reminder to the next turn.
+            // 10 min matches the rough upper bound for a coherent
+            // single-prompt LLM task; anything longer is the
+            // subagent loop misbehaving.
+            const SUBAGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
             tokio::spawn(async move {
-                let result = model
-                    .btw_query(format!(
-                        "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
-                        prompt
-                    ))
-                    .await;
-                store.notify(
-                    &tid,
-                    match result {
-                        Ok(text) => TaskState::Completed(text),
-                        Err(e) => TaskState::Failed(e.to_string()),
-                    },
-                );
+                let fut = model.btw_query(format!(
+                    "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
+                    prompt
+                ));
+                let result = tokio::time::timeout(SUBAGENT_TIMEOUT, fut).await;
+                let state = match result {
+                    Ok(Ok(text)) => TaskState::Completed(text),
+                    Ok(Err(e)) => TaskState::Failed(e.to_string()),
+                    Err(_) => TaskState::Failed(format!(
+                        "subagent timed out after {}s",
+                        SUBAGENT_TIMEOUT.as_secs(),
+                    )),
+                };
+                store.notify(&tid, state);
             });
 
             Ok(format!(

@@ -1536,8 +1536,18 @@ pub async fn handle_slash(
                 "  /prompt                list available prompts",
                 c_result(),
             )?;
-            renderer.write_line("  /prompt <name>         activate a prompt", c_result())?;
-            renderer.write_line("  /prompt default        clear active prompt", c_result())?;
+            renderer.write_line(
+                "  /prompt <name>         activate a prompt by name",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /prompt default        activate the 'default' prompt if installed,",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "                         otherwise clears the active prompt",
+                c_result(),
+            )?;
             renderer.write_line(
                 "  /regen-prompts        restore built-in prompts to global dir",
                 c_result(),

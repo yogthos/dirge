@@ -47,11 +47,26 @@ impl Sandbox {
         cmd.args([
             "--proc",
             "/proc",
+            // `--dev-bind /dev /dev` was avoided deliberately; the
+            // minimal `--dev /dev` mounts a tmpfs with only the
+            // essential device nodes (null/zero/full/random/urandom
+            // /tty). Outer host devices stay invisible.
             "--dev",
             "/dev",
             "--tmpfs",
             "/tmp",
             "--unshare-all",
+            // Drop the ability to gain new privileges via setuid /
+            // file capabilities — even if the sandboxed bash
+            // somehow encounters a setuid binary on the read-only
+            // host mount it can't escalate.
+            "--new-session",
+            // `--unshare-all` already turns on user / pid / net /
+            // uts / cgroup / ipc namespaces. Add `--unshare-user-try`
+            // explicitly so a future bwrap default change can't
+            // weaken this without our knowledge; `-try` keeps it
+            // best-effort if the kernel doesn't allow user-ns.
+            "--unshare-user-try",
             "--die-with-parent",
             "bash",
             "-c",

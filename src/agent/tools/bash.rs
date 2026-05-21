@@ -210,6 +210,29 @@ impl Tool for BashTool {
         // order. Previously we concatenated stdout then stderr,
         // mis-ordering interleaved output.
         let mut result = output.merged;
+        // Cap raw bash output before it enters LLM context. The
+        // UI's `render_tool_output` already truncates the display,
+        // but the full string was being persisted to
+        // `ToolCallState::Completed` → fed back to the LLM on the
+        // next turn. `cat /dev/urandom | head -c 10M` would have
+        // shoved millions of tokens at the model. Apply the cap
+        // here at the source. 256 KiB ≈ 65k tokens worst-case,
+        // already well above any sensible single-command output.
+        const BASH_OUTPUT_CAP_BYTES: usize = 256 * 1024;
+        if result.len() > BASH_OUTPUT_CAP_BYTES {
+            // Slice at UTF-8 char boundary.
+            let mut cut = BASH_OUTPUT_CAP_BYTES;
+            while cut > 0 && !result.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let dropped = result.len() - cut;
+            result.truncate(cut);
+            result.push_str(&format!(
+                "\n…[bash output truncated: dropped {} bytes ({} KiB total); pipe through head/grep to keep the LLM context lean]",
+                dropped,
+                (cut + dropped) / 1024,
+            ));
+        }
         if output.exit_code != 0 {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
