@@ -535,22 +535,94 @@ mod tests {
         assert_eq!(result.replace_result, Some("[truncated]".to_string()));
     }
 
-    /// Block-precedence: when multiple hooks register, any one calling
-    /// `harness/block` wins. Hooks after the blocker still run (we don't
-    /// short-circuit at the Janet level for simplicity) but the block flag
-    /// stays set.
+    /// First-blocker-wins precedence (Phase 1, matches pi's
+    /// `runner.ts:806-827` `tool_call` semantics). When multiple
+    /// hooks register and one calls `harness/block`, the FIRST
+    /// blocker wins and dispatch stops — subsequent hooks do NOT
+    /// run. Previously last-write-wins, which made the block
+    /// reason depend on plugin load order and ran observers after
+    /// a deny that the user might want to skip on perf grounds.
     #[cfg(feature = "plugin")]
     #[test]
-    fn test_dispatch_tool_hook_block_sticks_across_hooks() {
+    fn dispatch_tool_hook_first_blocker_stops_dispatch() {
         let mut mgr = PluginManager::try_new().unwrap();
-        mgr.eval(r#"(defn block-it [ctx] (harness/block "no"))"#)
+        // Plugin A blocks with reason "first". Plugin B would also
+        // block with reason "second" AND fire a notification to
+        // prove it ran. After the fix, B never runs.
+        mgr.eval(r#"(defn first-block [ctx] (harness/block "first"))"#)
             .unwrap();
-        mgr.eval(r#"(defn noop [ctx] nil)"#).unwrap();
-        mgr.register("on-tool-start", "block-it");
-        mgr.register("on-tool-start", "noop");
+        mgr.eval(
+            r#"(defn second-block [ctx]
+                 (harness/notify "second-also-ran" :warn)
+                 (harness/block "second"))"#,
+        )
+        .unwrap();
+        mgr.register("on-tool-start", "first-block");
+        mgr.register("on-tool-start", "second-block");
 
         let result = mgr.dispatch_tool_hook("on-tool-start", "@{}").unwrap();
-        assert_eq!(result.block, Some("no".to_string()));
+        assert_eq!(
+            result.block,
+            Some("first".to_string()),
+            "first blocker's reason must win",
+        );
+        let pending = mgr.drain_notifications();
+        assert!(
+            !pending.iter().any(|(_, m)| m.contains("second-also-ran")),
+            "second hook should not have run after first blocked: {:?}",
+            pending,
+        );
+    }
+
+    /// When no hook blocks, all hooks run. Confirms the early-stop
+    /// only triggers on an actual `harness/block` call.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn dispatch_tool_hook_runs_all_when_no_block() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn a [ctx] (harness/notify "a-ran"))"#)
+            .unwrap();
+        mgr.eval(r#"(defn b [ctx] (harness/notify "b-ran"))"#)
+            .unwrap();
+        mgr.register("on-tool-start", "a");
+        mgr.register("on-tool-start", "b");
+
+        let _ = mgr.dispatch_tool_hook("on-tool-start", "@{}").unwrap();
+        let pending = mgr.drain_notifications();
+        let combined: String = pending
+            .iter()
+            .map(|(_, m)| m.clone())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(combined.contains("a-ran"), "got: {combined}");
+        assert!(combined.contains("b-ran"), "got: {combined}");
+    }
+
+    /// Mutations (mutate-input, replace-result) keep last-write-wins
+    /// semantics — only `harness/block` is first-wins. This matches
+    /// pi's `runner.ts:858-888` chaining: each handler sees the
+    /// prior's mutation and can override. Confirms the Phase 1
+    /// change to block didn't accidentally also short-circuit on
+    /// mutation slots.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn dispatch_tool_hook_mutations_still_chain_last_wins() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn rewrite-a [ctx] (harness/replace-result "from-a"))"#)
+            .unwrap();
+        mgr.eval(r#"(defn rewrite-b [ctx] (harness/replace-result "from-b"))"#)
+            .unwrap();
+        mgr.register("on-tool-end", "rewrite-a");
+        mgr.register("on-tool-end", "rewrite-b");
+
+        let result = mgr.dispatch_tool_hook("on-tool-end", "@{}").unwrap();
+        assert_eq!(
+            result.replace_result,
+            Some("from-b".to_string()),
+            "last-write-wins for mutations",
+        );
+        // No block fired — block field stays None.
+        assert_eq!(result.block, None);
     }
 
     // --- Phase 3: harness/notify ----------------------------------------
@@ -1941,8 +2013,17 @@ impl PluginManager {
 
     /// Specialized dispatcher for tool-hook events (`on-tool-start`,
     /// `on-tool-end`). Clears all tool-hook slots first so previous-call
-    /// state doesn't leak, runs every registered hook, then collects the
-    /// slot values into a structured result.
+    /// state doesn't leak, runs registered hooks in load order, then
+    /// collects the slot values into a structured result.
+    ///
+    /// **First-blocker-wins**: as soon as ANY hook sets `harness-block`,
+    /// dispatch stops and subsequent hooks do NOT run. This matches
+    /// pi's `runner.ts:806-827` `tool_call` semantics and is more
+    /// intuitive than the prior last-write-wins behavior — once a
+    /// plugin has decided to deny the tool call, running additional
+    /// hooks is wasted work and the block reason becomes load-order-
+    /// dependent. Mutations (`mutate-input`, `replace-result`) keep
+    /// last-write-wins chaining for compatibility.
     pub fn dispatch_tool_hook(
         &mut self,
         hook: &str,
@@ -1954,13 +2035,80 @@ impl PluginManager {
             .worker
             .eval("(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)");
 
-        let _ = self.dispatch(hook, context_janet)?;
+        let names = match self.hooks.get(hook) {
+            Some(names) => names.clone(),
+            None => Vec::new(),
+        };
+
+        for name in &names {
+            // Same catch-wrapping shape as `dispatch` — sanitize the
+            // error, queue chat notification + tracing::warn on
+            // failure, continue dispatch otherwise. Kept inline here
+            // (rather than reusing `dispatch`) so we can check the
+            // harness-block slot AFTER each plugin's hook returns
+            // and break out early. Sharing `dispatch` would require
+            // a flag parameter to either run all or stop-on-block.
+            let code = format!(
+                r#"(try (do (def ctx {ctx}) ({fname} ctx))
+                       ([err fib]
+                         (do
+                           (def sanitized
+                             (harness/sanitize-hook-err
+                               (string "[plugin] hook "
+                                       {hook_lit}
+                                       "."
+                                       {fname_lit}
+                                       " errored: "
+                                       err)))
+                           (harness/push-hook-err sanitized)
+                           (string "DIRGE_HOOK_ERR:" err))))"#,
+                ctx = context_janet,
+                fname = name,
+                hook_lit = format!("\"{}\"", escape_janet_string(hook)),
+                fname_lit = format!("\"{}\"", escape_janet_string(name)),
+            );
+            if let Ok(s) = self.worker.eval(&code)
+                && let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:")
+            {
+                tracing::warn!(
+                    target: "dirge::plugin",
+                    hook = %hook,
+                    function = %name,
+                    error = %msg,
+                    "plugin hook errored — continuing dispatch",
+                );
+            }
+
+            // First-wins block check. Peek the slot WITHOUT clearing —
+            // the final `take_pending_block` below does the clear.
+            // If this plugin set the slot, stop iterating so remaining
+            // plugins don't observe / mutate state for a tool call
+            // that will be refused anyway.
+            if self.has_pending_block() {
+                break;
+            }
+        }
 
         Ok(ToolHookResult {
             block: self.take_pending_block(),
             mutate_input: self.take_pending_mutate_input(),
             replace_result: self.take_pending_replace_result(),
         })
+    }
+
+    /// Peek the `harness-block` slot without clearing it. Returns
+    /// true when a plugin has set the slot in the current dispatch.
+    /// Used by `dispatch_tool_hook` to implement first-wins block
+    /// semantics; the slot is cleared by the final
+    /// `take_pending_block` after iteration completes.
+    fn has_pending_block(&mut self) -> bool {
+        match self
+            .worker
+            .eval("(if (nil? harness-block) \"\" harness-block)")
+        {
+            Ok(s) => !s.is_empty() && s != "nil",
+            Err(_) => false,
+        }
     }
 
     /// Snapshot the plugin-registered slash commands as `(cmd-name,

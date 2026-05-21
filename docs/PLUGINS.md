@@ -161,6 +161,22 @@ some accumulate into a chat-visible response, some get ignored.
   intermediate turn, with `:index` so you can distinguish them.
 - **`on-tool-start` runs *after* permission checks**. If the user denied
   the tool, neither `on-tool-start` nor the actual tool runs.
+- **Multi-plugin `harness/block`: first-wins.** When two or more plugins
+  register `on-tool-start` and one of them calls `(harness/block reason)`,
+  dispatch stops there — subsequent plugins do NOT run for this tool call.
+  Block reason is the first blocker's; load order matters. Matches pi's
+  `runner.ts:806-827` semantics. `harness/mutate-input` and
+  `harness/replace-result` keep the chained last-write-wins behavior so
+  successive plugins can refine each other's mutations.
+- **Subagents (`task` tool) are isolated**: when the LLM calls the `task`
+  tool, dirge runs a one-shot LLM query with no tools, no plugin hooks,
+  no permission gates, and no plugin state. Hooks registered for
+  `on-tool-start` / `on-tool-end` do NOT fire for tools the subagent
+  might internally consider — because the subagent has no tool access
+  at all. Matches opencode's and pi's subagent design: isolation by
+  default. If you need plugin observability into subtask work, route it
+  through `harness/log` from the parent's `on-response` or `on-turn-end`
+  hooks instead.
 
 ---
 

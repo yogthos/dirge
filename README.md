@@ -42,7 +42,7 @@ Most tool calls (`read`, `write`, `edit`, `bash`, `grep`, `find_files`, `list_di
 
 ### Error recovery
 
-Transient API errors (network, rate limits) are automatically retried with exponential backoff (1s → 2s → 4s, max 3 retries) plus 0–25% jitter so concurrent agents don't retry in lockstep. Auth and unknown errors surface immediately. Context-length errors are not retried — surface a `/compress` hint instead. Stream events are buffered and only flushed on success, so retries don't duplicate tokens; if any tool calls were already dispatched (side effects applied), the partial buffer is flushed and the error is surfaced without retrying.
+Transient API errors (network, rate limits, Anthropic `overloaded_error`) are automatically retried with exponential backoff (1s → 2s → 4s, max 3 retries) plus 0–25% jitter so concurrent agents don't retry in lockstep. Auth and unknown errors surface immediately. Context-length errors are not retried — surface a `/compress` hint instead. Tokens stream live to the chat as they arrive; if a retry fires, the user sees an "(error: …; retrying)" banner and the next attempt's tokens stream in fresh. If any tool calls were already dispatched (side effects applied), the error is surfaced without retrying so a partial-but-applied turn isn't re-run.
 
 ## Installation
 
