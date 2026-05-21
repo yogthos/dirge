@@ -144,7 +144,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     let max_turns = cli.resolve_max_agent_turns(cfg);
     builder = builder.default_max_turns(max_turns);
 
-    if let Some(temp) = cli.temperature {
+    // Temperature: CLI > config > unset. Previously only `cli.temperature`
+    // was checked, so users couldn't set a default in config.json.
+    if let Some(temp) = cli.resolve_temperature(cfg) {
         let clamped = temp.clamp(0.0, 2.0);
         builder = builder.temperature(clamped);
     }
@@ -217,6 +219,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::ApplyPatchTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
+                plan_file.clone(),
                 cache.clone(),
             )),
         ];

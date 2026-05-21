@@ -626,6 +626,9 @@ pub async fn handle_slash(
                 } else {
                     context.current_prompt = None;
                     context.current_prompt_name = None;
+                    // Mirror into session so `-c` / `/sessions <id>`
+                    // resumes the same prompt state next time.
+                    session.current_prompt_name = None;
                     let model = client.completion_model(session.model.to_string());
                     *agent = crate::provider::build_agent(
                         model,
@@ -652,6 +655,9 @@ pub async fn handle_slash(
                 if let Some(content) = context.prompts.get(name) {
                     context.current_prompt = Some(content.clone());
                     context.current_prompt_name = Some(name.to_string());
+                    // Mirror into the session so resuming restores the
+                    // same active prompt instead of defaulting to "code".
+                    session.current_prompt_name = Some(name.to_string());
                     let model = client.completion_model(session.model.to_string());
                     *agent = crate::provider::build_agent(
                         model,

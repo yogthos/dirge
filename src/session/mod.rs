@@ -164,6 +164,12 @@ pub struct Session {
     /// populates it from `messages` for legacy session files.
     #[serde(default)]
     pub message_store: HashMap<CompactString, SessionMessage>,
+    /// Active prompt name (e.g. "code", "plan", "review"). Persisted
+    /// with the session so resuming via `-c` / `/sessions <id>`
+    /// restores the same prompt the user had active. Defaulted to
+    /// `None` for backward compat with pre-feature session files.
+    #[serde(default)]
+    pub current_prompt_name: Option<String>,
 }
 
 impl Session {
@@ -194,6 +200,7 @@ impl Session {
             next_entry_seq: 0,
             tree: SessionTree::default(),
             message_store: HashMap::new(),
+            current_prompt_name: None,
         }
     }
 
@@ -504,7 +511,15 @@ impl Session {
 
     pub fn compacted_context(&self) -> (Option<&str>, usize) {
         match self.compactions.last() {
-            Some(c) => (Some(c.summary.as_str()), c.first_kept_index),
+            // Clamp `first_kept_index` to `messages.len()` defensively
+            // in case the session was edited externally or shrunk by
+            // `switch_to_leaf` / `pop_last_message` after the
+            // compaction was recorded. Without this, callers doing
+            // `messages[first_kept..]` would panic on stale indices.
+            Some(c) => (
+                Some(c.summary.as_str()),
+                c.first_kept_index.min(self.messages.len()),
+            ),
             None => (None, 0),
         }
     }

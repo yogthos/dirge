@@ -1,7 +1,7 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
@@ -30,6 +30,12 @@ pub struct ApplyPatchTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     cache: Option<ToolCache>,
+    /// When active prompt is `plan`/`review`/`review-security`, writes
+    /// are restricted to this single file (typically `PLAN.md`). Any
+    /// op targeting another path is refused. Mirrors the gate on
+    /// `WriteTool` / `EditTool` so a planning-mode session can't
+    /// sneak filesystem changes through `apply_patch`.
+    plan_file: Option<PathBuf>,
 }
 
 impl ApplyPatchTool {
@@ -39,18 +45,21 @@ impl ApplyPatchTool {
             permission,
             ask_tx,
             cache: None,
+            plan_file: None,
         }
     }
 
     pub fn with_cache(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
+        plan_file: Option<PathBuf>,
         cache: ToolCache,
     ) -> Self {
         Self {
             permission,
             ask_tx,
             cache: Some(cache),
+            plan_file,
         }
     }
 }
@@ -193,6 +202,36 @@ impl Tool for ApplyPatchTool {
         let mut results = Vec::new();
 
         for op in &args.operations {
+            // Plan-mode write restriction: when active prompt is
+            // plan/review/review-security, `plan_file` is set to
+            // PLAN.md and every op's target path must match it. This
+            // mirrors the gate on `WriteTool` + `EditTool` so plan
+            // mode actually means "no filesystem changes outside
+            // PLAN.md" — apply_patch previously bypassed it.
+            let paths_to_check: Vec<&str> = match op {
+                PatchOp::Create { path, .. }
+                | PatchOp::Update { path, .. }
+                | PatchOp::Delete { path } => vec![path.as_str()],
+                PatchOp::Rename { path, new_path } => {
+                    vec![path.as_str(), new_path.as_str()]
+                }
+            };
+            if let Some(plan) = self.plan_file.as_ref() {
+                for path in &paths_to_check {
+                    let target = Path::new(path);
+                    let target_canon = target
+                        .canonicalize()
+                        .unwrap_or_else(|_| target.to_path_buf());
+                    let plan_canon = plan.canonicalize().unwrap_or_else(|_| plan.clone());
+                    if target_canon != plan_canon {
+                        return Err(ToolError::Msg(format!(
+                            "plan mode is active — apply_patch can only target {}; got {}",
+                            plan.display(),
+                            path,
+                        )));
+                    }
+                }
+            }
             // Permission check for the target path
             match op {
                 PatchOp::Create { path, .. }

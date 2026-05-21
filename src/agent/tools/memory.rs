@@ -45,7 +45,8 @@ impl Tool for MemoryTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "Action: view, write, or delete"
+                        "enum": ["view", "write", "delete"],
+                        "description": "view: read one or list all; write: create/overwrite; delete: remove a memory file"
                     },
                     "path": {
                         "type": "string",

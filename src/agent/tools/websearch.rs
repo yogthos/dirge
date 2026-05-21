@@ -103,7 +103,8 @@ impl Tool for WebSearchTool {
                         "description": "The search query"
                     },
                     "num_results": {
-                        "type": "number",
+                        "type": "integer",
+                        "minimum": 1,
                         "description": "Maximum number of results (default: 10)"
                     }
                 },

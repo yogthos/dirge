@@ -253,7 +253,40 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(session_id) = &cli.session {
-        session = session::storage::load_session(session_id)?;
+        // Try exact id first; fall back to prefix match so the CLI
+        // is as forgiving as the interactive `/sessions <prefix>`
+        // command. Ambiguous prefix surfaces a list of matching ids.
+        match session::storage::load_session(session_id) {
+            Ok(s) => session = s,
+            Err(_) => {
+                let matches = session::storage::find_sessions_by_prefix(session_id)?;
+                match matches.len() {
+                    0 => anyhow::bail!("no session matching id or prefix {:?}", session_id),
+                    1 => session = matches.into_iter().next().expect("len == 1"),
+                    n => {
+                        let ids: Vec<String> =
+                            matches.iter().take(5).map(|s| s.id.to_string()).collect();
+                        anyhow::bail!(
+                            "session prefix {:?} matches {} sessions: {} — pass a longer prefix",
+                            session_id,
+                            n,
+                            ids.join(", "),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Restore the active prompt from the loaded session so resumed
+    // sessions don't silently snap back to the default `code` prompt.
+    // Default-prompt initialization above set context.current_prompt
+    // to `code`; we override it here if the session carries a name.
+    if let Some(name) = session.current_prompt_name.clone()
+        && let Some(content) = context.prompts.get(&name)
+    {
+        context.current_prompt = Some(content.clone());
+        context.current_prompt_name = Some(name);
     }
 
     let client = provider::create_client(
