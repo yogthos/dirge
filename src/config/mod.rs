@@ -104,9 +104,18 @@ pub struct Config {
     pub show_edit_diff: Option<bool>,
     pub tool_result_max_chars: Option<usize>,
     pub default_prompt: Option<String>,
-    /// UI color theme. Known values: `phosphor` (default, 80s CRT
-    /// green) and `plain` (the pre-theme white/cyan look). Unknown
-    /// values fall back to `phosphor` with a warning.
+    /// UI color theme. Known built-in values: `phosphor` (default,
+    /// 80s CRT green) and `plain` (white/cyan).
+    ///
+    /// Any other value looks for a custom theme file at
+    /// `~/.config/dirge/<theme>.theme.json` — see the
+    /// `ui::theme` module for the JSON format. Fields not in the
+    /// file inherit from the phosphor preset so minimal overrides
+    /// work (e.g. just `{"accent": "magenta"}`).
+    ///
+    /// If neither the built-in name nor the file matches, dirge
+    /// falls back to phosphor with a warning rather than refusing
+    /// to start.
     pub theme: Option<String>,
     pub tools: Option<ToolsConfig>,
     #[cfg(feature = "lsp")]

@@ -1,6 +1,7 @@
 # dirge roadmap
 
-theme color styles as json
+minor fixes:
+* read cache could return stale "past EOF" result across sessions
 
 Forward-looking work organized into phases. Each phase is a self-
 contained PR/series with TDD coverage, scoped to ship independently.
