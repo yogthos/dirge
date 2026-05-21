@@ -345,30 +345,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let client = provider::create_client(
-        &provider,
-        cli.api_key.as_deref(),
-        &cfg.custom_providers_map(),
-    )?;
-
-    #[cfg(feature = "mcp")]
-    let mcp_manager = if let Some(servers) = &cfg.mcp_servers {
-        if !cli.resolve_no_tools(&cfg) {
-            Some(extras::mcp::McpClientManager::connect_all(servers).await)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    #[cfg(feature = "semantic")]
-    let semantic_manager = if !cli.resolve_no_tools(&cfg) {
-        Some(semantic::SemanticManager::new())
-    } else {
-        None
-    };
-
+    // Plugin loading must happen BEFORE `create_client` so plugin-
+    // registered providers (via `harness/register-provider`) are
+    // installed into `PLUGIN_PROVIDERS` before
+    // `resolve_provider_info` runs. Previously plugins loaded later,
+    // so `--provider <plugin-name>` failed with "Unknown provider"
+    // even though the plugin defined it.
     #[cfg(feature = "plugin")]
     let plugin_manager = match plugin::PluginManager::try_new() {
         Ok(pm) => Some(std::sync::Arc::new(std::sync::Mutex::new(pm))),
@@ -377,7 +359,6 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
-
     // Make the PluginManager visible to HookedToolDyn (which runs inside
     // rig's tool dispatch, where we can't easily plumb the Arc through).
     // Set once, before any tool is built or called.
@@ -385,7 +366,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pm_arc) = plugin_manager.as_ref() {
         plugin::hook::init_global(pm_arc.clone());
     }
-
     // Pull the dialog-request receiver out of the PluginManager once,
     // here, so we can hand it to the UI loop. After this point, calling
     // take_dialog_rx again returns None — single owner by design. Always
@@ -398,7 +378,6 @@ async fn main() -> anyhow::Result<()> {
     });
     #[cfg(not(feature = "plugin"))]
     let dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<plugin::DialogRequest>> = None;
-
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;
@@ -482,6 +461,30 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  registered {} plugin provider(s)", n);
         }
     }
+
+    let client = provider::create_client(
+        &provider,
+        cli.api_key.as_deref(),
+        &cfg.custom_providers_map(),
+    )?;
+
+    #[cfg(feature = "mcp")]
+    let mcp_manager = if let Some(servers) = &cfg.mcp_servers {
+        if !cli.resolve_no_tools(&cfg) {
+            Some(extras::mcp::McpClientManager::connect_all(servers).await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    #[cfg(feature = "semantic")]
+    let semantic_manager = if !cli.resolve_no_tools(&cfg) {
+        Some(semantic::SemanticManager::new())
+    } else {
+        None
+    };
 
     #[cfg(feature = "acp")]
     if cli.acp_enabled {

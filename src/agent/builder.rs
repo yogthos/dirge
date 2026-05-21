@@ -326,11 +326,55 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 .collect_tools(permission.clone(), ask_tx.clone())
                 .await;
             if !mcp_tools.is_empty() {
-                let dyn_tools: Vec<Box<dyn rig::tool::ToolDyn>> = mcp_tools
+                // Skip MCP tools whose names collide with dirge
+                // built-ins. Without this, the MCP version would
+                // silently shadow `read`/`write`/`bash`/etc. —
+                // rig's builder takes the last-added tool when
+                // names clash, and dirge adds built-ins first.
+                // Better to warn loudly and refuse to shadow than
+                // to let an arbitrary MCP server replace core tools.
+                const BUILTIN_TOOL_NAMES: &[&str] = &[
+                    "read",
+                    "write",
+                    "edit",
+                    "bash",
+                    "grep",
+                    "find_files",
+                    "glob",
+                    "list_dir",
+                    "write_todo_list",
+                    "apply_patch",
+                    "memory",
+                    "skill",
+                    "task",
+                    "task_status",
+                    "question",
+                    "webfetch",
+                    "websearch",
+                    "lsp",
+                ];
+                let filtered: Vec<crate::extras::mcp::tool::McpTool> = mcp_tools
                     .into_iter()
-                    .map(|t| Box::new(t) as Box<dyn rig::tool::ToolDyn>)
+                    .filter(|t| {
+                        let name = t.definition.name.as_ref();
+                        if BUILTIN_TOOL_NAMES.contains(&name) {
+                            eprintln!(
+                                "warning: MCP server '{}' exports tool '{}' which collides with a dirge built-in; skipping MCP version",
+                                t.server_name, name,
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .collect();
-                builder = builder.tools(hookify(dyn_tools));
+                if !filtered.is_empty() {
+                    let dyn_tools: Vec<Box<dyn rig::tool::ToolDyn>> = filtered
+                        .into_iter()
+                        .map(|t| Box::new(t) as Box<dyn rig::tool::ToolDyn>)
+                        .collect();
+                    builder = builder.tools(hookify(dyn_tools));
+                }
             }
         }
 
