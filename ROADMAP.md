@@ -1,36 +1,3 @@
-# bugs
-
-the avatar ends up being intermittently rendered on multiple lines when text scrolls
-
-# minor UI/UX clean up
-
-use different color of user messages and dirge messages so it's easy to differentiate visually
-
-this looks kinda ugly inner right lines don't line up either, maybe should just be orange like alert box
-╭─ BASH ─ "cd /Users/yogthos/src/tmp/guestbook && clojure -M:test -n..." ──────────────────────────────────────────────╮
-│░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒▒░▓▒░▒░▓░▒│
-│                                                ░▒▓  NO OUTPUT  ▓▒░                                                 │
-│                                         tool denied · aborted · no result                                          │
-│▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓░▒░▓▒░▓░▒▓│
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-
-after alert message, the next box sometimes ends up cut off at the top 
-
-  -> will allow: /Users/yogthos/src/tmp/guestbook/src/clj/yourname/guestbook/web/routes/*
-  allowed edit /Users/yogthos/src/tmp/guestbook/src/clj/yourname/guestbook/web/routes/* (saved to session)
-│ Toolset error: ToolCallError: ToolCallError: old_text not found in '/Users/yogthos/src/tmp/guestbook/src/clj/yourna… │
-│ Ensure the exact text matches including whitespace and line endings.                                                 │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-
-tables don't always render aligned on the right most of the last column
-
-│ File                              │ Action │ Status │
-├───────────────────────────────────┼────────┼────────┤
-│ src/clj/yourname/guestbook/web/c… │ CREATE │ ✅      │
-│ test/clj/yourname/guestbook/web/… │ CREATE │ ✅      │
-│ src/clj/yourname/guestbook/web/r… │ MODIFY │ ✅      │
-│ src/clj/yourname/guestbook/core.… │ MODIFY │ ✅      │
-
 # dirge roadmap
 
 Forward-looking work organized into phases. Each phase is a self-
