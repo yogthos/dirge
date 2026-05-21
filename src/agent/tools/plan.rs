@@ -62,6 +62,12 @@ impl Tool for PlanEnterTool {
     }
 
     async fn call(&self, _args: PlanEnterArgs) -> Result<String, ToolError> {
+        // Note: this tool doesn't go through `check_perm` because the
+        // plan_tx channel itself surfaces a confirmation dialog to the
+        // user — the user has to explicitly Accept or Reject the mode
+        // switch via `PlanSwitchResponse`. Routing through `check_perm`
+        // would double-ask. This matches how `harness/confirm` works
+        // in the plugin layer.
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.plan_tx

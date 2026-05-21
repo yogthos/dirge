@@ -70,7 +70,14 @@ impl Theme {
     pub const fn phosphor() -> Self {
         Theme {
             agent: Color::Green,
-            user: Color::Green,
+            // Cyan complements phosphor green without breaking the
+            // CRT aesthetic — classic CRTs shipped with green OR
+            // cyan/amber phosphors and the cyan tone reads
+            // distinct-but-related. Before this both `user` and
+            // `agent` were `Color::Green` so user messages were
+            // visually indistinguishable from the agent's output —
+            // confusing when scrolling chat history.
+            user: Color::Cyan,
             system: Color::DarkGreen,
             tool: Color::Green,
             perm: Color::Yellow,

@@ -72,13 +72,22 @@ pub struct Renderer {
     input_rows: u16,
     monochrome: bool,
     pub selection_active: bool,
-    pub selection_start: Option<usize>,
-    pub selection_end: Option<usize>,
+    /// Selection anchor as `(buffer_line_index, char_offset_in_line)`.
+    /// Char offset is in *chars* (not bytes) so multi-byte UTF-8 glyphs
+    /// behave the same as ASCII. `(line, line_len)` is a valid past-the-
+    /// end position used when dragging past the line's right edge.
+    pub selection_start: Option<(usize, usize)>,
+    pub selection_end: Option<(usize, usize)>,
     panel_mode: PanelMode,
     /// Most-recently set panel snapshot. The UI rebuilds and pushes this
     /// before each redraw so render_viewport/draw_bottom can repaint the
     /// panel along with the rest of the screen.
     panel_data: PanelData,
+    /// What the agent is doing — drives the bottom-left ASCII avatar.
+    avatar_state: crate::ui::avatar::AvatarState,
+    /// Animation flip; toggled by `tick_avatar()` so the avatar's
+    /// eyes / mouth alternate between two poses per state.
+    avatar_tick: bool,
 }
 
 impl Renderer {
@@ -98,7 +107,18 @@ impl Renderer {
             selection_end: None,
             panel_mode: PanelMode::Auto,
             panel_data: PanelData::default(),
+            avatar_state: crate::ui::avatar::AvatarState::Idle,
+            avatar_tick: false,
         })
+    }
+
+    /// Update the avatar state and trigger a repaint of the bottom-left
+    /// pixels. Cheap when the state hasn't changed — only the existing
+    /// 3-row × 5-col patch is re-drawn.
+    pub fn set_avatar_state(&mut self, state: crate::ui::avatar::AvatarState) {
+        if self.avatar_state != state {
+            self.avatar_state = state;
+        }
     }
 
     pub fn set_panel_mode(&mut self, mode: PanelMode) {
@@ -226,6 +246,24 @@ impl Renderer {
         rows.saturating_sub(self.input_rows + 1)
     }
 
+    /// Map a screen `(row, col)` to a `(line_idx, char_col)` anchor for
+    /// granular selection. `col` is the absolute terminal column; we
+    /// subtract `content_indent()` to get the char offset within the
+    /// rendered line, clamped to the line's char count so dragging
+    /// past the right edge anchors at the end-of-line.
+    pub fn buffer_pos_at(&self, row: u16, col: u16) -> Option<(usize, usize)> {
+        let line_idx = self.buffer_line_at_row(row)?;
+        let entry = self.buffer.get(line_idx)?;
+        let line_len = entry.text.chars().count();
+        let indent = self.content_indent() as u16;
+        let char_col = if col < indent {
+            0
+        } else {
+            (col - indent) as usize
+        };
+        Some((line_idx, char_col.min(line_len)))
+    }
+
     pub fn buffer_line_at_row(&self, row: u16) -> Option<usize> {
         let (_, rows) = self.terminal_size();
         let visible = rows.saturating_sub(self.input_rows + 1) as usize;
@@ -250,18 +288,42 @@ impl Renderer {
     }
 
     pub fn selected_text(&self) -> Option<String> {
+        // Normalize (start, end) so start <= end in row-major order:
+        // earlier row wins; same row → earlier column wins.
         let (start, end) = match (self.selection_start, self.selection_end) {
-            (Some(s), Some(e)) if s <= e => (s, e),
+            (Some(s), Some(e)) if (s.0, s.1) <= (e.0, e.1) => (s, e),
             (Some(s), Some(e)) => (e, s),
             _ => return None,
         };
         let mut result = String::new();
-        for i in start..=end {
-            if let Some(entry) = self.buffer.get(i) {
-                if !result.is_empty() {
-                    result.push('\n');
+        if start.0 == end.0 {
+            // Single-row selection: substring from start.1 to end.1.
+            if let Some(entry) = self.buffer.get(start.0) {
+                let chars: Vec<char> = entry.text.chars().collect();
+                let lo = start.1.min(chars.len());
+                let hi = end.1.min(chars.len());
+                if lo < hi {
+                    result.extend(&chars[lo..hi]);
                 }
-                result.push_str(&entry.text);
+            }
+        } else {
+            // Multi-row: tail of start row, full middle rows, head of end row.
+            if let Some(entry) = self.buffer.get(start.0) {
+                let chars: Vec<char> = entry.text.chars().collect();
+                let lo = start.1.min(chars.len());
+                result.extend(&chars[lo..]);
+            }
+            for i in (start.0 + 1)..end.0 {
+                result.push('\n');
+                if let Some(entry) = self.buffer.get(i) {
+                    result.push_str(&entry.text);
+                }
+            }
+            result.push('\n');
+            if let Some(entry) = self.buffer.get(end.0) {
+                let chars: Vec<char> = entry.text.chars().collect();
+                let hi = end.1.min(chars.len());
+                result.extend(&chars[..hi]);
             }
         }
         if result.is_empty() {
@@ -405,43 +467,79 @@ impl Renderer {
             let text_chars: usize = if start + i < end {
                 let entry = &self.buffer[start + i];
                 let line_idx = start + i;
-                let text: String = entry.text.chars().take(line_cap).collect();
-                let actual_chars = text.chars().count();
+                let chars: Vec<char> = entry.text.chars().take(line_cap).collect();
+                let actual_chars = chars.len();
 
-                let is_selected = self.selection_active
+                // Resolve the per-row selection span as char indices
+                // `[sel_lo, sel_hi)` within this row's `chars` slice.
+                // None when this row has no selected chars.
+                let sel_span: Option<(usize, usize)> = if self.selection_active
                     && self.selection_start.is_some()
                     && self.selection_end.is_some()
-                    && {
-                        let s = self.selection_start.unwrap();
-                        let e = self.selection_end.unwrap();
-                        let lo = s.min(e);
-                        let hi = s.max(e);
-                        line_idx >= lo && line_idx <= hi
+                {
+                    let s = self.selection_start.unwrap();
+                    let e = self.selection_end.unwrap();
+                    // Normalize so `lo` comes before `hi` in row-major
+                    // order: earlier row wins; same row → earlier col.
+                    let (lo, hi) = if (s.0, s.1) <= (e.0, e.1) {
+                        (s, e)
+                    } else {
+                        (e, s)
                     };
+                    if line_idx < lo.0 || line_idx > hi.0 {
+                        None
+                    } else {
+                        let from = if line_idx == lo.0 { lo.1 } else { 0 };
+                        let to = if line_idx == hi.0 {
+                            hi.1.min(actual_chars)
+                        } else {
+                            actual_chars
+                        };
+                        if from < to { Some((from, to)) } else { None }
+                    }
+                } else {
+                    None
+                };
 
-                if is_selected {
-                    write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
-                }
-                // Bold attribute simulates the CRT phosphor bloom: on
-                // most modern terminals it nudges the glyphs to a
-                // heavier weight and a brighter shade of the chosen
-                // color. We apply it to bright tones only (the dim
-                // green / dim grey colors must stay un-bloomed to
-                // preserve the two-tone phosphor depth shown in the
-                // reference btop screenshots).
                 let bloom = crate::ui::theme::is_bright(entry.color);
-                if bloom {
-                    write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                // Paint the row in up to three runs: pre-selection,
+                // selected (reverse-video), post-selection. When no
+                // selection touches this row, we just paint the whole
+                // run once.
+                let paint_run = |stdout: &mut std::io::Stdout,
+                                 slice: &[char],
+                                 reverse: bool|
+                 -> io::Result<()> {
+                    if slice.is_empty() {
+                        return Ok(());
+                    }
+                    if reverse {
+                        write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
+                    }
+                    if bloom {
+                        write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                    }
+                    write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
+                    let s: String = slice.iter().collect();
+                    write!(stdout, "{}", s)?;
+                    if bloom {
+                        write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                    }
+                    if reverse {
+                        write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
+                    }
+                    write!(stdout, "{}", ResetColor)?;
+                    Ok(())
+                };
+
+                match sel_span {
+                    None => paint_run(&mut stdout, &chars, false)?,
+                    Some((from, to)) => {
+                        paint_run(&mut stdout, &chars[..from], false)?;
+                        paint_run(&mut stdout, &chars[from..to], true)?;
+                        paint_run(&mut stdout, &chars[to..], false)?;
+                    }
                 }
-                write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
-                write!(stdout, "{}", text)?;
-                if bloom {
-                    write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-                }
-                if is_selected {
-                    write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
-                }
-                write!(stdout, "{}", ResetColor)?;
                 actual_chars
             } else {
                 0
@@ -505,10 +603,28 @@ impl Renderer {
             let mut stdout = io::stdout();
             let _ = stdout.execute(ScrollUp(1));
             self.lines = self.lines.saturating_sub(1);
-            for &r in &[max_content.saturating_sub(1), max_content] {
+            // After ScrollUp, the input row (with the avatar) and any
+            // continuation input rows + the status row all shifted up
+            // by 1. Their fragments now sit on `max_content - 1`
+            // through `rows - 2`. Clear EVERY row from the last chat
+            // row through the previous status row — anything else
+            // would leave avatar/status fragments visible at the
+            // wrong row, which is the symptom users see as "avatar
+            // duplicated on scroll." The bottom row (now blank from
+            // ScrollUp) doesn't need clearing.
+            let clear_start = max_content.saturating_sub(1);
+            let clear_end = rows.saturating_sub(1); // exclusive
+            for r in clear_start..clear_end {
                 let _ = stdout.execute(MoveTo(0, r));
                 let _ = write!(stdout, "{}", " ".repeat(content_cols as usize));
             }
+            // Repaint the avatar after the wipe — otherwise the
+            // avatar visibly blinks out between writes during
+            // streaming (until the next `draw_bottom` is called by
+            // the UI loop on a significant event). Cheap: one
+            // MoveTo + 5 chars at a known column.
+            let input_top = rows.saturating_sub(self.input_rows + 1);
+            let _ = self.draw_avatar(&mut stdout, input_top);
             let _ = stdout.flush();
         }
     }
@@ -548,8 +664,20 @@ impl Renderer {
                     if indent > 0 {
                         write!(stdout, "{}", " ".repeat(indent))?;
                     }
+                    // Bold-glow for bright tones so streamed text
+                    // reads the same as the post-redraw render_viewport
+                    // path. Without this, streaming chunks look flat
+                    // until the next full repaint shifts them to the
+                    // bright/bold weight.
+                    let bloom = crate::ui::theme::is_bright(color);
+                    if bloom {
+                        write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                    }
                     write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                     writeln!(stdout, "{}", chunk)?;
+                    if bloom {
+                        write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                    }
                     write!(stdout, "{}", ResetColor)?;
                     self.lines = self.lines.saturating_add(1);
                     self.col = 0;
@@ -603,8 +731,15 @@ impl Renderer {
                     let r = self.content_row();
                     stdout.execute(MoveTo(indent + self.col, r))?;
                     if !segment.is_empty() {
+                        let bloom = crate::ui::theme::is_bright(color);
+                        if bloom {
+                            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                        }
                         write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                         write!(stdout, "{}", segment)?;
+                        if bloom {
+                            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                        }
                         write!(stdout, "{}", ResetColor)?;
                     }
                     writeln!(stdout)?;
@@ -633,8 +768,15 @@ impl Renderer {
                         let mut stdout = io::stdout();
                         let r = self.content_row();
                         stdout.execute(MoveTo(indent + self.col, r))?;
+                        let bloom = crate::ui::theme::is_bright(color);
+                        if bloom {
+                            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+                        }
                         write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                         write!(stdout, "{}", chunk)?;
+                        if bloom {
+                            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+                        }
                         write!(stdout, "{}", ResetColor)?;
                         self.col = self.col.saturating_add(chunk.chars().count() as u16);
                     }
@@ -754,6 +896,7 @@ impl Renderer {
         // pulse — readable without becoming distracting.
         let prompt_main = if is_running {
             self.spinner_tick = !self.spinner_tick;
+            self.avatar_tick = !self.avatar_tick;
             // Two-state spinner using ░/▒ blocks so the eye registers
             // motion at slow refresh rates.
             if self.spinner_tick {
@@ -783,6 +926,13 @@ impl Renderer {
             stdout.execute(MoveTo(0, row))?;
             write!(stdout, "{}", " ".repeat(cols as usize))?;
             stdout.execute(MoveTo(bottom_indent as u16, row))?;
+            // Bold-glow the prompt indicator + input text so they
+            // match the chat above. Without this the bottom area
+            // looked dimmer than the chat that scrolled past it.
+            let accent_bloom = crate::ui::theme::is_bright(crate::ui::theme::accent());
+            if accent_bloom {
+                write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+            }
             write!(
                 stdout,
                 "{}",
@@ -794,10 +944,17 @@ impl Renderer {
             } else {
                 write!(stdout, "{}", prompt_cont)?;
             }
+            if accent_bloom {
+                write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+            }
             // Switch to the user-input text tone (bright phosphor)
             // before writing what the user typed, so the prompt
             // accent and the input text are visually distinct but
             // both on the green axis.
+            let user_bloom = crate::ui::theme::is_bright(crate::ui::theme::user());
+            if user_bloom {
+                write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+            }
             write!(
                 stdout,
                 "{}",
@@ -808,6 +965,9 @@ impl Renderer {
             {
                 let slice: String = chars[vr.char_start..vr.char_end].iter().collect();
                 write!(stdout, "{}", slice)?;
+            }
+            if user_bloom {
+                write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
             }
             write!(stdout, "{}", ResetColor)?;
         }
@@ -856,13 +1016,27 @@ impl Renderer {
         // prefix` + cursor offset within content).
         let cursor_x =
             (bottom_indent + 3 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
-        stdout.execute(MoveTo(cursor_x, cursor_row))?;
+
+        // Hide the cursor BEFORE painting panel + avatar — those paints
+        // execute many `MoveTo` calls and the hardware cursor would
+        // visibly flicker across the right-hand panel while iterating
+        // its rows. Hidden cursor stays invisible until the final Show
+        // below puts it back at the input prompt.
+        stdout.execute(Hide)?;
 
         if self.panel_visible() {
             self.draw_panel(&mut stdout, rows)?;
-            // draw_panel moves the cursor — return it to the input.
-            stdout.execute(MoveTo(cursor_x, cursor_row))?;
         }
+        // Paint the avatar in the bottom-left margin (cols 0..AVATAR_W,
+        // rows just above the input row). Only painted when the
+        // centering indent leaves room — on narrow terminals where
+        // the chat band already starts at col 0, there's no margin to
+        // put a face into.
+        self.draw_avatar(&mut stdout, input_top)?;
+
+        // Place the cursor at the input position; the Show below will
+        // make it visible exactly there.
+        stdout.execute(MoveTo(cursor_x, cursor_row))?;
 
         // draw_bottom is the only place the visible cursor belongs (at the
         // user's input position). Other renderer paths (render_viewport,
@@ -870,6 +1044,46 @@ impl Renderer {
         // doesn't drag the hardware cursor across the chat area.
         stdout.execute(Show)?;
         stdout.flush()?;
+        Ok(())
+    }
+
+    /// Paint the bottom-left ASCII avatar at cols `0..AVATAR_W`, in the
+    /// three rows just above `input_top`. Skipped when the chat band's
+    /// centering indent is too narrow (`< AVATAR_W + 1`) to fit the
+    /// avatar without overlapping chat content.
+    fn draw_avatar(&self, stdout: &mut io::Stdout, input_top: u16) -> io::Result<()> {
+        use crate::ui::avatar::{AVATAR_W, art, color};
+        // Single-row avatar painted on the *input* row, horizontally
+        // centered in the left margin between col 0 and the input
+        // prompt. Single-row + on the input row means the avatar
+        // never gets caught in `ensure_room`'s `ScrollUp(1)` — the
+        // input row sits below the scroll region, so the avatar
+        // doesn't smear into the scrollback when chat grows.
+        let indent = self.content_indent();
+        if indent < AVATAR_W + 2 {
+            // Not enough margin to fit the avatar with breathing
+            // room around the input prompt's left edge.
+            return Ok(());
+        }
+        let face = art(self.avatar_state, self.avatar_tick);
+        let painted = self.color(color(self.avatar_state));
+        // Center within [0, indent): x = (indent - AVATAR_W) / 2
+        let x = ((indent - AVATAR_W) / 2) as u16;
+        // Wipe the full margin (cols 0..indent) first so a face from
+        // a previous state doesn't leave fossils when its position
+        // shifts (e.g. theme change, indent recomputed on resize).
+        stdout.execute(MoveTo(0, input_top))?;
+        write!(stdout, "{}", " ".repeat(indent))?;
+        stdout.execute(MoveTo(x, input_top))?;
+        write!(stdout, "{}", SetForegroundColor(painted))?;
+        if crate::ui::theme::is_bright(color(self.avatar_state)) {
+            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
+        }
+        write!(stdout, "{}", face)?;
+        if crate::ui::theme::is_bright(color(self.avatar_state)) {
+            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
+        }
+        write!(stdout, "{}", ResetColor)?;
         Ok(())
     }
 
@@ -1182,7 +1396,7 @@ mod tests {
         let mut r = Renderer::new().expect("renderer");
         for i in 0..n {
             r.buffer.push(LineEntry {
-                text: CompactString::new(&format!("line {i}")),
+                text: CompactString::new(format!("line {i}")),
                 color: Color::White,
             });
         }
@@ -1220,7 +1434,7 @@ mod tests {
         // Stream in 8 new lines while the user is scrolled up.
         for i in 0..8 {
             r.push_buffer_line(LineEntry {
-                text: CompactString::new(&format!("new {i}")),
+                text: CompactString::new(format!("new {i}")),
                 color: Color::White,
             });
         }
@@ -1244,7 +1458,7 @@ mod tests {
         // Replace from line 40 with twice as many lines.
         let new_lines: Vec<LineEntry> = (0..20)
             .map(|i| LineEntry {
-                text: CompactString::new(&format!("repl {i}")),
+                text: CompactString::new(format!("repl {i}")),
                 color: Color::White,
             })
             .collect();
@@ -1255,7 +1469,7 @@ mod tests {
         // Now replace with FEWER lines (response got shorter via re-render).
         let shorter: Vec<LineEntry> = (0..5)
             .map(|i| LineEntry {
-                text: CompactString::new(&format!("sh {i}")),
+                text: CompactString::new(format!("sh {i}")),
                 color: Color::White,
             })
             .collect();
@@ -1282,7 +1496,7 @@ mod tests {
 
         for i in 0..5 {
             r.push_buffer_line(LineEntry {
-                text: CompactString::new(&format!("new {i}")),
+                text: CompactString::new(format!("new {i}")),
                 color: Color::White,
             });
         }
@@ -1305,19 +1519,19 @@ mod tests {
             r.scroll_line_up();
         }
         r.selection_active = true;
-        r.selection_start = Some(15);
-        r.selection_end = Some(20);
+        r.selection_start = Some((15, 0));
+        r.selection_end = Some((20, 5));
 
         for i in 0..7 {
             r.push_buffer_line(LineEntry {
-                text: CompactString::new(&format!("new {i}")),
+                text: CompactString::new(format!("new {i}")),
                 color: Color::White,
             });
         }
 
         // Selection indices are absolute and remain untouched.
-        assert_eq!(r.selection_start, Some(15));
-        assert_eq!(r.selection_end, Some(20));
+        assert_eq!(r.selection_start, Some((15, 0)));
+        assert_eq!(r.selection_end, Some((20, 5)));
     }
 
     // Boundary: a tiny buffer where appending pushes scroll_offset past
@@ -1360,6 +1574,87 @@ mod tests {
         r.commit_partial();
 
         assert_eq!(view_start(&r), pinned_start);
+    }
+
+    // --- granular selection ----------------------------------------------
+
+    fn fresh_with_text(lines: &[&str]) -> Renderer {
+        let mut r = Renderer::new().unwrap();
+        for s in lines {
+            r.buffer.push(LineEntry {
+                text: CompactString::new(s),
+                color: Color::White,
+            });
+        }
+        r
+    }
+
+    /// Same-row selection extracts the substring between start.1 and
+    /// end.1 (char-indexed, exclusive end).
+    #[test]
+    fn selected_text_single_row_substring() {
+        let mut r = fresh_with_text(&["hello world"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 6));
+        r.selection_end = Some((0, 11));
+        assert_eq!(r.selected_text(), Some("world".to_string()));
+    }
+
+    /// Reverse drag (end before start) still yields the same substring —
+    /// `selected_text` normalizes to row-major order.
+    #[test]
+    fn selected_text_reverse_drag_normalizes() {
+        let mut r = fresh_with_text(&["hello world"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 11));
+        r.selection_end = Some((0, 6));
+        assert_eq!(r.selected_text(), Some("world".to_string()));
+    }
+
+    /// Multi-row selection takes the tail of the start row, the full
+    /// middle rows, and the head of the end row.
+    #[test]
+    fn selected_text_multi_row_spans_lines() {
+        let mut r = fresh_with_text(&["first line", "middle", "last line"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 6)); // "line"
+        r.selection_end = Some((2, 4)); // "last"
+        assert_eq!(r.selected_text(), Some("line\nmiddle\nlast".to_string()));
+    }
+
+    /// Same-row empty selection (start == end) returns None — nothing
+    /// selected yet, just a click.
+    #[test]
+    fn selected_text_empty_selection_returns_none() {
+        let mut r = fresh_with_text(&["hello"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 3));
+        r.selection_end = Some((0, 3));
+        assert!(r.selected_text().is_none());
+    }
+
+    /// Multi-byte UTF-8: char indices ignore byte width. `é` and `🦀`
+    /// each count as 1 char, not their byte widths.
+    #[test]
+    fn selected_text_handles_unicode() {
+        let mut r = fresh_with_text(&["café 🦀 rust"]);
+        r.selection_active = true;
+        r.selection_start = Some((0, 0));
+        r.selection_end = Some((0, 6)); // "café 🦀"
+        assert_eq!(r.selected_text(), Some("café 🦀".to_string()));
+    }
+
+    /// `buffer_pos_at` clamps char_col to the line's length so dragging
+    /// past the right edge anchors at end-of-line rather than
+    /// silently extending past visible content.
+    #[test]
+    fn buffer_pos_at_clamps_past_eol() {
+        let r = fresh_with_text(&["short"]);
+        // With one buffer line and scroll_offset=0,
+        // `buffer_line_at_row` returns Some(0) for row 0 (start = 0
+        // after saturating, idx = row).
+        let pos = r.buffer_pos_at(0, 999);
+        assert_eq!(pos, Some((0, 5)));
     }
 
     // --- wrap_input -------------------------------------------------------

@@ -37,6 +37,25 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 const DIALOG_POLL: Duration = Duration::from_millis(50);
 
+/// Upper bound on how long a single `Worker::eval` will wait for the
+/// worker's reply. Generous (10 min) because `harness/confirm` /
+/// `harness/select` legitimately block the worker on user input — a
+/// distracted user may take minutes to answer a dialog. The point of
+/// the bound is to detect a truly wedged plugin (e.g. plugin code in
+/// `(while true)`) rather than to enforce snappy responses. When the
+/// timeout fires the caller gets a clean error instead of hanging.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+const EVAL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Upper bound on how long `Worker::Drop` will wait for the worker
+/// thread to exit. Short by design: shutdown is best-effort. If the
+/// plugin is stuck in an infinite loop, the worker thread can't
+/// respond to `Cmd::Shutdown` and we'd hang the user's terminal
+/// forever on Drop. Beyond `JOIN_TIMEOUT` we leak the thread (it's
+/// reaped on process exit) and log a warn so the operator knows.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[cfg(feature = "plugin")]
 use janetrs::client::JanetClient;
 #[cfg(feature = "plugin")]
@@ -111,6 +130,57 @@ const HARNESS_INIT: &str = r#"
                 "info")]
       (set harness-notif-list
            (string harness-notif-list lvl "\t" msg "\n")))))
+
+# Hook-error dedup slots. `harness-last-hook-err-msg` is the most
+# recently pushed sanitized hook-error message; `harness-last-hook-err-count`
+# is how many consecutive identical errors followed it. When a
+# DIFFERENT error arrives (or any other notification fires), the
+# count is flushed as a "(repeated N times)" entry. Drained alongside
+# the regular notif list. See `harness/push-hook-err` below + the
+# Rust-side dispatch wrapper in `plugin/mod.rs::dispatch`.
+(var harness-last-hook-err-msg nil)
+(var harness-last-hook-err-count 0)
+
+# Sanitize a hook-error message for the `level\tmsg\n` wire format.
+# Embedded tabs become spaces (so they don't get parsed as a second
+# `level` field) and newlines become ` | ` (so a multi-line Janet
+# stack trace stays on one notification entry).
+#
+# `string/replace-all` takes args as (patt subst str), so threading
+# with `->` (first-position) would pass the wrong arg as the
+# subject. Explicit nesting from inside out is the safest spelling.
+(defn harness/sanitize-hook-err [s]
+  (string/replace-all
+    "\n" " | "
+    (string/replace-all
+      "\r\n" " | "
+      (string/replace-all "\t" " " (string s)))))
+
+# Push a hook error onto the notif list, deduplicating consecutive
+# identical messages. The catch arm in dispatch calls this rather
+# than appending directly so a buggy on-message-update hook can't
+# flood the chat with thousands of identical banners.
+(defn harness/push-hook-err [sanitized-msg]
+  (if (= sanitized-msg harness-last-hook-err-msg)
+    # Same as last — increment in place; do not push.
+    (set harness-last-hook-err-count (+ harness-last-hook-err-count 1))
+    # Different message (or first one). If the previous one had
+    # been repeated, flush its summary now; then push the new msg
+    # and reset the dedup state.
+    (do
+      (when (and harness-last-hook-err-msg
+                 (> harness-last-hook-err-count 1))
+        (set harness-notif-list
+             (string harness-notif-list
+                     "error\t"
+                     harness-last-hook-err-msg
+                     " (repeated "
+                     harness-last-hook-err-count
+                     " times)\n")))
+      (set harness-notif-list
+           (string harness-notif-list "error\t" sanitized-msg "\n"))
+      (set harness-last-hook-err-msg sanitized-msg)
+      (set harness-last-hook-err-count 1))))
 
 # Plugin entries on the session timeline. Plugins call
 # (harness/append-entry type data &opt display) to record
@@ -377,8 +447,22 @@ impl Worker {
                 reply,
             })
             .map_err(|_| "janet worker disconnected".to_string())?;
-        rx.recv()
-            .map_err(|_| "janet worker dropped reply channel".to_string())?
+        // Bounded wait. `recv_timeout` is functionally `recv()` for
+        // any well-behaved plugin since EVAL_TIMEOUT is 10 minutes;
+        // its purpose is to surface a clean error when a plugin
+        // is wedged in an infinite loop, rather than locking the
+        // host's event loop forever on a `recv()` that never
+        // resolves.
+        match rx.recv_timeout(EVAL_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "janet worker did not reply within {}s — plugin may be stuck in an infinite loop",
+                EVAL_TIMEOUT.as_secs(),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("janet worker dropped reply channel".to_string())
+            }
+        }
     }
 }
 
@@ -393,7 +477,27 @@ impl Drop for Worker {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(Cmd::Shutdown);
         if let Some(h) = self.join.take() {
-            let _ = h.join();
+            // Bounded join. `JoinHandle::join` has no timeout, so we
+            // poll `is_finished()` (stable since Rust 1.61) and bail
+            // after JOIN_TIMEOUT. If the worker is wedged in plugin
+            // code (e.g. Janet `(while true)`), join would otherwise
+            // hang the calling thread — usually the user's main
+            // thread on `/quit`. We leak the JoinHandle rather than
+            // pinning the process; the thread is reaped on exit.
+            let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                tracing::warn!(
+                    target: "dirge::plugin",
+                    timeout_secs = JOIN_TIMEOUT.as_secs(),
+                    "janet worker thread did not exit within JOIN_TIMEOUT; leaking on shutdown",
+                );
+                std::mem::forget(h);
+            }
         }
     }
 }
@@ -488,7 +592,21 @@ unsafe extern "C-unwind" fn janet_confirm_cfn(
     }));
     match result {
         Ok(j) => j,
-        Err(_) => unsafe { janet_wrap_boolean(0) },
+        Err(payload) => {
+            // Log the panic before swallowing so the operator can
+            // see *why* harness/confirm collapsed to false. Previous
+            // behavior masked panics silently and plugin authors had
+            // no way to distinguish "user said no" from "Rust panic
+            // at FFI boundary."
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/confirm",
+                panic = %msg,
+                "FFI panic in dialog cfn — returning safe default (false)",
+            );
+            unsafe { janet_wrap_boolean(0) }
+        }
     }
 }
 
@@ -535,7 +653,32 @@ unsafe extern "C-unwind" fn janet_select_cfn(
     }));
     match result {
         Ok(j) => j,
-        Err(_) => unsafe { janet_wrap_nil() },
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/select",
+                panic = %msg,
+                "FFI panic in dialog cfn — returning safe default (nil)",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+/// Best-effort conversion of a panic payload (`Box<dyn Any>`) to a
+/// printable string. Tries `&str` then `String` — covers the two
+/// payload shapes std and most code produce. Returns
+/// `"<non-string panic payload>"` for anything else so the log
+/// always has SOMETHING to anchor on rather than going silent again.
+#[cfg(feature = "plugin")]
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
     }
 }
 

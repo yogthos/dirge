@@ -118,11 +118,22 @@ pub struct GrepArgs {
 pub struct FindFilesArgs {
     pub pattern: String,
     pub path: Option<String>,
+    /// Include dotfiles / hidden files (e.g. `.env`, `.gitignore`).
+    /// Default `false` — by default the listing skips hidden files
+    /// so secrets in `.env` or `.git/` internals don't get pulled
+    /// into LLM context inadvertently. Set `true` when the agent
+    /// explicitly needs to inspect dotfiles.
+    #[serde(default)]
+    pub include_hidden: bool,
 }
 
 #[derive(Deserialize)]
 pub struct ListDirArgs {
     pub path: Option<String>,
+    /// Include dotfiles in the listing. See `FindFilesArgs::include_hidden`
+    /// for the rationale; default `false` for safety.
+    #[serde(default)]
+    pub include_hidden: bool,
 }
 
 async fn handle_ask_inner(

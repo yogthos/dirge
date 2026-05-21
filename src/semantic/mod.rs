@@ -19,6 +19,11 @@ pub struct SemanticManager {
 
 impl SemanticManager {
     pub fn new() -> Self {
+        // `mut` is conditionally needed depending on which language
+        // adapter features are active. Suppress the warning so a
+        // `semantic` build without any of the language sub-features
+        // (`semantic-ts`/`-python`/`-bash`) doesn't trip the linter.
+        #[allow(unused_mut)]
         let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
 
         #[cfg(feature = "semantic-ts")]

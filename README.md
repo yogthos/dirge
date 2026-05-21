@@ -9,7 +9,7 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **Line-numbered read output**: `read` tool prefixes each line with right-aligned line numbers (`123: content`)
 - **Environment-aware**: system prompt includes OS, shell, working directory, and git branch for context
 - **Semantic code tools** (tree-sitter): list_symbols, get_symbol_body, find_definition, find_callers, find_callees — supports TypeScript/TSX and Python
-- **Claude-compatible skills**: discover skills from `.claude/skills/`, `.maki/skills/`, `.opencode/skills/`, `.dirge/skills/` directories. Agent can call the `skill` tool to load instructions on demand
+- **Claude-compatible skills**: discover skills from `.claude/skills/`, `.opencode/skills/`, `.dirge/skills/` directories. Agent can call the `skill` tool to load instructions on demand
 - **Bash permissions** (tree-sitter): parses shell commands to split `&&`/`;`/`|` into individual segments, detects command substitution and complex constructs
 - **Permission system**: four configurable modes with per-tool patterns, session allowlists, and external directory policies
 - **Session management**: save/load/resume sessions, auto-compaction to stay within context windows
@@ -42,7 +42,7 @@ Most tool calls (`read`, `write`, `edit`, `bash`, `grep`, `find_files`, `list_di
 
 ### Error recovery
 
-Transient API errors (network, rate limits) are automatically retried with exponential backoff (1s → 2s → 4s, max 3 retries) plus 0–25% jitter so concurrent agents don't retry in lockstep. Auth and unknown errors surface immediately. Context-length errors are not retried — surface a `/compress` hint instead. Stream events are buffered and only flushed on success, so retries don't duplicate tokens; if any tool calls were already dispatched (side effects applied), the partial buffer is flushed and the error is surfaced without retrying.
+Transient API errors (network, rate limits, Anthropic `overloaded_error`) are automatically retried with exponential backoff (1s → 2s → 4s, max 3 retries) plus 0–25% jitter so concurrent agents don't retry in lockstep. Auth and unknown errors surface immediately. Context-length errors are not retried — surface a `/compress` hint instead. Tokens stream live to the chat as they arrive; if a retry fires, the user sees an "(error: …; retrying)" banner and the next attempt's tokens stream in fresh. If any tool calls were already dispatched (side effects applied), the error is surfaced without retrying so a partial-but-applied turn isn't re-run.
 
 ## Installation
 
@@ -94,6 +94,11 @@ dirge --provider deepseek  # defaults to deepseek-v4-pro
 
 export GLM_API_KEY="..."
 dirge --provider glm       # defaults to glm-4
+
+# Verbose mode — debug-level dirge logs + warn-level plugin hook
+# errors (useful when authoring a plugin or filing a bug report).
+# RUST_LOG env still takes precedence if set.
+dirge --verbose
 ```
 
 ## Slash commands
@@ -200,7 +205,7 @@ The agent automatically loads `AGENTS.md` or `CLAUDE.md` from the project root, 
 
 ## Claude-compatible skills
 
-Place skill directories in `.claude/skills/`, `.maki/skills/`, or `.opencode/skills/` in your project or home directory. Each skill is a directory containing `SKILL.md` with optional YAML frontmatter:
+Place skill directories in `.claude/skills/`, `.opencode/skills/`, or `.dirge/skills/` in your project or home directory. Each skill is a directory containing `SKILL.md` with optional YAML frontmatter:
 
 ```markdown
 ---
@@ -243,6 +248,7 @@ Example plugins in [`plugins/`](plugins/):
 | `local_openai.janet` | `harness/register-provider` declaring vLLM/Ollama/LMStudio local endpoints |
 | `session_tree.janet` | `harness/set-label` + `harness/new-session` — `/label` and `/fresh` slash commands |
 | `turn_timer/` | Multi-file plugin — state, hooks, and a `/timer-stats` command split across three files in a single directory |
+| `response_inspector.janet` | `on-response` hook — pattern-match the LLM's reply, post notifications, and return a steering string appended to the next turn's system prompt |
 
 ## LSP integration
 

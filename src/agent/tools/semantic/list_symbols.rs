@@ -90,17 +90,17 @@ impl Tool for ListSymbolsTool {
                 .map_err(|e| ToolError::Msg(format!("Index lock error: {e}")))?;
 
             if let Some(ref fp) = file_path {
-                idx.ensure_file(fp).map_err(|e| ToolError::Msg(e))?;
+                idx.ensure_file(fp).map_err(ToolError::Msg)?;
             } else {
                 idx.ensure_all(
                     &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                     None,
                 )
-                .map_err(|e| ToolError::Msg(e))?;
+                .map_err(ToolError::Msg)?;
             }
 
             idx.list_symbols(file_path.as_deref(), kind_filter)
-                .map_err(|e| ToolError::Msg(e))?
+                .map_err(ToolError::Msg)?
         };
 
         if results.is_empty() {

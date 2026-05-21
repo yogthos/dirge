@@ -185,14 +185,25 @@ fn compile_lsp_commands(cfg: &config::Config) -> std::collections::HashMap<Strin
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    let cli = cli::Cli::parse();
+
+    // Tracing filter precedence: RUST_LOG (always wins) > --verbose
+    // (debug for dirge + warn for plugin hooks) > default
+    // (warn, rig silenced). `--verbose` exists primarily so plugin
+    // authors can see hook-error logs without having to know the
+    // RUST_LOG syntax. Logs go to stderr; the interactive TUI
+    // captures stdout but leaves stderr passthrough.
+    let default_filter = if cli.verbose {
+        "dirge=debug,dirge::plugin=warn,rig=off"
+    } else {
+        "warn,rig=off"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,rig=off")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
         .init();
-
-    let cli = cli::Cli::parse();
     let cfg = config::load();
     // Initialize the global UI theme before any rendering happens. The
     // theme is global state; setting it once at boot keeps every
@@ -253,7 +264,51 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(session_id) = &cli.session {
-        session = session::storage::load_session(session_id)?;
+        // Try exact id first; fall back to prefix match so the CLI
+        // is as forgiving as the interactive `/sessions <prefix>`
+        // command. Ambiguous prefix surfaces a list of matching ids.
+        match session::storage::load_session(session_id) {
+            Ok(s) => session = s,
+            Err(_) => {
+                let matches = session::storage::find_sessions_by_prefix(session_id)?;
+                match matches.len() {
+                    0 => anyhow::bail!("no session matching id or prefix {:?}", session_id),
+                    1 => session = matches.into_iter().next().expect("len == 1"),
+                    n => {
+                        let ids: Vec<String> =
+                            matches.iter().take(5).map(|s| s.id.to_string()).collect();
+                        anyhow::bail!(
+                            "session prefix {:?} matches {} sessions: {} — pass a longer prefix",
+                            session_id,
+                            n,
+                            ids.join(", "),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Restore the active prompt from the loaded session so resumed
+    // sessions don't silently snap back to the default `code` prompt.
+    // Default-prompt initialization above set context.current_prompt
+    // to `code`; we override it here if the session carries a name.
+    // If the persisted name no longer resolves (user uninstalled the
+    // prompt), warn so the silent fallback doesn't surprise them.
+    if let Some(name) = session.current_prompt_name.clone() {
+        match context.prompts.get(&name) {
+            Some(content) => {
+                context.current_prompt = Some(content.clone());
+                context.current_prompt_name = Some(name);
+            }
+            None => {
+                eprintln!(
+                    "warning: session was using prompt {:?} but it's no longer available — falling back to default ({:?}).",
+                    name,
+                    context.current_prompt_name.as_deref().unwrap_or("none"),
+                );
+            }
+        }
     }
 
     let client = provider::create_client(
@@ -341,7 +396,7 @@ async fn main() -> anyhow::Result<()> {
                 //     `*.janet` contents are concatenated into one Janet
                 //     env (multi-file plugins)
                 let is_janet_file =
-                    path.is_file() && path.extension().map_or(false, |e| e == "janet");
+                    path.is_file() && path.extension().is_some_and(|e| e == "janet");
                 let is_plugin_dir = path.is_dir();
                 if !is_janet_file && !is_plugin_dir {
                     continue;

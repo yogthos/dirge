@@ -76,9 +76,9 @@ impl Tool for FindCallersTool {
                 .write()
                 .map_err(|e| ToolError::Msg(format!("Index lock error: {e}")))?;
             idx.ensure_all(&search_path, None)
-                .map_err(|e| ToolError::Msg(e))?;
+                .map_err(ToolError::Msg)?;
             idx.find_callers(&args.name, &search_path)
-                .map_err(|e| ToolError::Msg(e))?
+                .map_err(ToolError::Msg)?
         };
 
         if results.is_empty() {

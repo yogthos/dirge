@@ -43,7 +43,15 @@ impl ToolDyn for McpTool {
             .clone()
             .unwrap_or(Cow::from(""))
             .to_string();
-        let parameters = serde_json::to_value(&self.definition.input_schema).unwrap_or_default();
+        // MCP servers that don't ship an `inputSchema` would
+        // serialize as `null`, which violates rig's expectation of
+        // an object. Substitute an empty object so the tool stays
+        // usable (the LLM just won't have a hint that args are
+        // expected, but it can still call the tool with no params).
+        let parameters = serde_json::to_value(&self.definition.input_schema)
+            .ok()
+            .filter(|v| !v.is_null())
+            .unwrap_or_else(|| serde_json::json!({}));
         Box::pin(async move {
             ToolDefinition {
                 name,

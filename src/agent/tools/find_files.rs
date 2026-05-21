@@ -58,6 +58,10 @@ impl Tool for FindFilesTool {
                     "path": {
                         "type": "string",
                         "description": "Directory to search in (defaults to current working directory)"
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "description": "Include dotfiles (.env, .gitignore, etc.) in results. Default false to avoid surfacing secrets and config files."
                     }
                 },
                 "required": ["pattern"]
@@ -69,28 +73,34 @@ impl Tool for FindFilesTool {
         check_perm(&self.permission, &self.ask_tx, "find_files", &args.pattern).await?;
 
         let cache_key = format!(
-            "find_files:{}:{}",
+            "find_files:{}:{}:hidden={}",
             args.pattern,
             args.path.as_deref().unwrap_or("."),
+            args.include_hidden,
         );
 
-        if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&cache_key) {
+        if let Some(ref cache) = self.cache
+            && let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached);
             }
-        }
 
         let re = Regex::new(&args.pattern)
             .map_err(|e| ToolError::Msg(format!("Invalid regex: {}", e)))?;
 
         let search_path = args.path.as_deref().unwrap_or(".");
 
+        // `WalkBuilder::hidden(true)` means SKIP hidden entries.
+        // Default behavior (`include_hidden = false`) hides
+        // dotfiles so .env / .git / .DS_Store don't leak into the
+        // LLM's view of the filesystem unintentionally. The LLM
+        // can pass `include_hidden: true` when it explicitly needs
+        // them. Matches pi + opencode defaults.
         let walker = WalkBuilder::new(search_path)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
             .require_git(false)
-            .hidden(false)
+            .hidden(!args.include_hidden)
             .filter_entry(|entry| {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     !is_skip_dir(entry.file_name().to_str().unwrap_or(""))

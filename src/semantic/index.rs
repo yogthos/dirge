@@ -38,7 +38,7 @@ impl SymbolIndex {
             .and_then(|m| m.modified().ok());
 
         let needs_refresh = match self.cache.get(&canonical) {
-            Some(entry) => mtime.map_or(true, |mt| mt != entry.mtime),
+            Some(entry) => mtime != Some(entry.mtime),
             None => true,
         };
 
@@ -99,11 +99,10 @@ impl SymbolIndex {
 
             if let Some(pattern) = include {
                 let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if !re.is_match(fname) {
+                if let Ok(re) = regex::Regex::new(pattern)
+                    && !re.is_match(fname) {
                         continue;
                     }
-                }
             }
 
             if let Ok(meta) = path.metadata()
@@ -210,11 +209,11 @@ impl SymbolIndex {
 
             for (line_num, line) in content.lines().enumerate() {
                 if re.is_match(line) {
-                    if let Some(ref entry) = entry {
+                    if let Some(entry) = entry {
                         let is_definition = entry.symbols.iter().any(|s| {
                             s.name == name
                                 && s.range.start_line <= line_num + 1
-                                && s.range.end_line >= line_num + 1
+                                && s.range.end_line > line_num
                         });
                         if is_definition {
                             continue;
@@ -321,7 +320,7 @@ impl SymbolIndex {
             let symbols: Vec<Symbol> = entry
                 .symbols
                 .iter()
-                .filter(|s| kind_filter.map_or(true, |k| s.kind == k))
+                .filter(|s| kind_filter.is_none_or(|k| s.kind == k))
                 .cloned()
                 .collect();
             result.push((entry.file_path.clone(), symbols));
@@ -340,7 +339,7 @@ impl SymbolIndex {
                 let symbols: Vec<Symbol> = entry
                     .symbols
                     .iter()
-                    .filter(|s| kind_filter.map_or(true, |k| s.kind == k))
+                    .filter(|s| kind_filter.is_none_or(|k| s.kind == k))
                     .cloned()
                     .collect();
                 if !symbols.is_empty() {

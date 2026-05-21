@@ -90,12 +90,27 @@ Accepted top-level keys:
 Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping glob-like patterns to actions.
 Supported permission tool keys are `bash`, `read`, `write`, `edit`, `grep`,
-`find_files`, `list_dir`, and `write_todo_list`. MCP-backed tools are
-checked under `mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the
-default action, `external_directory` for absolute-path rules outside the
-working directory, and `doom_loop` for repeated identical tool calls
-(default: `ask`). If `bash` is omitted, dirge installs its built-in
-safe bash allow/deny rules.
+`find_files`, `list_dir`, `write_todo_list`, `apply_patch`, `lsp`, and
+`question`. MCP-backed tools are checked under
+`mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the default action,
+`external_directory` for absolute-path rules outside the working directory,
+and `doom_loop` for repeated identical tool calls (default: `ask`). If
+`bash` is omitted, dirge installs its built-in safe bash allow/deny rules.
+
+### Mode semantics
+
+- **`standard`** (default): every rule in `permission` is consulted; tools without
+  matching rules fall back to `*` (default `allow`).
+- **`restrictive`**: like `standard`, but any tool whose rule resolves to `allow`
+  via the `*` fallback (no explicit allow rule matched) is converted to `ask`.
+  Explicit `allow` rules still allow. Explicit `deny` rules still deny.
+- **`accept`** (equivalent to `--accept-all`): auto-allows tools whose targets
+  resolve inside the working directory; tools touching paths outside still
+  consult `external_directory` rules.
+- **`yolo`** (equivalent to `--yolo`): bypasses every check. Use with caution.
+
+CLI precedence (high → low): `--yolo` > `--accept-all` > `--restrictive` >
+`default_permission_mode` config > `standard`.
 
 When compiled with MCP support, `mcp_servers` accepts command-based and URL-based
 servers:

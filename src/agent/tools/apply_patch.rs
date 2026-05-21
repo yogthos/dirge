@@ -1,7 +1,7 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
@@ -30,6 +30,12 @@ pub struct ApplyPatchTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     cache: Option<ToolCache>,
+    /// When active prompt is `plan`/`review`/`review-security`, writes
+    /// are restricted to this single file (typically `PLAN.md`). Any
+    /// op targeting another path is refused. Mirrors the gate on
+    /// `WriteTool` / `EditTool` so a planning-mode session can't
+    /// sneak filesystem changes through `apply_patch`.
+    plan_file: Option<PathBuf>,
 }
 
 impl ApplyPatchTool {
@@ -39,18 +45,21 @@ impl ApplyPatchTool {
             permission,
             ask_tx,
             cache: None,
+            plan_file: None,
         }
     }
 
     pub fn with_cache(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
+        plan_file: Option<PathBuf>,
         cache: ToolCache,
     ) -> Self {
         Self {
             permission,
             ask_tx,
             cache: Some(cache),
+            plan_file,
         }
     }
 }
@@ -76,11 +85,24 @@ fn apply_create(path: &str, content: &str) -> Result<String, String> {
 fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, String> {
     let original = std::fs::read_to_string(path).map_err(|e| format!("read failed: {}", e))?;
 
-    if !original.contains(old_text) {
+    // CRLF normalization to match `edit.rs`. The LLM almost always
+    // generates `\n` in `old_text` even when the file is CRLF on
+    // disk; without normalization the literal substring match fails.
+    // We normalize a working copy for matching but preserve the
+    // original's line endings on the write-back.
+    let crlf = original.contains("\r\n");
+    let normalized = if crlf {
+        original.replace("\r\n", "\n")
+    } else {
+        original.clone()
+    };
+    let needle = old_text.replace("\r\n", "\n");
+
+    if !normalized.contains(&needle) {
         return Err(format!("text not found in {}", path));
     }
 
-    let matches: Vec<_> = original.match_indices(old_text).collect();
+    let matches: Vec<_> = normalized.match_indices(&needle).collect();
     if matches.len() > 1 {
         return Err(format!(
             "text matches {} locations in {} — provide more context to make unique",
@@ -89,8 +111,20 @@ fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, St
         ));
     }
 
-    let updated = original.replacen(old_text, new_text, 1);
-    std::fs::write(path, &updated).map_err(|e| format!("write failed: {}", e))?;
+    let replacement = if crlf {
+        new_text.replace("\r\n", "\n")
+    } else {
+        new_text.to_string()
+    };
+    let updated_normalized = normalized.replacen(&needle, &replacement, 1);
+    // Restore CRLF line endings on write-back so we don't silently
+    // re-format the user's file.
+    let to_write = if crlf {
+        updated_normalized.replace('\n', "\r\n")
+    } else {
+        updated_normalized
+    };
+    std::fs::write(path, &to_write).map_err(|e| format!("write failed: {}", e))?;
     Ok(format!("updated {}", path))
 }
 
@@ -168,6 +202,77 @@ impl Tool for ApplyPatchTool {
         let mut results = Vec::new();
 
         for op in &args.operations {
+            // Plan-mode write restriction: when active prompt is
+            // plan/review/review-security, `plan_file` is set to
+            // PLAN.md and every op's target path must match it. This
+            // mirrors the gate on `WriteTool` + `EditTool` so plan
+            // mode actually means "no filesystem changes outside
+            // PLAN.md" — apply_patch previously bypassed it.
+            let paths_to_check: Vec<&str> = match op {
+                PatchOp::Create { path, .. }
+                | PatchOp::Update { path, .. }
+                | PatchOp::Delete { path } => vec![path.as_str()],
+                PatchOp::Rename { path, new_path } => {
+                    vec![path.as_str(), new_path.as_str()]
+                }
+            };
+            if let Some(plan) = self.plan_file.as_ref() {
+                // Build a parent+filename comparison so we can match
+                // PLAN.md by name even when the file doesn't exist
+                // yet (the very first `apply_patch create PLAN.md` op
+                // in a fresh plan-mode session). Pure `canonicalize`
+                // fails on non-existent paths and the fallback
+                // `to_path_buf` would compare relative vs absolute
+                // unequal — refusing a legitimate create. Compare:
+                //   1. canonicalized full paths (works once PLAN.md
+                //      exists, and for both create and update),
+                //   2. resolved parent + same filename (works for the
+                //      first-create case before PLAN.md exists).
+                let plan_canon = plan.canonicalize().ok();
+                let plan_parent = plan
+                    .parent()
+                    .and_then(|p| p.canonicalize().ok())
+                    .or_else(|| {
+                        std::env::current_dir()
+                            .ok()
+                            .map(|cwd| plan.parent().map(|p| cwd.join(p)).unwrap_or(cwd))
+                    });
+                let plan_name = plan.file_name();
+                for path in &paths_to_check {
+                    let target = Path::new(path);
+                    let target_canon = target.canonicalize().ok();
+                    let target_parent = target
+                        .parent()
+                        .and_then(|p| p.canonicalize().ok())
+                        .or_else(|| {
+                            std::env::current_dir().ok().map(|cwd| {
+                                target
+                                    .parent()
+                                    .filter(|p| !p.as_os_str().is_empty())
+                                    .map(|p| cwd.join(p))
+                                    .unwrap_or(cwd)
+                            })
+                        });
+                    let target_name = target.file_name();
+
+                    let matches_canonical = match (&plan_canon, &target_canon) {
+                        (Some(p), Some(t)) => p == t,
+                        _ => false,
+                    };
+                    let matches_by_parent_and_name =
+                        match (&plan_parent, &target_parent, plan_name, target_name) {
+                            (Some(pp), Some(tp), Some(pn), Some(tn)) => pp == tp && pn == tn,
+                            _ => false,
+                        };
+                    if !matches_canonical && !matches_by_parent_and_name {
+                        return Err(ToolError::Msg(format!(
+                            "plan mode is active — apply_patch can only target {}; got {}",
+                            plan.display(),
+                            path,
+                        )));
+                    }
+                }
+            }
             // Permission check for the target path
             match op {
                 PatchOp::Create { path, .. }
@@ -182,8 +287,8 @@ impl Tool for ApplyPatchTool {
                 check_perm_path(&self.permission, &self.ask_tx, "apply_patch", new_path).await?;
             }
             // Validate create content size
-            if let PatchOp::Create { content, .. } = op {
-                if content.len() > MAX_CREATE_SIZE {
+            if let PatchOp::Create { content, .. } = op
+                && content.len() > MAX_CREATE_SIZE {
                     results.push(format!(
                         "FAILED: create content exceeds {} bytes ({} bytes provided)",
                         MAX_CREATE_SIZE,
@@ -191,7 +296,6 @@ impl Tool for ApplyPatchTool {
                     ));
                     break;
                 }
-            }
 
             let result = match op {
                 PatchOp::Create { path, content } => apply_create(path, content),
@@ -206,9 +310,6 @@ impl Tool for ApplyPatchTool {
 
             match result {
                 Ok(msg) => {
-                    if let Some(ref cache) = self.cache {
-                        cache.clear();
-                    }
                     // Record the touched path(s) for the info panel. Rename
                     // adds the *new* path; delete still records the path the
                     // user/agent operated on so the panel reflects the action.
@@ -233,6 +334,14 @@ impl Tool for ApplyPatchTool {
                     break;
                 }
             }
+        }
+
+        // Clear the cache once after the batch instead of once per op.
+        // Per-op clearing was correct but wasteful — a 5-op batch
+        // would clear 5 times. Subsequent tool calls within the same
+        // turn now see a single clean cache.
+        if let Some(ref cache) = self.cache {
+            cache.clear();
         }
 
         Ok(results.join("\n"))

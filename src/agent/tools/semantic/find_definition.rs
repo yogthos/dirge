@@ -75,9 +75,9 @@ impl Tool for FindDefinitionTool {
                 &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 None,
             )
-            .map_err(|e| ToolError::Msg(e))?;
+            .map_err(ToolError::Msg)?;
             idx.find_definition(&args.name)
-                .map_err(|e| ToolError::Msg(e))?
+                .map_err(ToolError::Msg)?
         };
 
         if results.is_empty() {

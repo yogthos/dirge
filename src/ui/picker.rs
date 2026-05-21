@@ -258,7 +258,7 @@ impl FilePicker {
                 "{}",
                 SetForegroundColor(self.color(crate::ui::theme::dim()))
             )?;
-            write!(stdout, "{}", "no matches")?;
+            write!(stdout, "no matches")?;
             write!(stdout, "{}", ResetColor)?;
             stdout.flush()?;
             return Ok(());

@@ -5,10 +5,20 @@ pub enum AgentEvent {
     Token(CompactString),
     Reasoning(CompactString),
     ToolCall {
+        /// Provider call id (rig's `ToolCall.id`). Empty for older
+        /// rig versions or providers that don't emit one; the UI
+        /// uses it to pair this call with the corresponding
+        /// `ToolResult` event for structured persistence (Phase 3).
+        id: CompactString,
         name: CompactString,
         args: serde_json::Value,
     },
     ToolResult {
+        /// Matching call id from the `ToolCall` event. Empty if the
+        /// provider didn't emit one — the UI falls back to
+        /// positional pairing (this result belongs to the most-
+        /// recent unanswered ToolCall in the same turn).
+        id: CompactString,
         output: CompactString,
     },
     Error(CompactString),

@@ -176,7 +176,7 @@ impl Tool for LspTool {
                     },
                     "query": {
                         "type": "string",
-                        "description": "Search string for workspaceSymbol. Empty string returns all symbols."
+                        "description": "Search string for workspaceSymbol — REQUIRED when operation is 'workspaceSymbol' (pass empty string to list all symbols). Ignored for other operations."
                     }
                 },
                 "required": ["operation", "file_path"]
@@ -348,9 +348,6 @@ mod tests {
                 seen_methods: std::sync::Mutex::new(Vec::new()),
                 response: std::sync::Mutex::new(response),
             }
-        }
-        fn seen_methods(&self) -> Vec<String> {
-            self.seen_methods.lock().unwrap().clone()
         }
     }
 

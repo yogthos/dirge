@@ -182,21 +182,51 @@ pub fn load() -> Config {
         })
     };
 
+    // Validate `custom_providers` at load time so a typo in
+    // `provider_type` surfaces immediately instead of failing at
+    // first agent call with a cryptic "unknown provider" deep in the
+    // call stack.
+    if let Some(providers) = cfg.custom_providers.as_ref() {
+        for (name, p) in providers {
+            if crate::provider::parse_provider(&p.provider_type).is_none() {
+                eprintln!(
+                    "error: custom provider {:?} has invalid provider_type {:?}.\n\
+                     Must be one of: openrouter, openai, anthropic, gemini,\n\
+                     deepseek, glm, ollama, custom.",
+                    name, p.provider_type,
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     #[cfg(feature = "mcp")]
     if cfg.mcp_servers.is_none() {
-        let mut headers = HashMap::new();
-        if let Some(key) = std::env::var("EXA_API_KEY").ok() {
-            headers.insert("x-api-key".to_string(), key);
+        // Only auto-register the Exa default when there's actually
+        // a non-empty API key. An empty `EXA_API_KEY=""` (e.g. unset
+        // via a `.envrc` that intentionally clears it) used to
+        // register Exa anyway with an empty header, then every web-
+        // search call failed with 401 at first use. Skip cleanly
+        // when no usable key is present.
+        match std::env::var("EXA_API_KEY") {
+            Ok(key) if !key.is_empty() => {
+                let mut headers = HashMap::new();
+                headers.insert("x-api-key".to_string(), key);
+                let mut defaults = HashMap::new();
+                defaults.insert(
+                    "Exa Web Search".to_string(),
+                    McpServerConfig::Url {
+                        url: "https://mcp.exa.ai/mcp".to_string(),
+                        headers,
+                    },
+                );
+                cfg.mcp_servers = Some(defaults);
+            }
+            _ => {
+                // Key unset or empty — leave mcp_servers as None so
+                // the host knows there's nothing to connect to.
+            }
         }
-        let mut defaults = HashMap::new();
-        defaults.insert(
-            "Exa Web Search".to_string(),
-            McpServerConfig::Url {
-                url: "https://mcp.exa.ai/mcp".to_string(),
-                headers,
-            },
-        );
-        cfg.mcp_servers = Some(defaults);
     }
 
     cfg

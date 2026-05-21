@@ -16,7 +16,6 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     let global_dirs = dirs::home_dir().into_iter().flat_map(|home| {
         [
             home.join(".claude").join("skills"),
-            home.join(".maki").join("skills"),
             home.join(".opencode").join("skills"),
             home.join(".dirge").join("skills"),
         ]
@@ -27,7 +26,6 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
         .flat_map(|ancestor| {
             [
                 ancestor.join(".claude").join("skills"),
-                ancestor.join(".maki").join("skills"),
                 ancestor.join(".opencode").join("skills"),
                 ancestor.join(".dirge").join("skills"),
             ]
@@ -44,11 +42,26 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
                 if !skill_md.is_file() {
                     continue;
                 }
-                if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                    if let Some(skill) = parse_skill(&content, &path) {
+                // Cap skill content at 1 MB. A skill is meant to be a
+                // short markdown instructions file; multi-MB skills
+                // would blow up LLM context. If users have legitimate
+                // need for larger skills, they should compress and
+                // bump this cap deliberately.
+                const SKILL_MAX_BYTES: u64 = 1024 * 1024;
+                if let Ok(meta) = std::fs::metadata(&skill_md)
+                    && meta.len() > SKILL_MAX_BYTES
+                {
+                    eprintln!(
+                        "warning: skipping skill {:?} ({} bytes > 1 MB cap)",
+                        skill_md,
+                        meta.len(),
+                    );
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&skill_md)
+                    && let Some(skill) = parse_skill(&content, &path) {
                         map.entry(skill.name.clone()).or_insert(skill);
                     }
-                }
             }
         }
     }
@@ -63,11 +76,10 @@ pub fn find_project_ancestor_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut current = cwd.to_path_buf();
     dirs.push(current.clone());
     loop {
-        if current.join(".git").is_dir() {
-            if !dirs.contains(&current) {
+        if current.join(".git").is_dir()
+            && !dirs.contains(&current) {
                 dirs.push(current.clone());
             }
-        }
         if !current.pop() {
             break;
         }

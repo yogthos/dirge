@@ -14,6 +14,35 @@ mod tests {
         assert!(PluginManager::try_new().is_ok());
     }
 
+    /// Dropping an idle worker must complete promptly (well under
+    /// the `JOIN_TIMEOUT` upper bound). This is the regression guard
+    /// for the bounded-join change in `Worker::Drop` — without the
+    /// poll loop the change would have introduced a fixed 2s delay
+    /// on every shutdown.
+    #[test]
+    fn worker_drop_completes_promptly_when_idle() {
+        let mgr = PluginManager::try_new().unwrap();
+        let start = std::time::Instant::now();
+        drop(mgr);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "idle Drop should be near-instant; took {:?}",
+            elapsed,
+        );
+    }
+
+    /// Sanity-check that `eval` still returns the worker's reply
+    /// after the switch from `recv()` to `recv_timeout(EVAL_TIMEOUT)`.
+    /// Without this, a typo in the new match arms could mask the
+    /// happy-path break by always returning the timeout error.
+    #[test]
+    fn worker_eval_still_returns_reply_after_recv_timeout_switch() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        let out = mgr.eval("(+ 1 2)").unwrap();
+        assert_eq!(out, "3", "got: {out:?}");
+    }
+
     #[test]
     fn test_dispatch_returns_per_hook_results() {
         // Multiple plugins registering the same hook must each contribute
@@ -506,22 +535,94 @@ mod tests {
         assert_eq!(result.replace_result, Some("[truncated]".to_string()));
     }
 
-    /// Block-precedence: when multiple hooks register, any one calling
-    /// `harness/block` wins. Hooks after the blocker still run (we don't
-    /// short-circuit at the Janet level for simplicity) but the block flag
-    /// stays set.
+    /// First-blocker-wins precedence (Phase 1, matches pi's
+    /// `runner.ts:806-827` `tool_call` semantics). When multiple
+    /// hooks register and one calls `harness/block`, the FIRST
+    /// blocker wins and dispatch stops — subsequent hooks do NOT
+    /// run. Previously last-write-wins, which made the block
+    /// reason depend on plugin load order and ran observers after
+    /// a deny that the user might want to skip on perf grounds.
     #[cfg(feature = "plugin")]
     #[test]
-    fn test_dispatch_tool_hook_block_sticks_across_hooks() {
+    fn dispatch_tool_hook_first_blocker_stops_dispatch() {
         let mut mgr = PluginManager::try_new().unwrap();
-        mgr.eval(r#"(defn block-it [ctx] (harness/block "no"))"#)
+        // Plugin A blocks with reason "first". Plugin B would also
+        // block with reason "second" AND fire a notification to
+        // prove it ran. After the fix, B never runs.
+        mgr.eval(r#"(defn first-block [ctx] (harness/block "first"))"#)
             .unwrap();
-        mgr.eval(r#"(defn noop [ctx] nil)"#).unwrap();
-        mgr.register("on-tool-start", "block-it");
-        mgr.register("on-tool-start", "noop");
+        mgr.eval(
+            r#"(defn second-block [ctx]
+                 (harness/notify "second-also-ran" :warn)
+                 (harness/block "second"))"#,
+        )
+        .unwrap();
+        mgr.register("on-tool-start", "first-block");
+        mgr.register("on-tool-start", "second-block");
 
         let result = mgr.dispatch_tool_hook("on-tool-start", "@{}").unwrap();
-        assert_eq!(result.block, Some("no".to_string()));
+        assert_eq!(
+            result.block,
+            Some("first".to_string()),
+            "first blocker's reason must win",
+        );
+        let pending = mgr.drain_notifications();
+        assert!(
+            !pending.iter().any(|(_, m)| m.contains("second-also-ran")),
+            "second hook should not have run after first blocked: {:?}",
+            pending,
+        );
+    }
+
+    /// When no hook blocks, all hooks run. Confirms the early-stop
+    /// only triggers on an actual `harness/block` call.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn dispatch_tool_hook_runs_all_when_no_block() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn a [ctx] (harness/notify "a-ran"))"#)
+            .unwrap();
+        mgr.eval(r#"(defn b [ctx] (harness/notify "b-ran"))"#)
+            .unwrap();
+        mgr.register("on-tool-start", "a");
+        mgr.register("on-tool-start", "b");
+
+        let _ = mgr.dispatch_tool_hook("on-tool-start", "@{}").unwrap();
+        let pending = mgr.drain_notifications();
+        let combined: String = pending
+            .iter()
+            .map(|(_, m)| m.clone())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(combined.contains("a-ran"), "got: {combined}");
+        assert!(combined.contains("b-ran"), "got: {combined}");
+    }
+
+    /// Mutations (mutate-input, replace-result) keep last-write-wins
+    /// semantics — only `harness/block` is first-wins. This matches
+    /// pi's `runner.ts:858-888` chaining: each handler sees the
+    /// prior's mutation and can override. Confirms the Phase 1
+    /// change to block didn't accidentally also short-circuit on
+    /// mutation slots.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn dispatch_tool_hook_mutations_still_chain_last_wins() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn rewrite-a [ctx] (harness/replace-result "from-a"))"#)
+            .unwrap();
+        mgr.eval(r#"(defn rewrite-b [ctx] (harness/replace-result "from-b"))"#)
+            .unwrap();
+        mgr.register("on-tool-end", "rewrite-a");
+        mgr.register("on-tool-end", "rewrite-b");
+
+        let result = mgr.dispatch_tool_hook("on-tool-end", "@{}").unwrap();
+        assert_eq!(
+            result.replace_result,
+            Some("from-b".to_string()),
+            "last-write-wins for mutations",
+        );
+        // No block fired — block field stays None.
+        assert_eq!(result.block, None);
     }
 
     // --- Phase 3: harness/notify ----------------------------------------
@@ -1337,6 +1438,153 @@ mod tests {
         assert!(out.contains(&"from-beta".to_string()));
     }
 
+    /// Multi-line and tab-containing Janet error messages must not
+    /// break the `level\tmsg\n` notification format. drain_notifications
+    /// splits on `\n` per entry and on the first `\t` per level/msg,
+    /// so embedded control chars would corrupt parsing — show up as
+    /// truncated entries and orphaned "malformed" lines. The catch
+    /// arm now sanitizes via `string/replace-all` before the push.
+    #[test]
+    fn dispatch_sanitizes_multi_line_and_tab_in_hook_errors() {
+        let path = tmpfile(
+            "multiline-err",
+            r#"(defn on-prompt [ctx] (error "line one\nline two\tline three"))"#,
+        );
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let _ = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        let pending = mgr.drain_notifications();
+
+        // Exactly one entry, even though the error contained both \n
+        // and \t. Without sanitization the multi-line error would
+        // either produce multiple malformed entries (one per source
+        // line) or split level/msg incorrectly at the embedded tab.
+        let err_entries: Vec<_> = pending.iter().filter(|(lvl, _)| lvl == "error").collect();
+        assert_eq!(err_entries.len(), 1, "got entries: {:?}", pending);
+        let (_, msg) = err_entries[0];
+        assert!(msg.contains("line one"), "msg missing 'line one': {msg}");
+        assert!(msg.contains("line two"), "msg missing 'line two': {msg}");
+        assert!(
+            msg.contains("line three"),
+            "msg missing 'line three': {msg}"
+        );
+        // The msg field on the *Rust side* has already been split out
+        // of the wire format, so newlines/tabs inside it would only
+        // appear if our Janet sanitization missed them. Assert none.
+        assert!(!msg.contains('\n'), "msg leaked '\\n': {msg:?}");
+        assert!(!msg.contains('\t'), "msg leaked '\\t': {msg:?}");
+    }
+
+    /// Consecutive identical hook errors (e.g. a buggy
+    /// on-message-update firing ~16x per response) must dedupe into a
+    /// single notification with a repeat-count suffix instead of
+    /// flooding the chat with 50+ identical banners.
+    #[test]
+    fn dispatch_dedupes_consecutive_identical_hook_errors() {
+        let path = tmpfile(
+            "repeat-err",
+            r#"(defn on-prompt [ctx] (error "always the same"))"#,
+        );
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        for _ in 0..50 {
+            let _ = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        }
+        let pending = mgr.drain_notifications();
+
+        let err_entries: Vec<_> = pending.iter().filter(|(lvl, _)| lvl == "error").collect();
+        // At most 2 entries (the first push + a "repeated N times"
+        // summary that flushes on drain). Definitely not 50.
+        assert!(
+            err_entries.len() <= 2,
+            "expected dedup (≤2 error entries); got {}: {:?}",
+            err_entries.len(),
+            pending,
+        );
+        let combined: String = err_entries
+            .iter()
+            .map(|(l, m)| format!("{l}\t{m}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            combined.contains("always the same"),
+            "msg dropped: {combined}",
+        );
+        // The repeat-count summary must mention the number.
+        assert!(
+            combined.contains("repeated") && combined.contains("50"),
+            "expected repeat-count summary mentioning 50; got: {combined}",
+        );
+    }
+
+    /// Distinct hook errors must NOT be deduped — only consecutive
+    /// identical ones. A "B-error after A-error" should produce two
+    /// notifications, not one collapsed into the other.
+    #[test]
+    fn dispatch_distinct_hook_errors_are_not_deduped() {
+        let path_a = tmpfile(
+            "distinct-err-a",
+            r#"(defn on-prompt [ctx] (error "alpha error"))"#,
+        );
+        let path_b = tmpfile(
+            "distinct-err-b",
+            r#"(defn on-response [ctx] (error "beta error"))"#,
+        );
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &path_a).unwrap();
+        super::load_plugin(&mut mgr, &path_b).unwrap();
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let _ = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        let _ = mgr.dispatch("on-response", "@{:response \"y\"}").unwrap();
+        let pending = mgr.drain_notifications();
+
+        let combined: String = pending
+            .iter()
+            .map(|(l, m)| format!("{l}\t{m}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(combined.contains("alpha"), "alpha missing: {combined}");
+        assert!(combined.contains("beta"), "beta missing: {combined}");
+    }
+
+    /// A hook that throws is caught: dispatch continues (no panic,
+    /// no propagated error to the caller), `nil` is the effective
+    /// return value (filtered out of the results vec), AND the
+    /// error is pushed onto `harness-notif-list` with `error`
+    /// level so the next drain surfaces a chat-visible notification
+    /// — pi-style behavior layered on top of the structured
+    /// tracing::warn already emitted on the Rust side.
+    #[test]
+    fn dispatch_chat_surfaces_hook_errors_via_notification_queue() {
+        let path = tmpfile("errored-hook", r#"(defn on-prompt [ctx] (error "boom"))"#);
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // Dispatch must NOT propagate the error — the host should
+        // continue regardless of a broken plugin.
+        let out = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+        // Hook returned nil after the catch, so no results.
+        assert!(out.is_empty(), "errored hook should produce no result");
+
+        // The error landed on the notification queue and shows up
+        // in the next drain as an `error`-level entry.
+        let pending = mgr.drain_notifications();
+        assert!(
+            pending.iter().any(|(level, msg)| level == "error"
+                && msg.contains("on-prompt")
+                && msg.contains("boom")),
+            "expected an error notification mentioning on-prompt and boom; got: {:?}",
+            pending,
+        );
+    }
+
     /// A directory plugin loads every `*.janet` file inside in
     /// alphabetical order. The stem is the directory name; multi-file
     /// plugins share the same Janet env so files can collaborate.
@@ -1516,7 +1764,7 @@ pub fn load_plugin(
         let mut janet_files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
             .map_err(|e| format!("cannot read plugin dir {}: {}", path.display(), e))?
             .filter_map(|e| e.ok().map(|x| x.path()))
-            .filter(|p| p.is_file() && p.extension().map_or(false, |ext| ext == "janet"))
+            .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "janet"))
             .collect();
         janet_files.sort();
         if janet_files.is_empty() {
@@ -1658,14 +1906,55 @@ impl PluginManager {
 
         let mut results = Vec::new();
         for name in &names {
-            // Wrap the call in (try ... ([err] nil)) so plugin runtime
-            // errors don't print Janet stack traces to stderr.
+            // Wrap the call so plugin runtime errors don't print
+            // Janet stack traces to stderr OR vanish silently. On
+            // error, the catch arm does TWO things:
+            //   1. Push an entry onto `harness-notif-list` with
+            //      `error` level so the next drain surfaces a
+            //      chat-visible "[plugin] hook X.Y errored: ..."
+            //      banner (pi-style — see
+            //      `packages/coding-agent/src/core/extensions/runner.ts`
+            //      which emits structured `ExtensionError` events
+            //      the host renders as `ctx.ui.notify("...","error")`).
+            //   2. Return `DIRGE_HOOK_ERR:<msg>` so the Rust side
+            //      can also log a structured `tracing::warn!` —
+            //      surfaces via `--verbose` or `RUST_LOG=warn`.
+            //
+            // Prior behavior (now retired): pure
+            // `(try ... ([err fib] nil))` which swallowed errors
+            // entirely. Plugin authors got no feedback on broken
+            // hooks. opencode logged but didn't notify; pi notified.
+            // dirge now does both.
             let code = format!(
-                r#"(try (do (def ctx {ctx}) ({fname} ctx)) ([err fib] nil))"#,
+                r#"(try (do (def ctx {ctx}) ({fname} ctx))
+                       ([err fib]
+                         (do
+                           (def sanitized
+                             (harness/sanitize-hook-err
+                               (string "[plugin] hook "
+                                       {hook_lit}
+                                       "."
+                                       {fname_lit}
+                                       " errored: "
+                                       err)))
+                           (harness/push-hook-err sanitized)
+                           (string "DIRGE_HOOK_ERR:" err))))"#,
                 ctx = context_janet,
                 fname = name,
+                hook_lit = format!("\"{}\"", escape_janet_string(hook)),
+                fname_lit = format!("\"{}\"", escape_janet_string(name)),
             );
             if let Ok(s) = self.eval(&code) {
+                if let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:") {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        hook = %hook,
+                        function = %name,
+                        error = %msg,
+                        "plugin hook errored — continuing dispatch",
+                    );
+                    continue;
+                }
                 // Janet nil -> skip
                 if s != "nil" && !s.is_empty() {
                     results.push(s);
@@ -1724,8 +2013,17 @@ impl PluginManager {
 
     /// Specialized dispatcher for tool-hook events (`on-tool-start`,
     /// `on-tool-end`). Clears all tool-hook slots first so previous-call
-    /// state doesn't leak, runs every registered hook, then collects the
-    /// slot values into a structured result.
+    /// state doesn't leak, runs registered hooks in load order, then
+    /// collects the slot values into a structured result.
+    ///
+    /// **First-blocker-wins**: as soon as ANY hook sets `harness-block`,
+    /// dispatch stops and subsequent hooks do NOT run. This matches
+    /// pi's `runner.ts:806-827` `tool_call` semantics and is more
+    /// intuitive than the prior last-write-wins behavior — once a
+    /// plugin has decided to deny the tool call, running additional
+    /// hooks is wasted work and the block reason becomes load-order-
+    /// dependent. Mutations (`mutate-input`, `replace-result`) keep
+    /// last-write-wins chaining for compatibility.
     pub fn dispatch_tool_hook(
         &mut self,
         hook: &str,
@@ -1737,13 +2035,80 @@ impl PluginManager {
             .worker
             .eval("(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)");
 
-        let _ = self.dispatch(hook, context_janet)?;
+        let names = match self.hooks.get(hook) {
+            Some(names) => names.clone(),
+            None => Vec::new(),
+        };
+
+        for name in &names {
+            // Same catch-wrapping shape as `dispatch` — sanitize the
+            // error, queue chat notification + tracing::warn on
+            // failure, continue dispatch otherwise. Kept inline here
+            // (rather than reusing `dispatch`) so we can check the
+            // harness-block slot AFTER each plugin's hook returns
+            // and break out early. Sharing `dispatch` would require
+            // a flag parameter to either run all or stop-on-block.
+            let code = format!(
+                r#"(try (do (def ctx {ctx}) ({fname} ctx))
+                       ([err fib]
+                         (do
+                           (def sanitized
+                             (harness/sanitize-hook-err
+                               (string "[plugin] hook "
+                                       {hook_lit}
+                                       "."
+                                       {fname_lit}
+                                       " errored: "
+                                       err)))
+                           (harness/push-hook-err sanitized)
+                           (string "DIRGE_HOOK_ERR:" err))))"#,
+                ctx = context_janet,
+                fname = name,
+                hook_lit = format!("\"{}\"", escape_janet_string(hook)),
+                fname_lit = format!("\"{}\"", escape_janet_string(name)),
+            );
+            if let Ok(s) = self.worker.eval(&code)
+                && let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:")
+            {
+                tracing::warn!(
+                    target: "dirge::plugin",
+                    hook = %hook,
+                    function = %name,
+                    error = %msg,
+                    "plugin hook errored — continuing dispatch",
+                );
+            }
+
+            // First-wins block check. Peek the slot WITHOUT clearing —
+            // the final `take_pending_block` below does the clear.
+            // If this plugin set the slot, stop iterating so remaining
+            // plugins don't observe / mutate state for a tool call
+            // that will be refused anyway.
+            if self.has_pending_block() {
+                break;
+            }
+        }
 
         Ok(ToolHookResult {
             block: self.take_pending_block(),
             mutate_input: self.take_pending_mutate_input(),
             replace_result: self.take_pending_replace_result(),
         })
+    }
+
+    /// Peek the `harness-block` slot without clearing it. Returns
+    /// true when a plugin has set the slot in the current dispatch.
+    /// Used by `dispatch_tool_hook` to implement first-wins block
+    /// semantics; the slot is cleared by the final
+    /// `take_pending_block` after iteration completes.
+    fn has_pending_block(&mut self) -> bool {
+        match self
+            .worker
+            .eval("(if (nil? harness-block) \"\" harness-block)")
+        {
+            Ok(s) => !s.is_empty() && s != "nil",
+            Err(_) => false,
+        }
     }
 
     /// Snapshot the plugin-registered slash commands as `(cmd-name,
@@ -1850,6 +2215,29 @@ impl PluginManager {
     /// renders entries as colored chat lines. Returns an empty Vec when
     /// no plugin has posted anything.
     pub fn drain_notifications(&mut self) -> Vec<(String, String)> {
+        // Flush any pending hook-error dedup count BEFORE reading
+        // `harness-notif-list`. If a hook errored 50 times in a row,
+        // the first error is already on the list and the next 49
+        // got coalesced into `harness-last-hook-err-count`. The
+        // flush appends a single "(repeated 49 times)" entry so the
+        // count shows up in the next drain instead of being lost.
+        // Resets the dedup slots regardless so a future drain
+        // starts fresh.
+        let _ = self.worker.eval(
+            r#"(do
+                 (when (and harness-last-hook-err-msg
+                            (> harness-last-hook-err-count 1))
+                   (set harness-notif-list
+                        (string harness-notif-list
+                                "error\t"
+                                harness-last-hook-err-msg
+                                " (repeated "
+                                harness-last-hook-err-count
+                                " times)\n")))
+                 (set harness-last-hook-err-msg nil)
+                 (set harness-last-hook-err-count 0))"#,
+        );
+
         let raw = match self.worker.eval("harness-notif-list") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -2063,7 +2451,14 @@ fn parse_tree_op_line(line: &str) -> Option<TreeOp> {
                 Some(TreeOp::SwitchSession { id_prefix: arg1 })
             }
         }
-        _ => None,
+        // Forward compat: a future plugin shipping an op verb we
+        // don't know yet shouldn't poison the rest of the drain. Log
+        // at WARN so a confused plugin author can spot the typo
+        // instead of silently failing.
+        other => {
+            tracing::warn!(target: "dirge::plugin", op = other, "drain_tree_ops: unknown op verb (skipped)");
+            None
+        }
     }
 }
 

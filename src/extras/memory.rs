@@ -65,11 +65,10 @@ pub fn safe_resolve(dir: &Path, path: &str) -> Result<PathBuf, String> {
     if !resolved_canon.starts_with(&dir_canon) {
         return Err("Path escapes memory directory".to_string());
     }
-    if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
-        if meta.file_type().is_symlink() {
+    if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+        && meta.file_type().is_symlink() {
             return Err("Symlinks are not allowed in memory directory".to_string());
         }
-    }
     Ok(resolved)
 }
 
@@ -78,11 +77,10 @@ pub fn list_files(dir: &Path) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                if let Some(name) = entry.file_name().to_str() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && let Some(name) = entry.file_name().to_str() {
                     files.push(name.to_string());
                 }
-            }
         }
     }
     files.sort();
@@ -94,7 +92,20 @@ pub fn read_file(dir: &Path, path: &str) -> Result<String, String> {
     if !resolved.is_file() {
         return Err(format!("Memory '{}' not found", path));
     }
-    std::fs::read_to_string(&resolved).map_err(|e| format!("Failed to read memory: {e}"))
+    // 1 MB cap with truncation marker — same reasoning as the skill
+    // size cap. Memories are meant to be terse notes; multi-MB
+    // memories almost certainly need a different storage mechanism
+    // (and would explode LLM context if loaded raw).
+    const MEMORY_MAX_BYTES: usize = 1024 * 1024;
+    let raw =
+        std::fs::read_to_string(&resolved).map_err(|e| format!("Failed to read memory: {e}"))?;
+    if raw.len() > MEMORY_MAX_BYTES {
+        let mut truncated: String = raw.chars().take(MEMORY_MAX_BYTES).collect();
+        truncated.push_str("\n\n…[truncated: memory exceeds 1 MB cap]");
+        Ok(truncated)
+    } else {
+        Ok(raw)
+    }
 }
 
 pub fn write_file(dir: &Path, path: &str, content: &str) -> Result<(), String> {

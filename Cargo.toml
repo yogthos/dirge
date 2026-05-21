@@ -28,8 +28,18 @@ semantic-bash = ["semantic", "dep:tree-sitter-bash"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 
+[target.'cfg(unix)'.dependencies]
+# Used by the bash tool for process-group cleanup on timeout
+# (F6) — `killpg(pgid, SIGKILL)` to terminate the whole subshell
+# tree rather than orphaning bash's children.
+libc = "0.2"
+
 [dependencies]
 rig = { version = "0.37", features = ["rmcp"] }
+# Display-width-aware char counting for terminal layout. `chars().count()`
+# undercounts emoji (e.g. ✅ takes 2 cells in most terminals); markdown
+# tables misaligned the right border when cells contained them.
+unicode-width = "0.2"
 rmcp = { version = "1.7", optional = true, default-features = false, features = [
     "client",
     "transport-child-process",

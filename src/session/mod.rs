@@ -14,6 +14,48 @@ pub enum MessageRole {
     System,
 }
 
+/// State of a tool call attached to an assistant message. Mirrors
+/// opencode's `ToolPart.state` (`message-v2.ts:310-320`). The point
+/// of preserving state — rather than just "this tool ran" — is so
+/// that resumed sessions can emit a paired tool_result block to the
+/// LLM even for tool calls that didn't complete (e.g. user hit
+/// Ctrl+C mid-execution). Anthropic + OpenAI reject orphan tool_use
+/// blocks; we always emit a result, even if its content is an
+/// interrupted marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolCallState {
+    /// Tool ran to completion. `result` is the output text the LLM
+    /// would see (the same string the UI rendered in the chamber).
+    Completed { result: String },
+    /// Tool was dispatched but the agent was aborted before its
+    /// result came back. Resumed sessions emit a tool_result with
+    /// "[Tool execution was interrupted]" so the LLM knows the
+    /// effect is undefined.
+    Interrupted,
+    /// Tool dispatched but the call errored (e.g. permission denied,
+    /// runtime panic). `error` is the message the LLM saw.
+    Failed { error: String },
+}
+
+/// One tool invocation attached to an assistant message. We keep
+/// the original call id (rig's `ToolCall.id`) so resumed sessions
+/// emit tool_result blocks with the right correlation id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallEntry {
+    /// Provider-supplied call id (e.g. `tooluse_abc123` for
+    /// Anthropic, `call_xyz` for OpenAI). Used as the
+    /// `tool_use_id` / `tool_call_id` correlation on resume.
+    pub id: String,
+    /// Tool name as the LLM saw it (`bash`, `read`, `mcp_tool:...`).
+    pub name: String,
+    /// Arguments the LLM sent. JSON value so it round-trips
+    /// without re-parsing.
+    pub args: serde_json::Value,
+    /// Outcome — completed, interrupted, or failed.
+    pub state: ToolCallState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessage {
     pub role: MessageRole,
@@ -31,6 +73,16 @@ pub struct SessionMessage {
     /// chat messages with plugin entries by timestamp.
     #[serde(default)]
     pub timestamp: i64,
+    /// Tool calls + results attached to this assistant message.
+    /// Empty for User / System messages and for assistants that
+    /// didn't invoke any tools. Phase 3 added persistence so
+    /// resumed sessions re-emit structured tool_use/tool_result
+    /// blocks to the LLM instead of only the assistant's text;
+    /// previously the LLM lost all context of prior tool work on
+    /// session resume. Defaulted on deserialize for back-compat
+    /// with pre-Phase-3 session files.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallEntry>,
 }
 
 /// Generate a fresh message id. Extracted for `#[serde(default = ...)]`.
@@ -91,6 +143,34 @@ pub struct SessionTree {
     pub leaf_id: Option<CompactString>,
 }
 
+/// Lightweight record of a forked subtree that was pruned during
+/// compress / rewind. Phase 4: pi-style preservation
+/// (`packages/coding-agent/src/core/branch-summarization.ts`) at
+/// metadata-only granularity — no LLM summary call. Captures
+/// enough info (count + preview + parent id) that the user can
+/// find pruned branches in `/tree` and understand what was lost.
+/// A future Phase 4b could generate full LLM summaries; the schema
+/// is forward-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchSummary {
+    /// Id of the branch's root node (the topmost node of the
+    /// pruned subtree). Kept for debugging — the node itself no
+    /// longer exists in `tree.entries`.
+    pub root_id: CompactString,
+    /// Id of the still-present parent that the branch hung off.
+    /// May itself have been pruned in the same compress (e.g.
+    /// when both parent and sibling subtree get dropped because
+    /// the parent was the dropped active-path message).
+    pub parent_id: CompactString,
+    /// How many nodes were in the pruned subtree.
+    pub message_count: usize,
+    /// Human-readable preview: branch label (if any) + first
+    /// chars of the root message's content. Shown in `/tree`.
+    pub preview: String,
+    /// RFC3339 timestamp of when the prune happened.
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionAllowEntry {
     pub tool: String,
@@ -119,14 +199,38 @@ pub struct PluginEntry {
     pub seq: u64,
 }
 
+/// Current session-file schema version. Bump when adding fields
+/// that REQUIRE the new code to read correctly (rare — most
+/// field additions use `#[serde(default)]` and are
+/// forward-compatible). Loaders compare this against the
+/// session's stored value: equal or higher is fine (we'll just
+/// see defaults for fields we don't recognize); strictly lower
+/// triggers a migration shim.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// F8: schema version of this session file. Defaulted to 0 for
+    /// pre-F8 session files (which omit the field entirely);
+    /// `load_session` runs migrations from `schema_version` →
+    /// `SCHEMA_VERSION` after deserialize. New sessions get
+    /// `SCHEMA_VERSION` via `Session::new`.
+    #[serde(default)]
+    pub schema_version: u32,
     pub id: CompactString,
     pub name: CompactString,
     pub messages: Vec<SessionMessage>,
     pub compactions: Vec<Compaction>,
     pub created_at: CompactString,
     pub updated_at: CompactString,
+    // TODO(cost-tracking): `total_tokens` and `total_cost` are placeholders.
+    // Currently `total_tokens` accumulates the same heuristic estimate that
+    // already lives in `total_estimated_tokens` (`AgentEvent::Done` emits
+    // estimated_tokens because no provider integration has been wired
+    // through rig to extract actual usage). `total_cost` is never advanced
+    // past 0.0 because no per-provider pricing table exists. Both fields
+    // serialize for forward-compat so when actual provider usage lands
+    // they can be populated without a schema bump.
     pub total_tokens: u64,
     pub total_cost: f64,
     pub total_estimated_tokens: u64,
@@ -164,6 +268,18 @@ pub struct Session {
     /// populates it from `messages` for legacy session files.
     #[serde(default)]
     pub message_store: HashMap<CompactString, SessionMessage>,
+    /// Phase 4 — metadata records for forked subtrees that were
+    /// pruned during compress / rewind. Surfaces in `/tree` so the
+    /// user can see what branches were dropped. Defaulted on
+    /// deserialize for back-compat with pre-Phase-4 session files.
+    #[serde(default)]
+    pub branch_summaries: Vec<BranchSummary>,
+    /// Active prompt name (e.g. "code", "plan", "review"). Persisted
+    /// with the session so resuming via `-c` / `/sessions <id>`
+    /// restores the same prompt the user had active. Defaulted to
+    /// `None` for backward compat with pre-feature session files.
+    #[serde(default)]
+    pub current_prompt_name: Option<String>,
 }
 
 impl Session {
@@ -174,6 +290,7 @@ impl Session {
     pub fn new(provider: &str, model: &str, context_window: u64) -> Self {
         let now = CompactString::new(chrono::Utc::now().to_rfc3339());
         Session {
+            schema_version: SCHEMA_VERSION,
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(""),
             messages: Vec::new(),
@@ -194,6 +311,8 @@ impl Session {
             next_entry_seq: 0,
             tree: SessionTree::default(),
             message_store: HashMap::new(),
+            branch_summaries: Vec::new(),
+            current_prompt_name: None,
         }
     }
 
@@ -231,6 +350,18 @@ impl Session {
         self.tree.leaf_id = prev;
     }
 
+    /// Run both back-compat initializers as a unit. Use this instead
+    /// of calling `ensure_message_store_initialized` and
+    /// `ensure_tree_initialized` separately — they're individually
+    /// idempotent but the combined invariant ("tree + store both
+    /// reflect `messages`") is what every mutation actually depends
+    /// on. A panic between two separate calls would leave the
+    /// session half-initialized; this helper does both in one shot.
+    pub fn ensure_back_compat_initialized(&mut self) {
+        self.ensure_message_store_initialized();
+        self.ensure_tree_initialized();
+    }
+
     /// Append a plugin entry to this session. Assigns the next
     /// monotonic `seq` so renderers can produce a deterministic
     /// ordering even within a single-second timestamp bucket. Plugins
@@ -255,12 +386,26 @@ impl Session {
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
+        self.add_message_with_tool_calls(role, content, Vec::new());
+    }
+
+    /// Same as `add_message` but attaches structured tool-call
+    /// entries to the new message. Used by the runner to persist
+    /// assistant turns that invoked tools so `convert_history`
+    /// can re-emit structured tool_use/tool_result blocks on
+    /// session resume. Empty `tool_calls` is equivalent to the
+    /// plain `add_message`.
+    pub fn add_message_with_tool_calls(
+        &mut self,
+        role: MessageRole,
+        content: &str,
+        tool_calls: Vec<ToolCallEntry>,
+    ) {
         // Make sure tree + store mirror any messages that were loaded
         // from a pre-P4b/P4c session file BEFORE we append the new
         // one — otherwise the rebuild would re-insert this new message
         // with the wrong parent.
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         let tokens = Self::estimate_tokens(content);
         let id = new_message_id();
         let timestamp = chrono::Utc::now().timestamp();
@@ -273,6 +418,7 @@ impl Session {
             estimated_tokens: tokens,
             id: id.clone(),
             timestamp,
+            tool_calls,
         };
         self.messages.push(msg.clone());
         self.message_store.insert(id.clone(), msg);
@@ -302,15 +448,29 @@ impl Session {
     /// fork's children stay reachable. In the linear case it's
     /// always safe to remove.
     pub fn pop_last_message(&mut self) -> Option<SessionMessage> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
+        // Refuse to pop a compaction summary. After compress, the
+        // System message at index 0 anchors all prior context for
+        // the next agent turn; removing it would silently lose the
+        // entire compressed history. Repeated `/undo` past the
+        // recent messages must stop here. The user can `/clear` to
+        // reset entirely.
+        if let Some(last) = self.messages.last()
+            && self.messages.len() == 1
+            && last.role == MessageRole::System
+        {
+            return None;
+        }
         let msg = self.messages.pop()?;
-        // Move leaf back to the popped node's parent.
-        let parent = self
-            .tree
-            .entries
-            .get(&msg.id)
-            .and_then(|n| n.parent.clone());
+        // Pull the popped node's parent for leaf rewind. If the tree
+        // somehow lacks this node (corruption / external mutation),
+        // fall back to the previous message in the linear cache rather
+        // than wiping the leaf — wiping would leave the tree dangling
+        // when the user pops on a branched session.
+        let parent = match self.tree.entries.get(&msg.id) {
+            Some(node) => node.parent.clone(),
+            None => self.messages.last().map(|m| m.id.clone()),
+        };
         self.tree.leaf_id = parent;
         // Only prune the node if nothing else (e.g. a forked branch)
         // refers to it as a parent.
@@ -340,8 +500,7 @@ impl Session {
     /// would indicate corruption). On error, leaves the session
     /// state untouched.
     pub fn switch_to_leaf(&mut self, new_leaf_id: &CompactString) -> Result<(), String> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         if !self.tree.entries.contains_key(new_leaf_id) {
             return Err(format!("unknown entry id: {}", new_leaf_id));
         }
@@ -383,10 +542,16 @@ impl Session {
     /// branch. Returns the message content (so the UI can restore
     /// it into the input editor for re-editing).
     ///
+    /// **Root-node behaviour**: if `entry_id` has no parent (it is
+    /// the conversation root), the current `messages` cache is
+    /// cleared and `tree.leaf_id` is set to `None` so the next
+    /// `add_message` starts a fresh root. The tree's other entries
+    /// (sibling branches) are *not* pruned — they remain reachable
+    /// via `/tree`.
+    ///
     /// Mirrors pi's `ctx.fork(entryId, { position: "before" })`.
     pub fn fork_at(&mut self, entry_id: &CompactString) -> Result<SessionMessage, String> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         let node = self
             .tree
             .entries
@@ -428,7 +593,10 @@ impl Session {
         entry_id: &CompactString,
         label: Option<String>,
     ) -> Result<(), String> {
-        self.ensure_tree_initialized();
+        // Mirror the other mutation methods — keep tree + store in
+        // lockstep even though set_label only touches the tree, in
+        // case a future label-aware code path inspects the store.
+        self.ensure_back_compat_initialized();
         let node = self
             .tree
             .entries
@@ -470,8 +638,18 @@ impl Session {
         self.total_estimated_tokens = 0;
         self.created_at = now.clone();
         self.updated_at = now;
-        // Note: model/provider/context_window/working_dir/permission_allowlist
-        // preserved so the host can keep the same agent runtime.
+        // Least privilege: clear `permission_allowlist` too. The
+        // previous "preserved across reset" behavior let "allow
+        // always" grants for one task (e.g. `bash cargo *` from a
+        // testing session) silently transfer to an unrelated fresh
+        // session. Each new session re-asks for permissions.
+        self.permission_allowlist.clear();
+        // Phase 4: branch summaries are per-session — wipe with
+        // everything else so a fresh session doesn't inherit
+        // phantom branch records from the prior one.
+        self.branch_summaries.clear();
+        // Note: model/provider/context_window/working_dir preserved
+        // so the host can keep the same agent runtime.
     }
 
     pub fn needs_compaction(&self, reserve_tokens: u64) -> bool {
@@ -483,13 +661,51 @@ impl Session {
 
     pub fn compacted_context(&self) -> (Option<&str>, usize) {
         match self.compactions.last() {
-            Some(c) => (Some(c.summary.as_str()), c.first_kept_index),
+            // Clamp `first_kept_index` to `messages.len()` defensively
+            // in case the session was edited externally or shrunk by
+            // `switch_to_leaf` / `pop_last_message` after the
+            // compaction was recorded. Without this, callers doing
+            // `messages[first_kept..]` would panic on stale indices.
+            Some(c) => (
+                Some(c.summary.as_str()),
+                c.first_kept_index.min(self.messages.len()),
+            ),
             None => (None, 0),
         }
     }
 
+    /// Legacy wrapper retained for tests that don't care about the
+    /// pruned-siblings count. New callers should use
+    /// `compress_reporting` to surface a "discarded N branches"
+    /// notification to the user when sibling subtrees are dropped.
+    #[cfg(test)]
     pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
+        let _ = self.compress_reporting(summary, first_kept_index, token_savings);
+    }
+
+    /// Same as `compress` but returns the number of NON-active-path
+    /// nodes that were pruned from the tree because their ancestor
+    /// chain rooted at a dropped message. Active-path message drops
+    /// aren't counted — they're expected and already visible to the
+    /// user as the conversation history shrinking. The host uses this
+    /// count to surface a "discarded N forked branches" notification
+    /// (matches opencode's drop-with-truncation pattern from
+    /// `session/compaction.ts:386-396` — sibling branches outside the
+    /// preserved tail are gone, full stop).
+    pub fn compress_reporting(
+        &mut self,
+        summary: String,
+        first_kept_index: usize,
+        token_savings: u64,
+    ) -> usize {
+        // Bounds check — callers compute `first_kept_index` from a
+        // reverse-scan of `messages` so it should always be in range,
+        // but a buggy/racy caller could pass out-of-bounds. Clamp
+        // rather than panic on `drain(..)` so a misuse degrades to
+        // "summarize everything" instead of a hard crash.
+        let first_kept_index = first_kept_index.min(self.messages.len());
         let summarized_count = first_kept_index;
+
         // Subtract the saved tokens from estimated total
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_sub(token_savings);
         // Add back estimated tokens for the summary itself
@@ -505,6 +721,7 @@ impl Session {
             estimated_tokens: summary_tokens,
             id: summary_id.clone(),
             timestamp: summary_ts,
+            tool_calls: Vec::new(),
         };
 
         // Collect the IDs of the messages we're about to drop so we
@@ -513,6 +730,8 @@ impl Session {
             .iter()
             .map(|m| m.id.clone())
             .collect();
+        let dropped_set: std::collections::HashSet<CompactString> =
+            dropped_ids.iter().cloned().collect();
 
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
@@ -521,9 +740,135 @@ impl Session {
         // Mirror into the tree + store: remove dropped nodes, insert
         // the new summary node as the new root, and re-parent the
         // first kept node to point at the summary.
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
-        for id in &dropped_ids {
+        self.ensure_back_compat_initialized();
+
+        // Sibling-branch prune (Phase 2). When a dropped message has
+        // children that live in a forked sibling branch (not on the
+        // active path), those children — and their descendants —
+        // would be left with a `parent` pointing at a removed id.
+        // Walk the tree and add all such descendants to the prune
+        // set, then drop the union from tree + store. Tracks the
+        // count of NON-active-path nodes removed so the host can
+        // notify the user.
+        //
+        // Active-path messages (the ones still in `self.messages`
+        // after drain + summary insert) are EXCLUDED from the
+        // prune set — they'd otherwise get caught because the new
+        // first-kept message's parent is still pointing at a dropped
+        // id at this point in the function. The re-parent to summary
+        // happens further below.
+        let active_ids: std::collections::HashSet<CompactString> =
+            self.messages.iter().map(|m| m.id.clone()).collect();
+
+        // Algorithm: fixed-point iteration. Start with the directly-
+        // dropped ids. For each pass, find any tree entry whose
+        // parent is in the prune set AND which is not on the active
+        // path, then add it. Repeat until a pass adds nothing.
+        // O(N * K) worst case where K = avg branch depth; typically
+        // tiny in practice.
+        let mut to_prune: std::collections::HashSet<CompactString> = dropped_set.clone();
+        loop {
+            let new_ids: Vec<CompactString> = self
+                .tree
+                .entries
+                .iter()
+                .filter(|(id, node)| {
+                    !to_prune.contains(id.as_str())
+                        && !active_ids.contains(id.as_str())
+                        && node
+                            .parent
+                            .as_ref()
+                            .map(|p| to_prune.contains(p))
+                            .unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if new_ids.is_empty() {
+                break;
+            }
+            for id in new_ids {
+                to_prune.insert(id);
+            }
+        }
+
+        // Count of pruned nodes that were NOT on the active-path
+        // (the dropped messages). Active drops are visible to the
+        // user as the chat shrinking; sibling drops are silent
+        // without a notification, hence the count.
+        let sibling_pruned_count = to_prune.len().saturating_sub(dropped_set.len());
+
+        // Phase 4: capture a BranchSummary per pruned subtree
+        // BEFORE removing nodes (we need to read the root sibling's
+        // content + label). A "subtree root" is a node that's in
+        // `to_prune` AND whose parent is in `dropped_set` (i.e. the
+        // closest dropped-path ancestor). Each unique subtree root
+        // yields one summary.
+        let now_rfc = chrono::Utc::now().to_rfc3339();
+        let mut subtree_summaries: Vec<BranchSummary> = Vec::new();
+        for id in &to_prune {
+            if dropped_set.contains(id) {
+                // Active-path node; not a sibling subtree root.
+                continue;
+            }
+            let node = match self.tree.entries.get(id) {
+                Some(n) => n,
+                None => continue,
+            };
+            let parent = match &node.parent {
+                Some(p) => p,
+                None => continue,
+            };
+            if !dropped_set.contains(parent) {
+                // Not at the top of its subtree (some ancestor is
+                // also a sibling being pruned). Skip — only the
+                // closest-to-active-path ancestor gets a summary.
+                continue;
+            }
+            // Walk the subtree rooted here to count nodes.
+            let mut count = 0usize;
+            let mut stack = vec![id.clone()];
+            while let Some(cur) = stack.pop() {
+                if !to_prune.contains(&cur) {
+                    continue;
+                }
+                count += 1;
+                for (child_id, child_node) in self.tree.entries.iter() {
+                    if child_node.parent.as_ref() == Some(&cur) {
+                        stack.push(child_id.clone());
+                    }
+                }
+            }
+            // Preview: branch label (if any) + first chars of the
+            // root's message content. Keeps the user oriented when
+            // browsing `/tree`.
+            let label_prefix = node
+                .label
+                .as_deref()
+                .map(|l| format!("[{}] ", l))
+                .unwrap_or_default();
+            let body_preview = self
+                .message_store
+                .get(id)
+                .map(|m| {
+                    let s: String = m.content.chars().take(80).collect();
+                    if m.content.chars().count() > 80 {
+                        format!("{}…", s)
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_default();
+            subtree_summaries.push(BranchSummary {
+                root_id: id.clone(),
+                parent_id: parent.clone(),
+                message_count: count,
+                preview: format!("{}{}", label_prefix, body_preview),
+                created_at: now_rfc.clone(),
+            });
+        }
+        self.branch_summaries.extend(subtree_summaries);
+
+        for id in &to_prune {
             self.tree.entries.remove(id);
             self.message_store.remove(id);
         }
@@ -544,9 +889,36 @@ impl Session {
                 node.parent = Some(summary_id.clone());
             }
         } else {
-            self.tree.leaf_id = Some(summary_id);
+            self.tree.leaf_id = Some(summary_id.clone());
+        }
+        // Re-point the tree leaf if the previous leaf was one of the
+        // pruned nodes (e.g. a branched session compressed the branch
+        // that owned the leaf). Without this the leaf dangles at an
+        // id that no longer exists in `tree.entries`.
+        let leaf_dropped = self
+            .tree
+            .leaf_id
+            .as_ref()
+            .map(|id| dropped_set.contains(id))
+            .unwrap_or(false);
+        if leaf_dropped {
+            // Anchor the leaf to the new first-kept message, or to the
+            // summary if nothing else survived.
+            self.tree.leaf_id = self
+                .messages
+                .get(1)
+                .map(|m| m.id.clone())
+                .or(Some(summary_id.clone()));
         }
 
+        // On compress we replace every prior compaction record with a
+        // single fresh one. `Compaction::first_kept_index` is meant to
+        // mark the message-index boundary for the *latest* compaction
+        // only — keeping a stale list of records from earlier compresses
+        // makes their indices meaningless after subsequent drains. The
+        // latest summary IS the conversation prefix; older summaries
+        // are folded into it via `previous_summary` in the LLM context.
+        self.compactions.clear();
         self.compactions.push(Compaction {
             summary: CompactString::from(summary),
             first_kept_index: 1, // The summary is at index 0
@@ -555,9 +927,8 @@ impl Session {
             created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
         });
 
-        // Adjust all compaction first_kept indices for the removed messages
-        // (since we never have >1 compaction with the current simple approach, this is fine)
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        sibling_pruned_count
     }
 }
 
@@ -994,6 +1365,416 @@ mod tests {
         assert_eq!(s.context_window, 200_000);
         // Lineage left blank when no parent passed.
         assert_eq!(s.name, "");
+    }
+
+    /// `reset_to_new` must clear `permission_allowlist` to avoid
+    /// leaking "allow always" decisions from a prior conversation
+    /// into an unrelated fresh session. Least-privilege: each new
+    /// task starts with no implicit grants.
+    #[test]
+    fn reset_to_new_clears_permission_allowlist() {
+        let mut s = Session::new("openai", "gpt-4", 200_000);
+        s.permission_allowlist.push(PermissionAllowEntry {
+            tool: "bash".to_string(),
+            pattern: "rm -rf /tmp/foo".to_string(),
+        });
+        assert!(!s.permission_allowlist.is_empty());
+        s.reset_to_new(None);
+        assert!(
+            s.permission_allowlist.is_empty(),
+            "allowlist must reset on new session; got {:?}",
+            s.permission_allowlist,
+        );
+    }
+
+    /// Repeated `/undo` after a compress must NOT pop the System
+    /// summary at index 0. Removing it would unanchor the compressed
+    /// context and the next agent turn would see no history.
+    #[test]
+    fn pop_last_message_refuses_to_pop_summary_at_index_zero() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "u2");
+        s.add_message(MessageRole::Assistant, "a2");
+        s.compress("summary".to_string(), 4, 100);
+        // After compress: messages = [<summary at 0>, ...nothing else,
+        // since we drained 4 and kept 0 recent]. Verify the shape.
+        assert_eq!(s.messages.len(), 1, "post-compress shape");
+        assert_eq!(s.messages[0].role, MessageRole::System);
+
+        // Now /undo style pop. Must NOT remove the summary.
+        let popped = s.pop_last_message();
+        assert!(
+            popped.is_none(),
+            "pop must refuse the summary; got {:?}",
+            popped,
+        );
+        assert_eq!(s.messages.len(), 1, "summary must remain");
+        assert_eq!(s.messages[0].role, MessageRole::System);
+    }
+
+    /// Popping past the summary by depleting all recent messages
+    /// also must not remove the summary itself — the user has to
+    /// `/clear` to reset.
+    #[test]
+    fn pop_drains_recent_but_keeps_summary() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        s.add_message(MessageRole::Assistant, "a1");
+        s.compress("summary".to_string(), 2, 50);
+        // Re-add some recent messages after the compress.
+        s.add_message(MessageRole::User, "u2");
+        s.add_message(MessageRole::Assistant, "a2");
+        assert_eq!(s.messages.len(), 3); // [summary, u2, a2]
+
+        // Pop a2, then u2 — both should succeed.
+        assert!(s.pop_last_message().is_some());
+        assert!(s.pop_last_message().is_some());
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].role, MessageRole::System);
+
+        // One more pop attempt → refused.
+        assert!(s.pop_last_message().is_none());
+        assert_eq!(s.messages.len(), 1);
+    }
+
+    /// Phase 4 — when compress prunes a sibling subtree, it records
+    /// a `BranchSummary` capturing what was lost: parent id,
+    /// message count, preview text. Without this users see
+    /// "discarded N branches" with no way to know what was in them.
+    #[test]
+    fn compress_records_branch_summary_for_pruned_siblings() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        let u1_id = s.messages.last().unwrap().id.clone();
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "u2 keep");
+        s.add_message(MessageRole::Assistant, "a2 keep");
+        // Graft a sibling pair under u1.
+        let sib1_id = CompactString::new("sib_alpha");
+        let sib2_id = CompactString::new("sib_beta");
+        s.tree.entries.insert(
+            sib1_id.clone(),
+            TreeNode {
+                id: sib1_id.clone(),
+                parent: Some(u1_id.clone()),
+                timestamp: 100,
+                label: Some("explore-alt".to_string()),
+            },
+        );
+        s.tree.entries.insert(
+            sib2_id.clone(),
+            TreeNode {
+                id: sib2_id.clone(),
+                parent: Some(sib1_id.clone()),
+                timestamp: 200,
+                label: None,
+            },
+        );
+        s.message_store.insert(
+            sib1_id.clone(),
+            SessionMessage {
+                role: MessageRole::Assistant,
+                content: CompactString::from(
+                    "let me try a different approach: investigate the foo module first",
+                ),
+                estimated_tokens: 10,
+                id: sib1_id.clone(),
+                timestamp: 100,
+                tool_calls: Vec::new(),
+            },
+        );
+        s.message_store.insert(
+            sib2_id.clone(),
+            SessionMessage {
+                role: MessageRole::User,
+                content: CompactString::from("continue with that"),
+                estimated_tokens: 3,
+                id: sib2_id.clone(),
+                timestamp: 200,
+                tool_calls: Vec::new(),
+            },
+        );
+
+        let baseline = s.branch_summaries.len();
+        let pruned = s.compress_reporting("summary".to_string(), 2, 10);
+        assert_eq!(pruned, 2, "expected 2 sibling nodes pruned");
+        assert_eq!(
+            s.branch_summaries.len(),
+            baseline + 1,
+            "expected 1 branch summary; got {:?}",
+            s.branch_summaries,
+        );
+        let summary = s.branch_summaries.last().unwrap();
+        // Parent is u1 (the closest still-active-or-dropped ancestor
+        // of the pruned subtree). u1 itself was dropped in this
+        // compress, but the summary records the relationship so the
+        // user can correlate.
+        assert_eq!(summary.parent_id, u1_id);
+        assert_eq!(summary.message_count, 2);
+        // Preview pulls from the root sibling's content + label.
+        assert!(
+            summary.preview.contains("explore-alt")
+                || summary.preview.contains("different approach"),
+            "preview missing branch info: {:?}",
+            summary.preview,
+        );
+    }
+
+    /// `reset_to_new` clears `branch_summaries`.
+    #[test]
+    fn reset_to_new_clears_branch_summaries() {
+        let mut s = Session::new("p", "m", 0);
+        s.branch_summaries.push(BranchSummary {
+            root_id: CompactString::from("x"),
+            parent_id: CompactString::from("y"),
+            message_count: 3,
+            preview: "lingering branch".to_string(),
+            created_at: "2026-01-01".to_string(),
+        });
+        s.reset_to_new(None);
+        assert!(s.branch_summaries.is_empty());
+    }
+
+    /// Phase 3 — tool calls round-trip through serde with default
+    /// for back-compat. Old session files without the field
+    /// deserialize into an empty Vec.
+    #[test]
+    fn session_message_tool_calls_default_when_field_missing() {
+        let json = r#"{
+            "role": "assistant",
+            "content": "Done.",
+            "estimated_tokens": 5
+        }"#;
+        let msg: SessionMessage = serde_json::from_str(json).unwrap();
+        assert!(
+            msg.tool_calls.is_empty(),
+            "missing field must default to []"
+        );
+    }
+
+    /// Round-trip: write a message WITH tool_calls, read back, fields intact.
+    #[test]
+    fn session_message_tool_calls_roundtrip() {
+        let mut s = Session::new("p", "m", 0);
+        let calls = vec![
+            ToolCallEntry {
+                id: "tc_1".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"cmd": "ls"}),
+                state: ToolCallState::Completed {
+                    result: "file1\nfile2".to_string(),
+                },
+            },
+            ToolCallEntry {
+                id: "tc_2".to_string(),
+                name: "read".to_string(),
+                args: serde_json::json!({"path": "/tmp/x"}),
+                state: ToolCallState::Interrupted,
+            },
+        ];
+        s.add_message_with_tool_calls(MessageRole::Assistant, "Let me check.", calls.clone());
+
+        let blob = serde_json::to_string(&s).unwrap();
+        let s2: Session = serde_json::from_str(&blob).unwrap();
+        let last = s2.messages.last().unwrap();
+        assert_eq!(last.tool_calls.len(), 2);
+        assert_eq!(last.tool_calls[0].id, "tc_1");
+        assert!(matches!(
+            last.tool_calls[0].state,
+            ToolCallState::Completed { .. },
+        ));
+        assert!(matches!(
+            last.tool_calls[1].state,
+            ToolCallState::Interrupted,
+        ));
+    }
+
+    /// Convert history materializes prior tool calls as structured
+    /// rig Message blocks (Assistant with ToolCall content +
+    /// User with ToolResult content). Without this, resumed sessions
+    /// lose tool-call context and the LLM may re-call the same
+    /// tools. Matches opencode's `message-v2.ts:630-899` pattern.
+    #[test]
+    fn convert_history_emits_tool_use_and_tool_result_blocks() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "list files");
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            "Here:",
+            vec![ToolCallEntry {
+                id: "tc_42".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"cmd": "ls"}),
+                state: ToolCallState::Completed {
+                    result: "a\nb".to_string(),
+                },
+            }],
+        );
+
+        let history = crate::agent::runner::convert_history(&s);
+        // Expect: User("list files"), Assistant(text + tool_use),
+        // User(tool_result). 3 messages total.
+        assert_eq!(history.len(), 3, "history shape: {:#?}", history);
+
+        // Last is a User with tool_result content carrying the id.
+        match &history[2] {
+            rig::completion::Message::User { content } => {
+                let s = format!("{:?}", content);
+                assert!(s.contains("tc_42"), "tool_result missing call id: {s}");
+                // Debug format escapes newlines, so check the
+                // escaped form. The underlying string still has the
+                // real newline; this is just an assertion-side
+                // formatting consideration.
+                assert!(
+                    s.contains("a\\nb") || s.contains("a\nb"),
+                    "tool_result missing output: {s}",
+                );
+            }
+            other => panic!("expected User tool_result message; got {other:?}"),
+        }
+
+        // Middle is Assistant with both text and a ToolCall.
+        match &history[1] {
+            rig::completion::Message::Assistant { content, .. } => {
+                let s = format!("{:?}", content);
+                assert!(s.contains("tc_42"), "tool_use missing id: {s}");
+                assert!(s.contains("\"bash\""), "tool_use missing name: {s}");
+            }
+            other => panic!("expected Assistant message; got {other:?}"),
+        }
+    }
+
+    /// Interrupted tool calls must be emitted as tool_result with
+    /// an "[interrupted]" marker, NOT skipped. Anthropic + OpenAI
+    /// reject orphan tool_use blocks; opencode handles this
+    /// (`message-v2.ts:848-857`) by emitting an error tool_result.
+    #[test]
+    fn convert_history_pairs_interrupted_tool_calls_with_error_marker() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            "About to bash...",
+            vec![ToolCallEntry {
+                id: "tc_99".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"cmd": "sleep 9999"}),
+                state: ToolCallState::Interrupted,
+            }],
+        );
+
+        let history = crate::agent::runner::convert_history(&s);
+        // 2 messages: Assistant(text + tool_use) + User(tool_result-interrupted).
+        assert_eq!(history.len(), 2);
+        let last_str = format!("{:?}", &history[1]);
+        assert!(
+            last_str.contains("tc_99"),
+            "interrupted result must reference call id: {last_str}",
+        );
+        assert!(
+            last_str.contains("interrupted") || last_str.contains("Interrupted"),
+            "interrupted result must say so: {last_str}",
+        );
+    }
+
+    /// Phase 2 — compress drops a parent that has a sibling branch
+    /// underneath. The sibling subtree must also be pruned;
+    /// otherwise its nodes have `parent` pointing at a removed id
+    /// and the tree is dangling. Returns the count of pruned
+    /// non-active nodes so the host can surface a "discarded N
+    /// branches" notification.
+    #[test]
+    fn compress_prunes_sibling_branches_rooted_at_dropped_messages() {
+        let mut s = Session::new("p", "m", 0);
+        // Linear active branch: u1 → a1 → u2 → a2.
+        s.add_message(MessageRole::User, "u1");
+        let u1_id = s.messages.last().unwrap().id.clone();
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "u2");
+        s.add_message(MessageRole::Assistant, "a2");
+        // Manually graft a sibling branch under u1: sib1 (child of
+        // u1) → sib2 (child of sib1). These live in tree.entries +
+        // message_store but NOT in `messages` (different branch).
+        let sib1_id = CompactString::new("sib1");
+        let sib2_id = CompactString::new("sib2");
+        s.tree.entries.insert(
+            sib1_id.clone(),
+            TreeNode {
+                id: sib1_id.clone(),
+                parent: Some(u1_id.clone()),
+                timestamp: 0,
+                label: None,
+            },
+        );
+        s.tree.entries.insert(
+            sib2_id.clone(),
+            TreeNode {
+                id: sib2_id.clone(),
+                parent: Some(sib1_id.clone()),
+                timestamp: 0,
+                label: None,
+            },
+        );
+        s.message_store.insert(
+            sib1_id.clone(),
+            SessionMessage {
+                role: MessageRole::Assistant,
+                content: CompactString::from("sib1"),
+                estimated_tokens: 1,
+                id: sib1_id.clone(),
+                timestamp: 0,
+                tool_calls: Vec::new(),
+            },
+        );
+        s.message_store.insert(
+            sib2_id.clone(),
+            SessionMessage {
+                role: MessageRole::Assistant,
+                content: CompactString::from("sib2"),
+                estimated_tokens: 1,
+                id: sib2_id.clone(),
+                timestamp: 0,
+                tool_calls: Vec::new(),
+            },
+        );
+
+        // Compress drops u1+a1 (first 2 messages). Sibling branch
+        // is rooted at u1 (a dropped id), so sib1 + sib2 must be
+        // pruned from tree + store along with the dropped messages.
+        let pruned = s.compress_reporting("summary".to_string(), 2, 10);
+
+        // u1, a1 (linear), sib1, sib2 (sibling) all gone from tree.
+        assert!(!s.tree.entries.contains_key(&u1_id), "u1 still in tree");
+        assert!(!s.tree.entries.contains_key(&sib1_id), "sib1 still in tree");
+        assert!(!s.tree.entries.contains_key(&sib2_id), "sib2 still in tree");
+        assert!(
+            !s.message_store.contains_key(&sib1_id),
+            "sib1 still in store",
+        );
+        assert!(
+            !s.message_store.contains_key(&sib2_id),
+            "sib2 still in store",
+        );
+
+        // Report: 2 sibling branch nodes were pruned (sib1, sib2).
+        // The linear u1+a1 drops aren't counted as "branches" since
+        // they were on the active path.
+        assert_eq!(pruned, 2, "expected 2 sibling nodes pruned, got {pruned}",);
+    }
+
+    /// When compress drops messages but there are NO sibling branches,
+    /// the report says 0 sibling nodes pruned. Confirms the counter
+    /// isn't accidentally counting active-path nodes.
+    #[test]
+    fn compress_reports_zero_pruned_when_no_siblings() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "u2");
+        s.add_message(MessageRole::Assistant, "a2");
+        let pruned = s.compress_reporting("summary".to_string(), 2, 10);
+        assert_eq!(pruned, 0);
     }
 
     /// When given a parent session id, `reset_to_new` records it

@@ -141,14 +141,13 @@ impl Tool for EditTool {
 
         check_perm_path(&self.permission, &self.ask_tx, "edit", &args.path).await?;
 
-        if let Some(plan) = &self.plan_file {
-            if !is_plan_file(plan, &args.path) {
+        if let Some(plan) = &self.plan_file
+            && !is_plan_file(plan, &args.path) {
                 return Err(ToolError::Msg(
                     "Plan mode: edits restricted to PLAN.md only. Use /prompt default to exit plan mode."
                         .to_string(),
                 ));
             }
-        }
 
         let bytes = tokio::fs::read(&args.path).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
@@ -220,9 +219,29 @@ impl Tool for EditTool {
             cache.clear();
         }
 
-        let mut result = format!("Applied edit to {}", args.path);
-        if do_replace_all {
-            result.push_str(&format!(" ({} replacements)", match_positions.len()));
+        // Path lives in the chamber banner (`╭─ EDIT ─ "<path>" ─╮`),
+        // so don't repeat it. The diff block below is the meat;
+        // this first line is a compact summary.
+        let mut result = if do_replace_all {
+            format!("Applied edit ({} replacements)", match_positions.len())
+        } else {
+            "Applied edit".to_string()
+        };
+        // Mention the line delta when adding/removing lines so the
+        // LLM can confirm the size of change without re-reading
+        // the diff block. For replace_all the per-replacement
+        // delta multiplies by the number of replacements — the
+        // user wants the FILE delta, not the per-instance delta.
+        let old_lines = args.old_text.lines().count();
+        let new_lines = args.new_text.lines().count();
+        let per_replacement_delta = new_lines as i64 - old_lines as i64;
+        let total_delta = if do_replace_all {
+            per_replacement_delta * (match_positions.len() as i64)
+        } else {
+            per_replacement_delta
+        };
+        if total_delta != 0 {
+            result.push_str(&format!(" ({:+} lines)", total_delta));
         }
 
         // Always emit a diff. The earlier 20-line cap was meant to
@@ -231,8 +250,8 @@ impl Tool for EditTool {
         // per side which covers the vast majority of real edits;
         // edits larger than that are likely refactors where the
         // "edit + diff" pattern isn't the right tool anyway.
-        let old_lines = args.old_text.lines().count();
-        let new_lines = args.new_text.lines().count();
+        // `old_lines` / `new_lines` already computed above for the
+        // delta summary.
         if old_lines <= 200 && new_lines <= 200 {
             result.push_str(&Self::show_diff(
                 &args.path,

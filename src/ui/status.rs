@@ -34,11 +34,14 @@ impl StatusLine {
         let used = session.total_estimated_tokens;
         let pct = if ctx > 0 { (used * 100) / ctx } else { 0 };
 
-        let cost_str = if session.total_cost > 0.0 {
-            format!(" ${:.4}", session.total_cost)
-        } else {
-            String::new()
-        };
+        // TODO(cost-tracking): `session.total_cost` is always 0.0
+        // because dirge doesn't yet have a per-provider pricing
+        // table — `AgentEvent::Done` emits `cost: 0.0` unconditionally
+        // (see `src/agent/runner.rs::run_stream`). Until that's wired,
+        // the cost segment is suppressed entirely to avoid showing a
+        // misleading "$0.0000". When pricing lands, restore the
+        // conditional formatter that was here previously.
+        let cost_str = String::new();
 
         let compact_badge = if session.compactions.is_empty() {
             String::new()

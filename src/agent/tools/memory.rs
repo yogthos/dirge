@@ -45,7 +45,8 @@ impl Tool for MemoryTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "Action: view, write, or delete"
+                        "enum": ["view", "write", "delete"],
+                        "description": "view: read one or list all; write: create/overwrite; delete: remove a memory file"
                     },
                     "path": {
                         "type": "string",
@@ -69,10 +70,10 @@ impl Tool for MemoryTool {
         match args.action.as_str() {
             "view" => {
                 if let Some(path) = args.path.as_deref().filter(|p| !p.is_empty()) {
-                    let content = memory::read_file(&dir, path).map_err(|e| ToolError::Msg(e))?;
+                    let content = memory::read_file(&dir, path).map_err(ToolError::Msg)?;
                     Ok(format!("Memory: {}\n\n{}", path, content))
                 } else {
-                    let files = memory::list_files(&dir).map_err(|e| ToolError::Msg(e))?;
+                    let files = memory::list_files(&dir).map_err(ToolError::Msg)?;
                     if files.is_empty() {
                         Ok("No memories stored.".to_string())
                     } else {
@@ -97,7 +98,7 @@ impl Tool for MemoryTool {
                     .content
                     .as_deref()
                     .ok_or_else(|| ToolError::Msg("content required for write".to_string()))?;
-                memory::write_file(&dir, path, content).map_err(|e| ToolError::Msg(e))?;
+                memory::write_file(&dir, path, content).map_err(ToolError::Msg)?;
                 Ok(format!("Written memory: {}", path))
             }
             "delete" => {
@@ -105,7 +106,7 @@ impl Tool for MemoryTool {
                     .path
                     .as_deref()
                     .ok_or_else(|| ToolError::Msg("path required for delete".to_string()))?;
-                memory::delete_file(&dir, path).map_err(|e| ToolError::Msg(e))?;
+                memory::delete_file(&dir, path).map_err(ToolError::Msg)?;
                 Ok(format!("Deleted memory: {}", path))
             }
             _ => Err(ToolError::Msg(format!(

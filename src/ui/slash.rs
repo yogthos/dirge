@@ -34,6 +34,28 @@ fn c_error() -> Color {
     theme::error()
 }
 
+/// Walk `cut_idx` forward until the message at that index is a
+/// `User` message (or the index reaches `messages.len()`). This
+/// guarantees the kept tail after compress starts with a User
+/// message, which is what every provider expects after a System
+/// summary. If `cut_idx` already points at a User message or is
+/// past the end, no change. If no user message exists in the
+/// tail, return `messages.len()` — caller surfaces the "nothing to
+/// compress" message.
+///
+/// Matches opencode's `splitTurn` discipline
+/// (`session/compaction.ts:161-184`).
+fn align_cut_to_user_boundary(
+    messages: &[crate::session::SessionMessage],
+    cut_idx: usize,
+) -> usize {
+    let mut i = cut_idx;
+    while i < messages.len() && messages[i].role != MessageRole::User {
+        i += 1;
+    }
+    i
+}
+
 pub fn undo_last(session: &mut Session) -> usize {
     let len = session.messages.len();
     if len == 0 {
@@ -100,6 +122,15 @@ pub async fn handle_compress(
         accumulated = accumulated.saturating_add(msg.estimated_tokens);
     }
 
+    // F3: nudge `cut_idx` forward until the first kept message is a
+    // User message (or we hit the end). Without this, the kept tail
+    // could start with an Assistant message — Anthropic + OpenAI
+    // expect alternating user/assistant role order; an assistant
+    // following a system summary breaks the role sequence and gets
+    // rejected with a 400. opencode handles this via `splitTurn`
+    // (`compaction.ts:161-184`).
+    cut_idx = align_cut_to_user_boundary(&session.messages, cut_idx);
+
     if cut_idx == 0 {
         renderer.write_line("nothing to compress (entire context is recent)", c_agent())?;
         return Ok(());
@@ -122,7 +153,27 @@ pub async fn handle_compress(
         .map(|m| m.estimated_tokens)
         .sum();
 
-    session.compress(summary, cut_idx, tokens_before);
+    // F13: estimate the summary's own token cost so we can
+    // report TRUE net savings instead of just "tokens replaced".
+    // A pathological summary longer than the messages it
+    // replaces means we just paid more tokens for less context.
+    // We still proceed with the compress (the new prefix is the
+    // SHAPE the LLM expects), but we want to surface the
+    // misfire so the user can adjust `keep_recent_tokens` or
+    // their custom compress prompt. opencode validates the
+    // summary fits the budget BEFORE issuing the LLM call
+    // (`compaction.ts:136-294`); dirge validates AFTER because
+    // we don't know the summary's size until the LLM returns.
+    let summary_tokens_est = crate::session::Session::estimate_tokens(&summary);
+    let net_saved: i64 = tokens_before as i64 - summary_tokens_est as i64;
+
+    // `compress_reporting` returns the count of non-active-path
+    // tree nodes (sibling branches) pruned. We notify the user
+    // about that loss explicitly — without the notification a
+    // branched session could silently lose forks during auto-
+    // compaction. opencode (`session/compaction.ts:386-396`) drops
+    // siblings silently; dirge prefers the explicit notification.
+    let pruned_branches = session.compress_reporting(summary, cut_idx, tokens_before);
 
     let model = client.completion_model(session.model.to_string());
     *agent = crate::provider::build_agent(
@@ -147,13 +198,43 @@ pub async fn handle_compress(
     renderer.write_line("prompt cleared (back to default behavior)", c_agent())?;
 
     render_session(renderer, session, cli, cfg, context)?;
-    renderer.write_line(
-        &format!(
-            "compressed {} messages (saved ~{} tokens)",
-            cut_idx, tokens_before,
-        ),
-        c_agent(),
-    )?;
+    if pruned_branches > 0 {
+        // Tell the user the branched topology shrunk. Without this,
+        // they'd notice missing forks in `/tree` without any
+        // explanation.
+        renderer.write_line(
+            &format!(
+                "discarded {} forked branch node{} that were rooted in the compressed region",
+                pruned_branches,
+                if pruned_branches == 1 { "" } else { "s" },
+            ),
+            c_error(),
+        )?;
+    }
+    if net_saved < 0 {
+        // Summary cost more than the messages it replaced. Surface
+        // visibly so the user knows the compress didn't help —
+        // suggests tightening `keep_recent_tokens` or editing the
+        // compress instructions.
+        renderer.write_line(
+            &format!(
+                "compressed {} messages but the summary ({}t) is LARGER than the replaced messages ({}t); net cost +{}t. Consider lowering keep_recent_tokens or refining compress instructions.",
+                cut_idx,
+                summary_tokens_est,
+                tokens_before,
+                -net_saved,
+            ),
+            c_error(),
+        )?;
+    } else {
+        renderer.write_line(
+            &format!(
+                "compressed {} messages (saved ~{} tokens; summary uses {}t)",
+                cut_idx, net_saved, summary_tokens_est,
+            ),
+            c_agent(),
+        )?;
+    }
 
     Ok(())
 }
@@ -626,6 +707,9 @@ pub async fn handle_slash(
                 } else {
                     context.current_prompt = None;
                     context.current_prompt_name = None;
+                    // Mirror into session so `-c` / `/sessions <id>`
+                    // resumes the same prompt state next time.
+                    session.current_prompt_name = None;
                     let model = client.completion_model(session.model.to_string());
                     *agent = crate::provider::build_agent(
                         model,
@@ -652,6 +736,9 @@ pub async fn handle_slash(
                 if let Some(content) = context.prompts.get(name) {
                     context.current_prompt = Some(content.clone());
                     context.current_prompt_name = Some(name.to_string());
+                    // Mirror into the session so resuming restores the
+                    // same active prompt instead of defaulting to "code".
+                    session.current_prompt_name = Some(name.to_string());
                     let model = client.completion_model(session.model.to_string());
                     *agent = crate::provider::build_agent(
                         model,
@@ -801,7 +888,40 @@ pub async fn handle_slash(
         "/regen-prompts" => match crate::context::prompts::regen() {
             Ok(()) => {
                 context.prompts = crate::context::prompts::load();
-                renderer.write_line("default prompts regenerated", c_agent())?;
+                // The active prompt's content may have changed on
+                // disk during regen. Re-bind `context.current_prompt`
+                // to the freshly-loaded body and rebuild the agent
+                // so the new preamble takes effect on the next turn
+                // without the user having to `/prompt <name>` again.
+                if let Some(name) = context.current_prompt_name.clone()
+                    && let Some(content) = context.prompts.get(&name)
+                {
+                    context.current_prompt = Some(content.clone());
+                }
+                let model = client.completion_model(session.model.to_string());
+                *agent = crate::provider::build_agent(
+                    model,
+                    cli,
+                    cfg,
+                    context,
+                    permission.clone(),
+                    ask_tx.clone(),
+                    None,
+                    None,
+                    bg_store.clone(),
+                    #[cfg(feature = "lsp")]
+                    None,
+                    sandbox.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                    #[cfg(feature = "semantic")]
+                    semantic_manager,
+                )
+                .await;
+                renderer.write_line(
+                    "default prompts regenerated; agent rebuilt with refreshed prompt",
+                    c_agent(),
+                )?;
             }
             Err(e) => {
                 renderer.write_line(&format!("failed to regenerate prompts: {}", e), c_error())?;
@@ -980,7 +1100,13 @@ pub async fn handle_slash(
             }
         }
         "/cd" => {
-            let target = parts.get(1).copied().unwrap_or("");
+            // `splitn(3, ' ')` produces empty middle elements for
+            // consecutive spaces (`/cd   /tmp` → `["/cd", "", "/tmp"]`),
+            // which collapses to "cd home" — silent surprise.
+            // Re-derive the target from everything after the slash
+            // command using whitespace-aware splitting.
+            let raw_args = text.trim().strip_prefix("/cd").unwrap_or("").trim();
+            let target = raw_args;
             let path = if target.is_empty() {
                 dirs::home_dir().unwrap_or_default()
             } else if let Some(rest) = target.strip_prefix('~') {
@@ -995,11 +1121,10 @@ pub async fn handle_slash(
                     let canonical = std::fs::canonicalize(&path).unwrap_or(path);
                     session.working_dir =
                         compact_str::CompactString::new(canonical.to_string_lossy());
-                    if let Some(perm) = permission {
-                        if let Ok(mut guard) = perm.lock() {
+                    if let Some(perm) = permission
+                        && let Ok(mut guard) = perm.lock() {
                             guard.set_working_dir(&session.working_dir);
                         }
-                    }
                     context.reload();
                     let model = client.completion_model(session.model.to_string());
                     *agent = crate::provider::build_agent(
@@ -1050,12 +1175,175 @@ pub async fn handle_slash(
                 .cloned();
             match last_user {
                 Some(msg) => {
+                    // Pop messages until we've removed the last user
+                    // message itself — covers assistant replies AND
+                    // system messages (compress summaries, error
+                    // notices) that landed between the user prompt
+                    // and the current state. `undo_last` only handles
+                    // the Assistant/User pair pattern; using it here
+                    // would leave a trailing System message in the
+                    // session and the agent would see it on retry.
+                    //
+                    // Bound the loop at the current message count so
+                    // a corrupt session that somehow lacks user msgs
+                    // (despite the `last_user.is_some()` check above)
+                    // can't infinite-loop on `pop` returning None.
+                    let mut guard = session.messages.len();
+                    while let Some(last) = session.messages.last() {
+                        let was_user = last.role == MessageRole::User;
+                        session.pop_last_message();
+                        if was_user {
+                            break;
+                        }
+                        guard = guard.saturating_sub(1);
+                        if guard == 0 {
+                            break;
+                        }
+                    }
                     input.buffer = msg.content.clone();
                     input.cursor = msg.content.len();
+                    render_session(renderer, session, cli, cfg, context)?;
                     renderer.write_line("edit last message and press Enter to retry", c_agent())?;
                 }
                 None => {
                     renderer.write_line("no previous message to retry", c_agent())?;
+                }
+            }
+        }
+        "/allow" => {
+            // Phase 5: CRUD for the session permission allowlist.
+            // Subcommands: list (default), add <tool> <pattern>,
+            // remove <idx>, clear. Without this, users can only
+            // create allowlist entries via the interactive "(a)
+            // allow always" prompt; there's no way to inspect or
+            // undo a bad grant short of editing the session JSON.
+            let sub = parts.get(1).copied().unwrap_or("list");
+            let perm = match permission {
+                Some(p) => p,
+                None => {
+                    renderer.write_line(
+                        "permission system unavailable (--no-tools mode?)",
+                        c_error(),
+                    )?;
+                    return Ok(());
+                }
+            };
+            match sub {
+                "list" => {
+                    let entries = {
+                        let guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.allowlist_entries()
+                    };
+                    if entries.is_empty() {
+                        renderer.write_line(
+                            "session allowlist is empty (use '(a) allow always' in a permission prompt to add entries)",
+                            c_agent(),
+                        )?;
+                    } else {
+                        renderer.write_line(
+                            &format!("session allowlist ({} entries):", entries.len()),
+                            c_agent(),
+                        )?;
+                        for (i, (tool, pat)) in entries.iter().enumerate() {
+                            renderer
+                                .write_line(&format!("  [{}] {} {}", i, tool, pat), c_result())?;
+                        }
+                        renderer.write_line(
+                            "use '/allow remove <idx>' to drop a single entry; '/allow clear' to drop all",
+                            theme::dim(),
+                        )?;
+                    }
+                }
+                "add" => {
+                    // `/allow add <tool> <pattern>` — third part is
+                    // the tool, rest is the pattern (may contain
+                    // spaces, so re-derive from raw text).
+                    let raw_args = text.trim().strip_prefix("/allow").unwrap_or("").trim();
+                    let rest = raw_args.strip_prefix("add").unwrap_or("").trim();
+                    let mut it = rest.splitn(2, char::is_whitespace);
+                    let tool = it.next().unwrap_or("");
+                    let pattern = it.next().unwrap_or("").trim();
+                    if tool.is_empty() || pattern.is_empty() {
+                        renderer.write_line(
+                            "usage: /allow add <tool> <pattern>  (e.g. /allow add bash 'cargo *')",
+                            c_error(),
+                        )?;
+                    } else {
+                        {
+                            let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.add_session_allowlist(tool.to_string(), pattern);
+                        }
+                        // Mirror into session.permission_allowlist
+                        // so the entry persists across save/load.
+                        let entry = crate::session::PermissionAllowEntry {
+                            tool: tool.to_string(),
+                            pattern: pattern.to_string(),
+                        };
+                        // Dedup at the session level too — checker
+                        // dedupes but we want save() to write a
+                        // clean list.
+                        if !session
+                            .permission_allowlist
+                            .iter()
+                            .any(|e| e.tool == entry.tool && e.pattern == entry.pattern)
+                        {
+                            session.permission_allowlist.push(entry);
+                        }
+                        renderer.write_line(&format!("added: {} {}", tool, pattern), c_agent())?;
+                    }
+                }
+                "remove" => {
+                    let idx_str = parts.get(2).copied().unwrap_or("");
+                    let idx: usize = match idx_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            renderer.write_line(
+                                "usage: /allow remove <idx>  (run /allow list to see indices)",
+                                c_error(),
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    let removed = {
+                        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.remove_session_allowlist_at(idx)
+                    };
+                    match removed {
+                        Some((tool, pat)) => {
+                            // Mirror removal into the session
+                            // allowlist too.
+                            session
+                                .permission_allowlist
+                                .retain(|e| !(e.tool == tool && e.pattern == pat));
+                            renderer.write_line(
+                                &format!("removed [{}]: {} {}", idx, tool, pat),
+                                c_agent(),
+                            )?;
+                        }
+                        None => {
+                            renderer.write_line(
+                                &format!("no allowlist entry at index {}", idx),
+                                c_error(),
+                            )?;
+                        }
+                    }
+                }
+                "clear" => {
+                    {
+                        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.clear_session_allowlist();
+                    }
+                    session.permission_allowlist.clear();
+                    renderer.write_line("session allowlist cleared", c_agent())?;
+                }
+                other => {
+                    renderer.write_line(
+                        &format!(
+                            "unknown /allow subcommand {:?}; try: list, add, remove, clear",
+                            other,
+                        ),
+                        c_error(),
+                    )?;
                 }
             }
         }
@@ -1127,6 +1415,26 @@ pub async fn handle_slash(
             )?;
             renderer.write_line(
                 "  /compress [instr]      compress with custom instructions",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /toggle <feat> [on|off] toggle a feature (e.g. /toggle todo)",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /allow list            list session allowlist entries",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /allow add <tool> <pat> add an allowlist entry",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /allow remove <idx>    drop one allowlist entry",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /allow clear           drop all allowlist entries",
                 c_result(),
             )?;
             #[cfg(feature = "loop")]
@@ -1264,4 +1572,82 @@ pub async fn handle_slash(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Session, SessionMessage};
+
+    fn msg(role: MessageRole, content: &str) -> SessionMessage {
+        // Re-use Session::add_message to get a real msg with id/timestamp.
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(role, content);
+        s.messages.pop().unwrap()
+    }
+
+    /// F3: when the reverse-scan lands on an Assistant message, the
+    /// helper advances to the next User so the kept tail begins
+    /// with a User message (provider-required role sequence after
+    /// the System summary).
+    #[test]
+    fn align_cut_advances_past_assistant_to_next_user() {
+        let messages = vec![
+            msg(MessageRole::User, "u0"),
+            msg(MessageRole::Assistant, "a0"),
+            msg(MessageRole::User, "u1"),
+            msg(MessageRole::Assistant, "a1"), // reverse-scan landed here (cut_idx=3)
+            msg(MessageRole::User, "u2"),
+            msg(MessageRole::Assistant, "a2"),
+        ];
+        // Initial cut at idx=3 (Assistant). Should advance to 4 (User).
+        assert_eq!(align_cut_to_user_boundary(&messages, 3), 4);
+    }
+
+    /// User-boundary cut is unchanged.
+    #[test]
+    fn align_cut_idempotent_when_already_on_user() {
+        let messages = vec![
+            msg(MessageRole::User, "u0"),
+            msg(MessageRole::Assistant, "a0"),
+            msg(MessageRole::User, "u1"),
+        ];
+        assert_eq!(align_cut_to_user_boundary(&messages, 2), 2);
+        assert_eq!(align_cut_to_user_boundary(&messages, 0), 0);
+    }
+
+    /// Cut past end of array stays past end.
+    #[test]
+    fn align_cut_past_end_clamps() {
+        let messages = vec![msg(MessageRole::User, "u0")];
+        assert_eq!(align_cut_to_user_boundary(&messages, 1), 1);
+        assert_eq!(align_cut_to_user_boundary(&messages, 5), 5);
+    }
+
+    /// No user in the tail (e.g. only system+assistant remain after
+    /// the cut). Helper returns `messages.len()`, which is the
+    /// "nothing to compress (no clean boundary)" case.
+    #[test]
+    fn align_cut_returns_end_when_no_user_in_tail() {
+        let messages = vec![
+            msg(MessageRole::User, "u0"),
+            msg(MessageRole::Assistant, "a0"),
+            msg(MessageRole::System, "system note"),
+            msg(MessageRole::Assistant, "a1"),
+        ];
+        // cut_idx=2 points at System; no User follows.
+        assert_eq!(align_cut_to_user_boundary(&messages, 2), messages.len());
+    }
+
+    /// A cut that lands on a System message (e.g. a prior summary)
+    /// also advances forward to the next User.
+    #[test]
+    fn align_cut_skips_system_to_user() {
+        let messages = vec![
+            msg(MessageRole::System, "prior summary"),
+            msg(MessageRole::User, "u0"),
+            msg(MessageRole::Assistant, "a0"),
+        ];
+        assert_eq!(align_cut_to_user_boundary(&messages, 0), 1);
+    }
 }

@@ -102,6 +102,32 @@ async fn test_replace_all() {
     assert!(result.contains("3 replacements"), "result: {result}");
 }
 
+/// Self-review bug: `replace_all` line-delta used to report the
+/// PER-REPLACEMENT delta, not the FILE delta. 3 replacements
+/// each adding 1 line grow the file by 3, but the summary said
+/// "(+1 lines)". Fix multiplies by replacement count.
+#[tokio::test]
+async fn test_replace_all_reports_file_delta_not_per_replacement() {
+    let tmp = TempFile::new("replace_all_delta.txt");
+    // 3 single-line occurrences; each replacement adds 1 line.
+    std::fs::write(tmp.path(), "x\nx\nx\n").unwrap();
+    let tool = EditTool::new(None, None, None);
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            old_text: "x".into(),
+            new_text: "x\nx".into(),
+            replace_all: Some(true),
+        })
+        .await
+        .unwrap();
+    // 3 replacements × +1 line per replacement = +3 file delta.
+    assert!(
+        result.contains("(+3 lines)"),
+        "expected total file delta, not per-replacement; got: {result}",
+    );
+}
+
 #[tokio::test]
 async fn test_multi_match_without_replace_all_returns_error() {
     let tmp = TempFile::new("multi.txt");

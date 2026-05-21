@@ -20,6 +20,14 @@ pub struct PermissionChecker {
     ext_dir_rules: Vec<(Pattern, Action)>,
     doom_loop_action: Action,
     working_dir: String,
+    /// Cached canonical form of `working_dir`, computed once at
+    /// construction (and refreshed by `set_working_dir`). Used by
+    /// `is_external_path` to compare canonical paths without
+    /// hitting the filesystem on every permission check — the
+    /// canonicalize syscall is otherwise called once per
+    /// read/write/edit/grep call, accumulating to hundreds of
+    /// stat()s per session.
+    working_dir_canonical: String,
     session_allowlist: Vec<(String, Pattern)>,
     recent_calls: VecDeque<(String, String)>,
     mode: SecurityMode,
@@ -29,7 +37,10 @@ pub struct PermissionChecker {
 /// classic glob semantics (one segment, doesn't cross `/`). Everything else
 /// is treated as shell/text where `*` means "any chars including /".
 pub(crate) fn is_path_tool_name(tool: &str) -> bool {
-    matches!(tool, "read" | "write" | "edit" | "list_dir")
+    matches!(
+        tool,
+        "read" | "write" | "edit" | "list_dir" | "apply_patch" | "lsp"
+    )
 }
 
 /// Build a Pattern with the right `*` semantics for the given tool.
@@ -60,6 +71,9 @@ impl PermissionChecker {
             ("find_files", &config.find_files),
             ("list_dir", &config.list_dir),
             ("write_todo_list", &config.write_todo_list),
+            ("apply_patch", &config.apply_patch),
+            ("lsp", &config.lsp),
+            ("question", &config.question),
         ] {
             let Some(tp) = tool_perm else { continue };
             let mut entries = Vec::new();
@@ -99,6 +113,7 @@ impl PermissionChecker {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .to_string_lossy()
             .to_string();
+        let working_dir_canonical = canonicalize_for_cache(&working_dir);
 
         PermissionChecker {
             rules,
@@ -106,6 +121,7 @@ impl PermissionChecker {
             ext_dir_rules,
             doom_loop_action,
             working_dir,
+            working_dir_canonical,
             session_allowlist: Vec::new(),
             recent_calls: VecDeque::with_capacity(16),
             mode,
@@ -256,23 +272,52 @@ impl PermissionChecker {
     }
 
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
+        // Dedup against existing (tool, pattern.original) so
+        // repeated "allow always" picks for the same command don't
+        // accumulate identical entries. Cheap O(N) check — N here
+        // is per-session and typically dozens at most.
+        if self
+            .session_allowlist
+            .iter()
+            .any(|(t, p)| t == &tool && p.original == pattern_str)
+        {
+            return;
+        }
         let pattern = pattern_for_tool(&tool, pattern_str);
         self.session_allowlist.push((tool, pattern));
     }
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
+        // Route through `add_session_allowlist` so the same dedup
+        // applies on load. Prevents duplicate entries either from a
+        // malformed session file or from a host that loads twice.
         for (tool, pat) in entries {
-            self.session_allowlist
-                .push((tool.clone(), pattern_for_tool(tool, pat)));
+            self.add_session_allowlist(tool.clone(), pat);
         }
     }
 
-    #[allow(dead_code)]
     pub fn allowlist_entries(&self) -> Vec<(String, String)> {
         self.session_allowlist
             .iter()
             .map(|(t, p)| (t.clone(), p.original.clone()))
             .collect()
+    }
+
+    /// Remove the allowlist entry at the given index (0-based,
+    /// matching the display order in `/allow list`). Returns the
+    /// removed `(tool, pattern)` on success, or `None` if the
+    /// index is out of range. Used by `/allow remove <n>`.
+    pub fn remove_session_allowlist_at(&mut self, idx: usize) -> Option<(String, String)> {
+        if idx >= self.session_allowlist.len() {
+            return None;
+        }
+        let (tool, pat) = self.session_allowlist.remove(idx);
+        Some((tool, pat.original.clone()))
+    }
+
+    /// Remove ALL allowlist entries. Used by `/allow clear`.
+    pub fn clear_session_allowlist(&mut self) {
+        self.session_allowlist.clear();
     }
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
@@ -285,19 +330,45 @@ impl PermissionChecker {
 
     pub fn set_working_dir(&mut self, dir: &str) {
         self.working_dir = dir.to_string();
+        self.working_dir_canonical = canonicalize_for_cache(dir);
     }
 
     fn is_path_tool(&self, tool: &str) -> bool {
-        matches!(tool, "read" | "write" | "edit" | "list_dir")
+        // Must match `is_path_tool_name` — these are the tools that
+        // take a filesystem path as their permission input and need
+        // `external_directory` rule consultation. `apply_patch` and
+        // `lsp` are included because both route filesystem-path
+        // strings through `check_perm_path`.
+        is_path_tool_name(tool)
     }
 
     fn is_external_path(&self, path_str: &str) -> bool {
-        let p = Path::new(path_str);
+        // F18: previously `!is_absolute → return false`, which
+        // treated `../../etc/passwd` as "internal" (not external).
+        // In Accept mode that bypassed external_directory rules:
+        // a relative `../../secret` would auto-allow because it
+        // wasn't classified external. Now we resolve relative
+        // paths against the working_dir (same logic as
+        // `resolve_absolute`) before the starts_with check.
+        let resolved = resolve_absolute(path_str, &self.working_dir);
+        let p = Path::new(&resolved);
         if !p.is_absolute() {
+            // resolve_absolute fell back to lexical join and the
+            // result is still relative — usually means working_dir
+            // itself is bogus. Treat as not-external; rules will
+            // fall through to the default action.
             return false;
         }
         let cwd = Path::new(&self.working_dir);
-        !p.starts_with(cwd)
+        // Canonical cwd is precomputed (see `working_dir_canonical`).
+        // Comparing against BOTH the canonical and literal forms
+        // handles symlinked roots like macOS's `/tmp → /private/tmp`:
+        // `resolved` is canonical (`/private/tmp/...`) but `cwd`
+        // may still be the literal `/tmp` form. Without both checks
+        // every in-tree access in such a setup would classify as
+        // external.
+        let canonical_cwd = Path::new(&self.working_dir_canonical);
+        !p.starts_with(canonical_cwd) && !p.starts_with(cwd)
     }
 
     fn match_ext_dir(&self, path_str: &str) -> Option<Action> {
@@ -327,12 +398,55 @@ impl PermissionChecker {
     }
 }
 
+/// One-shot canonicalize for the working-directory cache. Best
+/// effort: if canonicalize fails (cwd doesn't exist on disk, e.g.
+/// in tests that pass a fixture path), fall back to the literal
+/// string so the `starts_with` comparisons in `is_external_path`
+/// still work for the literal form.
+fn canonicalize_for_cache(working_dir: &str) -> String {
+    std::fs::canonicalize(working_dir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| working_dir.to_string())
+}
+
 fn resolve_absolute(path: &str, working_dir: &str) -> String {
     let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_string_lossy().to_string()
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
     } else {
-        Path::new(working_dir).join(p).to_string_lossy().to_string()
+        Path::new(working_dir).join(p)
+    };
+    // F7: canonicalize so symlinks resolve to their real target.
+    // Without this, a symlink like `safe_link -> /etc/passwd` would
+    // be checked against rules as `safe_link`, bypassing any
+    // `/etc/**` deny / external-directory rule. opencode handles
+    // this implicitly via TypeScript fs APIs that follow links;
+    // Rust requires the explicit call.
+    //
+    // Fallback: if canonicalize fails (path doesn't exist yet —
+    // e.g. a write to a new file), normalize `.` / `..` lexically
+    // and return the joined path as-is. The non-existence is
+    // intentional for write ops; canonicalize() would return
+    // NotFound and we'd lose the path entirely.
+    match std::fs::canonicalize(&joined) {
+        Ok(canonical) => canonical.to_string_lossy().to_string(),
+        Err(_) => {
+            // The path doesn't exist (write to new file, parent
+            // also missing, etc.). Try canonicalize on the parent
+            // then re-append the basename — catches
+            // `/safe/parent/../../etc/passwd` style attacks where
+            // the parent exists but the leaf doesn't. If even the
+            // parent doesn't canonicalize, fall back to the
+            // LEXICAL join (matches pre-F7 behavior so rules on
+            // not-yet-existing paths still match).
+            if let (Some(parent), Some(name)) = (joined.parent(), joined.file_name())
+                && let Ok(canonical_parent) = std::fs::canonicalize(parent)
+            {
+                return canonical_parent.join(name).to_string_lossy().to_string();
+            }
+            joined.to_string_lossy().to_string()
+        }
     }
 }
 
@@ -347,6 +461,64 @@ mod tests {
             SecurityMode::Standard,
             Some(std::path::PathBuf::from("/tmp")),
         )
+    }
+
+    /// F7: `resolve_absolute` must follow symlinks so a symlink
+    /// pointing at a deny-listed path can't bypass the rule.
+    #[test]
+    fn resolve_absolute_follows_symlinks() {
+        // Create a temp dir with a real file + a symlink to it.
+        // Use a unique dir per test process to avoid collisions
+        // across parallel test runs.
+        let dir =
+            std::env::temp_dir().join(format!("dirge-f7-symlink-test-{}", std::process::id(),));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real-secret.txt");
+        std::fs::write(&target, "hunter2").unwrap();
+        let link = dir.join("benign-name.txt");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+        let resolved = resolve_absolute(link.to_str().unwrap(), "/");
+        // The resolved path must match the real target, not the
+        // symlink name. Canonicalize the comparand too — on macOS
+        // /tmp is itself a symlink to /private/tmp.
+        let expected = std::fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resolved, expected, "symlink should resolve to its target",);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F7: nonexistent paths (writes to new files) must still
+    /// resolve sensibly. They can't canonicalize fully but we
+    /// canonicalize the parent so `/real/parent/../../etc/passwd`
+    /// becomes `/etc/passwd` instead of staying lexical.
+    #[test]
+    fn resolve_absolute_handles_nonexistent_via_parent_canonicalize() {
+        let dir =
+            std::env::temp_dir().join(format!("dirge-f7-newfile-test-{}", std::process::id(),));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let new_file = dir.join("does-not-exist-yet.txt");
+
+        let resolved = resolve_absolute(new_file.to_str().unwrap(), "/");
+        // The leaf doesn't canonicalize but the parent does.
+        // Expected form: canonical(parent) / "does-not-exist-yet.txt"
+        let expected_parent = std::fs::canonicalize(&dir).unwrap();
+        let expected = expected_parent
+            .join("does-not-exist-yet.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resolved, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Regression: "allow always" → `cd *` saved to session allowlist must
@@ -371,6 +543,104 @@ mod tests {
 
         let r2 = checker.check("bash", "cd /Users/yogthos/src/work/rigging-workshop");
         assert!(matches!(r2, CheckResult::Allowed));
+    }
+
+    /// Phase 5 — `/allow remove <idx>` plumbs through to
+    /// `remove_session_allowlist_at`. Returns the removed entry's
+    /// (tool, pattern) so the slash handler can confirm to the
+    /// user what was removed.
+    #[test]
+    fn remove_session_allowlist_at_returns_removed_entry() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "git *");
+        checker.add_session_allowlist("read".to_string(), "/tmp/*");
+        assert_eq!(checker.allowlist_entries().len(), 3);
+
+        let removed = checker.remove_session_allowlist_at(1);
+        assert_eq!(removed, Some(("bash".to_string(), "git *".to_string())),);
+        // After removal, the indices shift: original [0]bash:cargo*,
+        // [2]read:/tmp/* are now at [0] and [1].
+        let after = checker.allowlist_entries();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0], ("bash".to_string(), "cargo *".to_string()));
+        assert_eq!(after[1], ("read".to_string(), "/tmp/*".to_string()));
+    }
+
+    /// Out-of-range index returns None rather than panicking. The
+    /// slash handler shows a clear error in that case.
+    #[test]
+    fn remove_session_allowlist_at_out_of_range_returns_none() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        assert_eq!(checker.remove_session_allowlist_at(99), None);
+        assert_eq!(checker.remove_session_allowlist_at(1), None);
+        // Existing entry still there.
+        assert_eq!(checker.allowlist_entries().len(), 1);
+    }
+
+    /// `clear` empties the allowlist entirely. Different from
+    /// `reset_to_new` (which clears EVERYTHING) — this is the
+    /// user-facing nuke for just allowlist grants.
+    #[test]
+    fn clear_session_allowlist_empties_the_list() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "git *");
+        assert_eq!(checker.allowlist_entries().len(), 2);
+        checker.clear_session_allowlist();
+        assert!(checker.allowlist_entries().is_empty());
+    }
+
+    // Adding the same (tool, pattern) twice must not duplicate the
+    // entry. The audit flagged that "allow always" picks for the
+    // same command repeated across a long session accumulate
+    // identical entries, wasting space and causing redundant
+    // matches on every subsequent check.
+    #[test]
+    fn add_session_allowlist_dedupes_identical_entries() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        let entries = checker.allowlist_entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected dedup; got {} entries: {:?}",
+            entries.len(),
+            entries,
+        );
+    }
+
+    // Distinct patterns for the same tool stay separate — only
+    // exact (tool, pattern) duplicates dedupe.
+    #[test]
+    fn add_session_allowlist_keeps_distinct_patterns_for_same_tool() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "git *");
+        let entries = checker.allowlist_entries();
+        assert_eq!(entries.len(), 2, "got: {:?}", entries);
+    }
+
+    // `load_session_allowlist` (called on session resume) also
+    // dedupes against existing entries. If the host calls load
+    // twice (test harness, reconnect, etc.) the entries don't
+    // double up.
+    #[test]
+    fn load_session_allowlist_dedupes_against_existing() {
+        let mut checker = fresh_checker();
+        let entries = vec![
+            ("bash".to_string(), "cargo *".to_string()),
+            ("bash".to_string(), "cargo *".to_string()),
+        ];
+        checker.load_session_allowlist(&entries);
+        // Even within a single load, dupes get collapsed.
+        assert_eq!(checker.allowlist_entries().len(), 1);
+        // Loading the same entries again should not add more.
+        checker.load_session_allowlist(&entries);
+        assert_eq!(checker.allowlist_entries().len(), 1);
     }
 
     // Path-tool patterns still get filesystem-glob semantics — adding

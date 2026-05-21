@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FEATURES="${FEATURES:-semantic,semantic-ts,semantic-python,semantic-bash,mcp,loop,git-worktree,plugin}"
+# Enable every feature dirge ships with so the release binary
+# has the full surface area. Defaults (`loop`, `git-worktree`,
+# `mcp`, `lsp`) come along automatically because we don't pass
+# `--no-default-features`; this list explicitly adds:
+# - `semantic` + per-language adapters (rust/ts/python/bash)
+# - `plugin` (Janet runtime)
+# - `acp` (Zed/editor agent-protocol server)
+FEATURES="${FEATURES:-semantic,semantic-ts,semantic-python,semantic-bash,mcp,loop,git-worktree,plugin,acp,lsp}"
 
 echo "==> Building dirge with features: $FEATURES"
 cargo build --features "$FEATURES" --release

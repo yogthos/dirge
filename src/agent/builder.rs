@@ -144,7 +144,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     let max_turns = cli.resolve_max_agent_turns(cfg);
     builder = builder.default_max_turns(max_turns);
 
-    if let Some(temp) = cli.temperature {
+    // Temperature: CLI > config > unset. Previously only `cli.temperature`
+    // was checked, so users couldn't set a default in config.json.
+    if let Some(temp) = cli.resolve_temperature(cfg) {
         let clamped = temp.clamp(0.0, 2.0);
         builder = builder.temperature(clamped);
     }
@@ -194,7 +196,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 ask_tx.clone(),
                 cache.clone(),
             )),
-            Box::new(tools::GlobTool::new(permission.clone(), ask_tx.clone())),
+            Box::new(tools::GlobTool::with_cache(
+                permission.clone(),
+                ask_tx.clone(),
+                cache.clone(),
+            )),
             Box::new(tools::ListDirTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
@@ -213,12 +219,16 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::ApplyPatchTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
+                plan_file.clone(),
                 cache.clone(),
             )),
         ];
 
-        let question_tool = question_tx
-            .map(|tx| Box::new(tools::QuestionTool::new(tx)) as Box<dyn rig::tool::ToolDyn>);
+        let question_tool = question_tx.map(|tx| {
+            Box::new(
+                tools::QuestionTool::new(tx).with_permission(permission.clone(), ask_tx.clone()),
+            ) as Box<dyn rig::tool::ToolDyn>
+        });
 
         let plan_tools = plan_tx.map(|tx| {
             let enter =
@@ -279,8 +289,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 pm,
                 store.clone(),
             ));
-            let status_tool =
-                Box::new(tools::TaskStatusTool::new(store)) as Box<dyn rig::tool::ToolDyn>;
+            let status_tool = Box::new(
+                tools::TaskStatusTool::new(store)
+                    .with_permission(permission.clone(), ask_tx.clone()),
+            ) as Box<dyn rig::tool::ToolDyn>;
             builder = builder.tools(hookify(vec![task_tool, status_tool]));
         }
 

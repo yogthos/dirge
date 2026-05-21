@@ -43,14 +43,13 @@ impl PythonAdapter {
                         self.push_method(child, source, symbols, class_name);
                     }
                     "decorated_definition" => {
-                        if let Some(inner) = child.child_by_field_name("definition") {
-                            if inner.kind() == "function_definition" {
+                        if let Some(inner) = child.child_by_field_name("definition")
+                            && inner.kind() == "function_definition" {
                                 let range = self.make_range(child);
                                 self.push_method_with_range(
                                     inner, range, source, symbols, class_name,
                                 );
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -118,16 +117,14 @@ impl PythonAdapter {
                             }
                         }
                     }
-                    if names.is_empty() {
-                        if let Some(name_node) = child.child_by_field_name("name") {
+                    if names.is_empty()
+                        && let Some(name_node) = child.child_by_field_name("name") {
                             names.push(self.node_text(name_node, source).to_string());
                         }
-                    }
-                    if module.is_empty() {
-                        if let Some(name_node) = child.child_by_field_name("name") {
+                    if module.is_empty()
+                        && let Some(name_node) = child.child_by_field_name("name") {
                             module = self.node_text(name_node, source).to_string();
                         }
-                    }
                     imports.push(Import {
                         names,
                         source: module,
@@ -163,8 +160,8 @@ impl PythonAdapter {
                     } else {
                         Some(child)
                     };
-                    if let Some(node) = func_node {
-                        if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Some(node) = func_node
+                        && let Some(name_node) = node.child_by_field_name("name") {
                             let name = self.node_text(name_node, source).to_string();
                             let is_exported = !name.starts_with('_');
                             let range = self.make_range(child);
@@ -178,7 +175,6 @@ impl PythonAdapter {
                                 parent_class: None,
                             });
                         }
-                    }
                 }
                 "class_definition" => {
                     if let Some(name_node) = child.child_by_field_name("name") {
@@ -209,13 +205,11 @@ impl PythonAdapter {
             return Some(node);
         }
         for i in 0..node.named_child_count() {
-            if let Some(child) = node.named_child(i) {
-                if child.start_byte() <= start && child.end_byte() >= end {
-                    if let Some(found) = self.find_node_at_range(child, start, end) {
+            if let Some(child) = node.named_child(i)
+                && child.start_byte() <= start && child.end_byte() >= end
+                    && let Some(found) = self.find_node_at_range(child, start, end) {
                         return Some(found);
                     }
-                }
-            }
         }
         None
     }

@@ -117,10 +117,27 @@ pub fn apply_tree_op(op: TreeOp, session: &mut Session, input: &mut InputEditor)
                             short(new_id.as_str()),
                         ))
                     }
-                    n => TreeOpEffect::Failed(format!(
-                        "[plugin] switch-session: prefix '{}' matches {} sessions",
-                        id_prefix, n
-                    )),
+                    n => {
+                        // Surface the first few matches so the plugin
+                        // author / user can pick a longer prefix.
+                        let ids: Vec<String> = matches
+                            .iter()
+                            .take(3)
+                            .map(|s| short(s.id.as_str()))
+                            .collect();
+                        let suffix = if n > 3 {
+                            format!(" (and {} more)", n - 3)
+                        } else {
+                            String::new()
+                        };
+                        TreeOpEffect::Failed(format!(
+                            "[plugin] switch-session: prefix '{}' matches {} sessions ({}){}",
+                            id_prefix,
+                            n,
+                            ids.join(", "),
+                            suffix,
+                        ))
+                    }
                 },
                 Err(e) => TreeOpEffect::Failed(format!("[plugin] switch-session: {}", e)),
             }

@@ -62,6 +62,42 @@ fn expand_home(pattern: &str) -> String {
     pattern.to_string()
 }
 
+fn glob_to_regex(pattern: &str, path_style: bool) -> String {
+    let mut re = String::with_capacity(pattern.len() * 2);
+    re.push('^');
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        re.push_str("(?:.*/)?");
+                    } else {
+                        re.push_str(".*");
+                    }
+                } else if path_style {
+                    re.push_str("[^/]*");
+                } else {
+                    re.push_str(".*");
+                }
+            }
+            '?' if path_style => re.push_str("[^/]"),
+            '?' => re.push('.'),
+            '.' => re.push_str("\\."),
+            '\\' => re.push_str("\\\\"),
+            '(' | ')' | '[' | ']' | '{' | '}' | '+' | '^' | '$' | '|' => {
+                re.push('\\');
+                re.push(c);
+            }
+            _ => re.push(c),
+        }
+    }
+    re.push('$');
+    re
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,40 +173,4 @@ mod tests {
         // the literal parens.
         assert!(!pat.matches("npm test unit"));
     }
-}
-
-fn glob_to_regex(pattern: &str, path_style: bool) -> String {
-    let mut re = String::with_capacity(pattern.len() * 2);
-    re.push('^');
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => {
-                if chars.peek() == Some(&'*') {
-                    chars.next();
-                    if chars.peek() == Some(&'/') {
-                        chars.next();
-                        re.push_str("(?:.*/)?");
-                    } else {
-                        re.push_str(".*");
-                    }
-                } else if path_style {
-                    re.push_str("[^/]*");
-                } else {
-                    re.push_str(".*");
-                }
-            }
-            '?' if path_style => re.push_str("[^/]"),
-            '?' => re.push('.'),
-            '.' => re.push_str("\\."),
-            '\\' => re.push_str("\\\\"),
-            '(' | ')' | '[' | ']' | '{' | '}' | '+' | '^' | '$' | '|' => {
-                re.push('\\');
-                re.push(c);
-            }
-            _ => re.push(c),
-        }
-    }
-    re.push('$');
-    re
 }

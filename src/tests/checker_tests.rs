@@ -158,6 +158,50 @@ fn relative_path_is_not_external() {
     assert!(matches!(result, CheckResult::Allowed));
 }
 
+/// F18: a relative path with `..` traversal that escapes the
+/// working directory IS external — previously it was treated as
+/// internal because is_external_path returned false on
+/// `!is_absolute`. In Accept mode that auto-allowed `../../secret`.
+#[test]
+fn relative_path_escaping_cwd_is_external() {
+    // Build a deeper working dir so `../../../escaped` lands ABOVE
+    // the working dir but inside a still-existing ancestor.
+    let base = std::env::temp_dir().join(format!("dirge-f18-extern-{}", std::process::id()));
+    let cwd = base.join("a/b/c"); // 3 levels deep under `base`
+    let escaped_dir = base.join("escaped");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&escaped_dir).unwrap();
+    let escaped_file = escaped_dir.join("file.rs");
+    std::fs::write(&escaped_file, "").unwrap();
+
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Simple(Action::Ask)),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(&config, SecurityMode::Accept, Some(cwd.clone()));
+
+    // In-tree relative path → still internal → auto-allow in Accept.
+    std::fs::write(cwd.join("local.rs"), "").unwrap();
+    let internal = checker.check_path("read", "local.rs");
+    assert!(
+        matches!(internal, CheckResult::Allowed),
+        "in-tree path should auto-allow in Accept: got {:?}",
+        internal,
+    );
+
+    // `../../../escaped/file.rs` escapes cwd → external → Ask
+    // (no external_directory rule configured to allow it).
+    let escape = checker.check_path("read", "../../../escaped/file.rs");
+    assert!(
+        matches!(escape, CheckResult::Ask),
+        "escape attempt must surface as Ask in Accept; got {:?}",
+        escape,
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 // --- Config-driven rules ---
 
 #[test]

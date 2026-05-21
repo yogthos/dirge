@@ -59,6 +59,13 @@ pub struct Cli {
     pub no_color: bool,
 
     #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Enable verbose logging (debug for dirge, warn for plugin hooks; equivalent to RUST_LOG=dirge=debug,dirge::plugin=warn). RUST_LOG env takes precedence if set."
+    )]
+    pub verbose: bool,
+
+    #[arg(
         long = "restrictive",
         short = 'R',
         help = "Default all tools to ask for approval"
@@ -104,14 +111,11 @@ pub struct Cli {
     )]
     pub acp_enabled: bool,
 
-    #[cfg(feature = "acp")]
-    #[arg(long = "acp-host", help = "ACP TCP bind host [default: stdio mode]")]
-    pub acp_host: Option<String>,
-
-    #[cfg(feature = "acp")]
-    #[arg(long = "acp-port", help = "ACP TCP bind port [default: 7243]")]
-    pub acp_port: Option<u16>,
-
+    // Note: --acp-host / --acp-port are intentionally NOT exposed.
+    // The current ACP implementation only supports stdio transport
+    // (see `src/extras/acp/mod.rs`). The historical config keys still
+    // deserialize for backward compatibility but are ignored. If TCP
+    // ACP support is added in the future, restore these flags then.
     #[cfg(feature = "loop")]
     #[arg(long = "loop-prompt", help = "Prompt for each loop iteration")]
     pub loop_prompt: Option<String>,
@@ -155,6 +159,13 @@ impl Cli {
 
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
         self.max_tokens.or(cfg.max_tokens).unwrap_or(8192)
+    }
+
+    /// Model temperature with CLI > config > unset precedence. Clamped
+    /// to `[0.0, 2.0]` by the caller (builder) so a typo'd config
+    /// can't push the provider into an unsupported range.
+    pub fn resolve_temperature(&self, cfg: &config::Config) -> Option<f64> {
+        self.temperature.or(cfg.temperature)
     }
 
     pub fn resolve_max_agent_turns(&self, cfg: &config::Config) -> usize {

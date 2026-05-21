@@ -76,6 +76,10 @@ impl Tool for ListDirTool {
                     "path": {
                         "type": "string",
                         "description": "Directory path (defaults to current working directory)"
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "description": "Include dotfiles (.env, .gitignore, etc.) in the listing. Default false to avoid surfacing secrets and config files."
                     }
                 },
                 "required": []
@@ -87,20 +91,21 @@ impl Tool for ListDirTool {
         let path = args.path.as_deref().unwrap_or(".");
         check_perm_path(&self.permission, &self.ask_tx, "list_dir", path).await?;
 
-        let cache_key = format!("list_dir:{}", path);
+        let cache_key = format!("list_dir:{}:hidden={}", path, args.include_hidden);
 
-        if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&cache_key) {
+        if let Some(ref cache) = self.cache
+            && let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached);
             }
-        }
 
         let walker = WalkBuilder::new(path)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
             .require_git(false)
-            .hidden(false)
+            // Hide dotfiles by default to avoid leaking .env etc.
+            // into LLM context. See `FindFilesArgs::include_hidden`.
+            .hidden(!args.include_hidden)
             .max_depth(Some(1))
             .filter_entry(|entry| {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -159,11 +164,34 @@ impl Tool for ListDirTool {
         });
 
         if entries.is_empty() {
-            return Ok(format!("Listing {}:\n(empty directory)", path));
+            // Path is in the chamber banner; no need to repeat it.
+            return Ok("(empty directory)".to_string());
         }
 
+        // Summary line for at-a-glance counts: useful when the
+        // listing is long enough to be truncated by
+        // `tool_result_max_chars` — the LLM sees the totals even
+        // if the per-entry rows get cut. The `dir(N)` markers
+        // already show nested counts per directory.
+        let dir_count = entries
+            .iter()
+            .filter(|(_, k, _)| k.starts_with("dir"))
+            .count();
+        let link_count = entries.iter().filter(|(_, k, _)| k == "link").count();
+        let file_count = entries.len() - dir_count - link_count;
+
         let max_name = entries.iter().map(|e| e.0.len()).max().unwrap_or(0);
-        let mut result = format!("Listing {}:\n", path);
+        let mut summary = format!(
+            "{} entries ({} dirs, {} files",
+            entries.len(),
+            dir_count,
+            file_count,
+        );
+        if link_count > 0 {
+            summary.push_str(&format!(", {link_count} symlinks"));
+        }
+        summary.push_str("):\n");
+        let mut result = summary;
         for (name, kind, size) in &entries {
             let padded = format!("{:width$}", name, width = max_name);
             let size_str = if size.is_empty() {

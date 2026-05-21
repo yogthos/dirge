@@ -161,6 +161,44 @@ some accumulate into a chat-visible response, some get ignored.
   intermediate turn, with `:index` so you can distinguish them.
 - **`on-tool-start` runs *after* permission checks**. If the user denied
   the tool, neither `on-tool-start` nor the actual tool runs.
+- **Multi-plugin `harness/block`: first-wins.** When two or more plugins
+  register `on-tool-start` and one of them calls `(harness/block reason)`,
+  dispatch stops there — subsequent plugins do NOT run for this tool call.
+  Block reason is the first blocker's; load order matters. Matches pi's
+  `runner.ts:806-827` semantics. `harness/mutate-input` and
+  `harness/replace-result` keep the chained last-write-wins behavior so
+  successive plugins can refine each other's mutations.
+- **Subagents (`task` tool) are isolated**: when the LLM calls the `task`
+  tool, dirge runs a one-shot LLM query with no tools, no plugin hooks,
+  no permission gates, and no plugin state. Hooks registered for
+  `on-tool-start` / `on-tool-end` do NOT fire for tools the subagent
+  might internally consider — because the subagent has no tool access
+  at all. Matches opencode's and pi's subagent design: isolation by
+  default. If you need plugin observability into subtask work, route it
+  through `harness/log` from the parent's `on-response` or `on-turn-end`
+  hooks instead.
+- **Multi-file plugin load order is lexicographic.** When a plugin
+  directory contains multiple `.janet` files, they're loaded in
+  **lexicographic filename order** (e.g. `00-init.janet` before
+  `hooks.janet` before `state.janet`). The load is one shared Janet
+  worker, so later files see definitions from earlier files. If
+  one file depends on a helper defined in another, name the
+  defining file to sort first — the conventional `NN-prefix`
+  pattern (`00-`, `01-`, …) is the easiest way. Renaming files
+  silently changes load order; if hooks register in different
+  positions you may see different behavior from the same plugin
+  code.
+- **`harness/mutate-input` and `harness/replace-result` chain
+  across hooks.** When multiple plugins register for the same
+  `on-tool-start` / `on-tool-end`, the slot for the mutated value
+  is cleared once at the START of dispatch, and EACH hook sees
+  whatever the prior hook wrote. Last-write-wins for mutations:
+  hook B can read what hook A set in `harness-mutate-input` (via
+  the tool args it sees) and decide whether to overwrite, refine,
+  or no-op. This is intentional and unlike `harness/block`, which
+  stops dispatch entirely after the first writer. If you want
+  isolated mutations, gate by checking a sentinel before writing
+  (e.g. a custom key in the context table).
 
 ---
 
@@ -193,6 +231,23 @@ output.
   follow-up turn automatically.
 - `harness/replace-prompt`: think of it as "rewrite what the LLM sees
   this turn." Only meaningful from `on-prompt`.
+
+```janet
+# Capture the latest LLM response so the next `on-prompt` hook can
+# read it from the binding `harness-response`. The host calls
+# `(harness/store-response text)` itself after every turn, so you
+# normally don't need to invoke this directly — read `harness-response`
+# from inside `on-prompt` to inspect the previous assistant message.
+# If you DO want to fabricate a "previous response" for your own
+# state machine (e.g. seeding a test fixture), you can call it
+# explicitly.
+(harness/store-response "the previous assistant message text")
+```
+
+- `harness/store-response`: sets the `harness-response` binding so the
+  next `on-prompt` hook can react to what the LLM said last turn. The
+  host wires this automatically; plugins call it only for testing or
+  to seed a synthetic prior response.
 
 ### Tool interception
 
@@ -437,8 +492,44 @@ State persists for the life of the session — survives between turns.
 
 - **`harness/log`** writes to dirge's log file (not the chat). Use it
   freely.
-- **Janet errors** in a hook are caught and rendered as a chat error,
-  not a crash. The line/file should appear in the error message.
+- **Janet errors** in a hook are caught (so a broken hook can never
+  crash the host or block other plugins from dispatching), and the
+  error surfaces in TWO places:
+
+  1. **Chat banner** — a red `[plugin] hook <hook>.<fn> errored:
+     <message>` notification appears at the next loop tick (drained
+     out of `harness-notif-list` like a regular `harness/notify`
+     `:error` call). The user sees it inline with the chat without
+     having to know about logs.
+  2. **Structured log** — a `tracing::warn!` with target
+     `dirge::plugin` and fields `hook` / `function` / `error`.
+     Visible via `dirge --verbose` (or
+     `RUST_LOG=dirge::plugin=warn`). Includes the Janet stack line
+     so you can jump straight to the offending form.
+
+  The hook's return value is treated as `nil` (no effect on the
+  host) and dispatch continues to the next plugin.
+
+  **Why "log + notify + continue" rather than "abort the turn"**: a
+  single misbehaving plugin shouldn't be able to wedge the user out
+  of their session. The two-surface approach is modeled on pi's
+  `ExtensionError` flow (see
+  `packages/coding-agent/src/core/extensions/runner.ts` —
+  `emitError` calls registered listeners, hosts wire
+  `onError: (e) => ctx.ui.notify("Compaction failed: ...", "error")`).
+  opencode logs only (`log.error("plugin config hook failed", …)`
+  in `packages/opencode/src/plugin/index.ts`); dirge does both so
+  plugin authors get the visible signal without having to enable
+  logs.
+
+  **Quick debugging recipe**:
+  - Notice the red `[plugin] hook X.Y errored: ...` in the chat?
+    Your plugin's `Y` hook threw. The message is the Janet error.
+  - Run with `dirge --verbose` for the full Rust-side log including
+    `dirge::plugin` warn events plus dirge's own debug-level traces.
+  - Use `(harness/log "...")` from inside your hook to add ad-hoc
+    breadcrumbs — these appear in the same `dirge::plugin` log
+    stream when verbose mode is on.
 - **Hook didn't fire?** Double-check the function name matches the
   hook reference exactly — `on_prompt` (underscore) is a different
   symbol than `on-prompt`.
