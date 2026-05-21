@@ -66,6 +66,29 @@ pub fn render_tree(session: &Session) -> Vec<String> {
     for root in roots {
         render_subtree(session, root, 0, leaf, &mut out);
     }
+    // Phase 4: append a "Summarized branches" section if any
+    // forked subtrees were pruned during prior compress / rewind.
+    // Each entry shows the parent id (which may itself be pruned by
+    // now), the count, and the preview captured at prune time.
+    // Without this, users only see "discarded N branches" in the
+    // moment but lose access to what was in them — defeats the
+    // point of pi-style preservation.
+    if !session.branch_summaries.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "Summarized branches ({}): pruned during compress/rewind",
+            session.branch_summaries.len(),
+        ));
+        for bs in &session.branch_summaries {
+            out.push(format!(
+                "  └─ parent {} · {} msg{} · {}",
+                short_id(&bs.parent_id),
+                bs.message_count,
+                if bs.message_count == 1 { "" } else { "s" },
+                bs.preview,
+            ));
+        }
+    }
     out
 }
 

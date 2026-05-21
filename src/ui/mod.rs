@@ -3339,6 +3339,71 @@ fn rewind_session(
             }
         }
         let pruned_siblings = to_prune.len().saturating_sub(dropped_set.len());
+
+        // Phase 4: capture BranchSummary entries for each pruned
+        // sibling subtree BEFORE removing nodes. Same algorithm as
+        // `Session::compress_reporting` — root of a subtree is a
+        // node in `to_prune` whose direct parent was in
+        // `dropped_set` (the closest dropped-path ancestor). One
+        // summary per subtree root, walking descendants for the
+        // count.
+        let now_rfc = chrono::Utc::now().to_rfc3339();
+        let mut subtree_summaries: Vec<crate::session::BranchSummary> = Vec::new();
+        for id in &to_prune {
+            if dropped_set.contains(id) {
+                continue;
+            }
+            let node = match session.tree.entries.get(id) {
+                Some(n) => n,
+                None => continue,
+            };
+            let parent = match &node.parent {
+                Some(p) => p,
+                None => continue,
+            };
+            if !dropped_set.contains(parent) {
+                continue;
+            }
+            let mut count = 0usize;
+            let mut stack = vec![id.clone()];
+            while let Some(cur) = stack.pop() {
+                if !to_prune.contains(&cur) {
+                    continue;
+                }
+                count += 1;
+                for (child_id, child_node) in session.tree.entries.iter() {
+                    if child_node.parent.as_ref() == Some(&cur) {
+                        stack.push(child_id.clone());
+                    }
+                }
+            }
+            let label_prefix = node
+                .label
+                .as_deref()
+                .map(|l| format!("[{}] ", l))
+                .unwrap_or_default();
+            let body_preview = session
+                .message_store
+                .get(id)
+                .map(|m| {
+                    let s: String = m.content.chars().take(80).collect();
+                    if m.content.chars().count() > 80 {
+                        format!("{}…", s)
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_default();
+            subtree_summaries.push(crate::session::BranchSummary {
+                root_id: id.clone(),
+                parent_id: parent.clone(),
+                message_count: count,
+                preview: format!("{}{}", label_prefix, body_preview),
+                created_at: now_rfc.clone(),
+            });
+        }
+        session.branch_summaries.extend(subtree_summaries);
+
         for id in &to_prune {
             session.tree.entries.remove(id);
             session.message_store.remove(id);

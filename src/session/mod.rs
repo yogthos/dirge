@@ -143,6 +143,34 @@ pub struct SessionTree {
     pub leaf_id: Option<CompactString>,
 }
 
+/// Lightweight record of a forked subtree that was pruned during
+/// compress / rewind. Phase 4: pi-style preservation
+/// (`packages/coding-agent/src/core/branch-summarization.ts`) at
+/// metadata-only granularity — no LLM summary call. Captures
+/// enough info (count + preview + parent id) that the user can
+/// find pruned branches in `/tree` and understand what was lost.
+/// A future Phase 4b could generate full LLM summaries; the schema
+/// is forward-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchSummary {
+    /// Id of the branch's root node (the topmost node of the
+    /// pruned subtree). Kept for debugging — the node itself no
+    /// longer exists in `tree.entries`.
+    pub root_id: CompactString,
+    /// Id of the still-present parent that the branch hung off.
+    /// May itself have been pruned in the same compress (e.g.
+    /// when both parent and sibling subtree get dropped because
+    /// the parent was the dropped active-path message).
+    pub parent_id: CompactString,
+    /// How many nodes were in the pruned subtree.
+    pub message_count: usize,
+    /// Human-readable preview: branch label (if any) + first
+    /// chars of the root message's content. Shown in `/tree`.
+    pub preview: String,
+    /// RFC3339 timestamp of when the prune happened.
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionAllowEntry {
     pub tool: String,
@@ -224,6 +252,12 @@ pub struct Session {
     /// populates it from `messages` for legacy session files.
     #[serde(default)]
     pub message_store: HashMap<CompactString, SessionMessage>,
+    /// Phase 4 — metadata records for forked subtrees that were
+    /// pruned during compress / rewind. Surfaces in `/tree` so the
+    /// user can see what branches were dropped. Defaulted on
+    /// deserialize for back-compat with pre-Phase-4 session files.
+    #[serde(default)]
+    pub branch_summaries: Vec<BranchSummary>,
     /// Active prompt name (e.g. "code", "plan", "review"). Persisted
     /// with the session so resuming via `-c` / `/sessions <id>`
     /// restores the same prompt the user had active. Defaulted to
@@ -260,6 +294,7 @@ impl Session {
             next_entry_seq: 0,
             tree: SessionTree::default(),
             message_store: HashMap::new(),
+            branch_summaries: Vec::new(),
             current_prompt_name: None,
         }
     }
@@ -592,6 +627,10 @@ impl Session {
         // testing session) silently transfer to an unrelated fresh
         // session. Each new session re-asks for permissions.
         self.permission_allowlist.clear();
+        // Phase 4: branch summaries are per-session — wipe with
+        // everything else so a fresh session doesn't inherit
+        // phantom branch records from the prior one.
+        self.branch_summaries.clear();
         // Note: model/provider/context_window/working_dir preserved
         // so the host can keep the same agent runtime.
     }
@@ -740,6 +779,77 @@ impl Session {
         // user as the chat shrinking; sibling drops are silent
         // without a notification, hence the count.
         let sibling_pruned_count = to_prune.len().saturating_sub(dropped_set.len());
+
+        // Phase 4: capture a BranchSummary per pruned subtree
+        // BEFORE removing nodes (we need to read the root sibling's
+        // content + label). A "subtree root" is a node that's in
+        // `to_prune` AND whose parent is in `dropped_set` (i.e. the
+        // closest dropped-path ancestor). Each unique subtree root
+        // yields one summary.
+        let now_rfc = chrono::Utc::now().to_rfc3339();
+        let mut subtree_summaries: Vec<BranchSummary> = Vec::new();
+        for id in &to_prune {
+            if dropped_set.contains(id) {
+                // Active-path node; not a sibling subtree root.
+                continue;
+            }
+            let node = match self.tree.entries.get(id) {
+                Some(n) => n,
+                None => continue,
+            };
+            let parent = match &node.parent {
+                Some(p) => p,
+                None => continue,
+            };
+            if !dropped_set.contains(parent) {
+                // Not at the top of its subtree (some ancestor is
+                // also a sibling being pruned). Skip — only the
+                // closest-to-active-path ancestor gets a summary.
+                continue;
+            }
+            // Walk the subtree rooted here to count nodes.
+            let mut count = 0usize;
+            let mut stack = vec![id.clone()];
+            while let Some(cur) = stack.pop() {
+                if !to_prune.contains(&cur) {
+                    continue;
+                }
+                count += 1;
+                for (child_id, child_node) in self.tree.entries.iter() {
+                    if child_node.parent.as_ref() == Some(&cur) {
+                        stack.push(child_id.clone());
+                    }
+                }
+            }
+            // Preview: branch label (if any) + first chars of the
+            // root's message content. Keeps the user oriented when
+            // browsing `/tree`.
+            let label_prefix = node
+                .label
+                .as_deref()
+                .map(|l| format!("[{}] ", l))
+                .unwrap_or_default();
+            let body_preview = self
+                .message_store
+                .get(id)
+                .map(|m| {
+                    let s: String = m.content.chars().take(80).collect();
+                    if m.content.chars().count() > 80 {
+                        format!("{}…", s)
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_default();
+            subtree_summaries.push(BranchSummary {
+                root_id: id.clone(),
+                parent_id: parent.clone(),
+                message_count: count,
+                preview: format!("{}{}", label_prefix, body_preview),
+                created_at: now_rfc.clone(),
+            });
+        }
+        self.branch_summaries.extend(subtree_summaries);
 
         for id in &to_prune {
             self.tree.entries.remove(id);
@@ -1310,6 +1420,104 @@ mod tests {
         // One more pop attempt → refused.
         assert!(s.pop_last_message().is_none());
         assert_eq!(s.messages.len(), 1);
+    }
+
+    /// Phase 4 — when compress prunes a sibling subtree, it records
+    /// a `BranchSummary` capturing what was lost: parent id,
+    /// message count, preview text. Without this users see
+    /// "discarded N branches" with no way to know what was in them.
+    #[test]
+    fn compress_records_branch_summary_for_pruned_siblings() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        let u1_id = s.messages.last().unwrap().id.clone();
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "u2 keep");
+        s.add_message(MessageRole::Assistant, "a2 keep");
+        // Graft a sibling pair under u1.
+        let sib1_id = CompactString::new("sib_alpha");
+        let sib2_id = CompactString::new("sib_beta");
+        s.tree.entries.insert(
+            sib1_id.clone(),
+            TreeNode {
+                id: sib1_id.clone(),
+                parent: Some(u1_id.clone()),
+                timestamp: 100,
+                label: Some("explore-alt".to_string()),
+            },
+        );
+        s.tree.entries.insert(
+            sib2_id.clone(),
+            TreeNode {
+                id: sib2_id.clone(),
+                parent: Some(sib1_id.clone()),
+                timestamp: 200,
+                label: None,
+            },
+        );
+        s.message_store.insert(
+            sib1_id.clone(),
+            SessionMessage {
+                role: MessageRole::Assistant,
+                content: CompactString::from(
+                    "let me try a different approach: investigate the foo module first",
+                ),
+                estimated_tokens: 10,
+                id: sib1_id.clone(),
+                timestamp: 100,
+                tool_calls: Vec::new(),
+            },
+        );
+        s.message_store.insert(
+            sib2_id.clone(),
+            SessionMessage {
+                role: MessageRole::User,
+                content: CompactString::from("continue with that"),
+                estimated_tokens: 3,
+                id: sib2_id.clone(),
+                timestamp: 200,
+                tool_calls: Vec::new(),
+            },
+        );
+
+        let baseline = s.branch_summaries.len();
+        let pruned = s.compress_reporting("summary".to_string(), 2, 10);
+        assert_eq!(pruned, 2, "expected 2 sibling nodes pruned");
+        assert_eq!(
+            s.branch_summaries.len(),
+            baseline + 1,
+            "expected 1 branch summary; got {:?}",
+            s.branch_summaries,
+        );
+        let summary = s.branch_summaries.last().unwrap();
+        // Parent is u1 (the closest still-active-or-dropped ancestor
+        // of the pruned subtree). u1 itself was dropped in this
+        // compress, but the summary records the relationship so the
+        // user can correlate.
+        assert_eq!(summary.parent_id, u1_id);
+        assert_eq!(summary.message_count, 2);
+        // Preview pulls from the root sibling's content + label.
+        assert!(
+            summary.preview.contains("explore-alt")
+                || summary.preview.contains("different approach"),
+            "preview missing branch info: {:?}",
+            summary.preview,
+        );
+    }
+
+    /// `reset_to_new` clears `branch_summaries`.
+    #[test]
+    fn reset_to_new_clears_branch_summaries() {
+        let mut s = Session::new("p", "m", 0);
+        s.branch_summaries.push(BranchSummary {
+            root_id: CompactString::from("x"),
+            parent_id: CompactString::from("y"),
+            message_count: 3,
+            preview: "lingering branch".to_string(),
+            created_at: "2026-01-01".to_string(),
+        });
+        s.reset_to_new(None);
+        assert!(s.branch_summaries.is_empty());
     }
 
     /// Phase 3 — tool calls round-trip through serde with default
