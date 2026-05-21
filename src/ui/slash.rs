@@ -34,6 +34,28 @@ fn c_error() -> Color {
     theme::error()
 }
 
+/// Walk `cut_idx` forward until the message at that index is a
+/// `User` message (or the index reaches `messages.len()`). This
+/// guarantees the kept tail after compress starts with a User
+/// message, which is what every provider expects after a System
+/// summary. If `cut_idx` already points at a User message or is
+/// past the end, no change. If no user message exists in the
+/// tail, return `messages.len()` — caller surfaces the "nothing to
+/// compress" message.
+///
+/// Matches opencode's `splitTurn` discipline
+/// (`session/compaction.ts:161-184`).
+fn align_cut_to_user_boundary(
+    messages: &[crate::session::SessionMessage],
+    cut_idx: usize,
+) -> usize {
+    let mut i = cut_idx;
+    while i < messages.len() && messages[i].role != MessageRole::User {
+        i += 1;
+    }
+    i
+}
+
 pub fn undo_last(session: &mut Session) -> usize {
     let len = session.messages.len();
     if len == 0 {
@@ -99,6 +121,15 @@ pub async fn handle_compress(
         }
         accumulated = accumulated.saturating_add(msg.estimated_tokens);
     }
+
+    // F3: nudge `cut_idx` forward until the first kept message is a
+    // User message (or we hit the end). Without this, the kept tail
+    // could start with an Assistant message — Anthropic + OpenAI
+    // expect alternating user/assistant role order; an assistant
+    // following a system summary breaks the role sequence and gets
+    // rejected with a 400. opencode handles this via `splitTurn`
+    // (`compaction.ts:161-184`).
+    cut_idx = align_cut_to_user_boundary(&session.messages, cut_idx);
 
     if cut_idx == 0 {
         renderer.write_line("nothing to compress (entire context is recent)", c_agent())?;
@@ -1511,4 +1542,82 @@ pub async fn handle_slash(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Session, SessionMessage};
+
+    fn msg(role: MessageRole, content: &str) -> SessionMessage {
+        // Re-use Session::add_message to get a real msg with id/timestamp.
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(role, content);
+        s.messages.pop().unwrap()
+    }
+
+    /// F3: when the reverse-scan lands on an Assistant message, the
+    /// helper advances to the next User so the kept tail begins
+    /// with a User message (provider-required role sequence after
+    /// the System summary).
+    #[test]
+    fn align_cut_advances_past_assistant_to_next_user() {
+        let messages = vec![
+            msg(MessageRole::User, "u0"),
+            msg(MessageRole::Assistant, "a0"),
+            msg(MessageRole::User, "u1"),
+            msg(MessageRole::Assistant, "a1"), // reverse-scan landed here (cut_idx=3)
+            msg(MessageRole::User, "u2"),
+            msg(MessageRole::Assistant, "a2"),
+        ];
+        // Initial cut at idx=3 (Assistant). Should advance to 4 (User).
+        assert_eq!(align_cut_to_user_boundary(&messages, 3), 4);
+    }
+
+    /// User-boundary cut is unchanged.
+    #[test]
+    fn align_cut_idempotent_when_already_on_user() {
+        let messages = vec![
+            msg(MessageRole::User, "u0"),
+            msg(MessageRole::Assistant, "a0"),
+            msg(MessageRole::User, "u1"),
+        ];
+        assert_eq!(align_cut_to_user_boundary(&messages, 2), 2);
+        assert_eq!(align_cut_to_user_boundary(&messages, 0), 0);
+    }
+
+    /// Cut past end of array stays past end.
+    #[test]
+    fn align_cut_past_end_clamps() {
+        let messages = vec![msg(MessageRole::User, "u0")];
+        assert_eq!(align_cut_to_user_boundary(&messages, 1), 1);
+        assert_eq!(align_cut_to_user_boundary(&messages, 5), 5);
+    }
+
+    /// No user in the tail (e.g. only system+assistant remain after
+    /// the cut). Helper returns `messages.len()`, which is the
+    /// "nothing to compress (no clean boundary)" case.
+    #[test]
+    fn align_cut_returns_end_when_no_user_in_tail() {
+        let messages = vec![
+            msg(MessageRole::User, "u0"),
+            msg(MessageRole::Assistant, "a0"),
+            msg(MessageRole::System, "system note"),
+            msg(MessageRole::Assistant, "a1"),
+        ];
+        // cut_idx=2 points at System; no User follows.
+        assert_eq!(align_cut_to_user_boundary(&messages, 2), messages.len());
+    }
+
+    /// A cut that lands on a System message (e.g. a prior summary)
+    /// also advances forward to the next User.
+    #[test]
+    fn align_cut_skips_system_to_user() {
+        let messages = vec![
+            msg(MessageRole::System, "prior summary"),
+            msg(MessageRole::User, "u0"),
+            msg(MessageRole::Assistant, "a0"),
+        ];
+        assert_eq!(align_cut_to_user_boundary(&messages, 0), 1);
+    }
 }
