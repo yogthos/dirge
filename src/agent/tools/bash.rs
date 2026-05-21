@@ -263,13 +263,24 @@ async fn check_bash_segments(
         // a backslash escape.
         let segments = quote_aware_split(command);
 
-        // Flag command substitution / subshell constructs that need a
-        // full parser. Surface as one whole-command check so the user
-        // sees the unfamiliar form before any segment runs.
+        // Flag command substitution / subshell constructs / ANSI-C
+        // quoting that need a full parser. Surface as one
+        // whole-command check so the user sees the unfamiliar form
+        // before any segment runs.
+        //
+        // `$'...'` ANSI-C quoting was missing from the original
+        // check, leaving a small bypass: `echo $'hi\nrm -rf /; ls'`
+        // (with embedded literal newlines via `\n`) treated the body
+        // as one quoted token, so `quote_aware_split` didn't see the
+        // `;` as a separator. Adding `$'` to the substitution list
+        // makes the whole command get checked as a single string —
+        // the rules can still match the safe form, but the LLM
+        // doesn't get a free pass on obscure quoting.
         let has_substitution = command.contains("$(")
             || command.contains('`')
             || command.contains("<(")
-            || command.contains(">(");
+            || command.contains(">(")
+            || command.contains("$'");
         if has_substitution {
             return check_perm(permission, ask_tx, "bash", command).await;
         }

@@ -75,13 +75,56 @@ impl RecoveryPolicy {
 /// `:` being absent (some providers emit `retry-after 30`).
 pub(crate) fn retry_after_from_error_msg(msg: &str) -> Option<Duration> {
     fn parse_after_label(msg: &str, label: &str) -> Option<u64> {
-        let lower = msg.to_lowercase();
-        let idx = lower.find(label)?;
-        // Skip past label + optional `:` / whitespace / quote.
-        let tail = &msg[idx + label.len()..];
+        // Case-insensitive search WITHOUT lowercasing the whole
+        // message: previously we lowercased `msg` and then indexed
+        // into the ORIGINAL `msg` at the lowered string's byte
+        // offset. For ASCII that's identical, but `to_lowercase`
+        // can change byte length for some unicode (e.g. Turkish
+        // `İ` → `i̇` is 2 → 3 bytes). The mismatched offset could
+        // land mid-UTF-8 and panic on `&msg[...]`. Now we scan the
+        // original bytes window-by-window with case-insensitive
+        // ASCII comparison. The label itself is fixed-ASCII so this
+        // is sound — we just need to be case-insensitive against
+        // the message's casing.
+        let label_bytes = label.as_bytes();
+        let msg_bytes = msg.as_bytes();
+        if msg_bytes.len() < label_bytes.len() {
+            return None;
+        }
+        let mut idx = None;
+        for i in 0..=msg_bytes.len() - label_bytes.len() {
+            let window = &msg_bytes[i..i + label_bytes.len()];
+            if window
+                .iter()
+                .zip(label_bytes.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            {
+                idx = Some(i);
+                break;
+            }
+        }
+        let idx = idx?;
+        // `idx` is now a byte offset into the original `msg`.
+        // Land at a char boundary (the ASCII label match guarantees
+        // we're on a boundary, but `idx + label.len()` could still
+        // hit one — for ASCII labels it can't, but defend anyway).
+        let after = idx + label.len();
+        if !msg.is_char_boundary(after) {
+            return None;
+        }
+        let tail = &msg[after..];
         let tail = tail.trim_start_matches([':', ' ', '\t', '"']).trim_start();
-        // Consume contiguous digits.
-        let n: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        // Consume contiguous digits, with a hard cap so a malformed
+        // header (`Retry-After: 999999999999999999999`) doesn't
+        // produce a parsed integer that overflows or is absurdly
+        // large before the 5-min cap applies in the caller. Cap at
+        // 10^10 — any value larger is clearly bogus, and the cap
+        // saturates rather than overflowing u64.
+        let n: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .take(11)
+            .collect();
         if n.is_empty() {
             return None;
         }
@@ -477,6 +520,61 @@ mod tests {
     fn retry_after_returns_none_when_absent() {
         let msg = "generic network error: connection reset";
         assert_eq!(retry_after_from_error_msg(msg), None);
+    }
+
+    /// Regression: messages with multi-byte UTF-8 BEFORE the label
+    /// previously could panic — the original parser found the
+    /// label in a lowercased copy and indexed into the original
+    /// at that byte offset. `to_lowercase` can change byte length
+    /// (Turkish `İ` is 2 bytes lowercase as `i̇` = 3 bytes), so
+    /// the offsets disagreed and `&msg[idx + label.len()..]` could
+    /// land mid-UTF-8 → panic. Now the search is on byte windows
+    /// of the original string with case-insensitive ASCII compare.
+    #[test]
+    fn retry_after_handles_unicode_before_label() {
+        // Provider error message with a Turkish capital I before
+        // the label. Lowercasing produces a different byte length.
+        let msg = "İoError: Retry-After: 8";
+        assert_eq!(
+            retry_after_from_error_msg(msg),
+            Some(Duration::from_secs(8)),
+        );
+    }
+
+    /// Case-insensitive matching against the label name itself.
+    /// `RETRY-AFTER-MS` and `retry-after-ms` should both parse.
+    #[test]
+    fn retry_after_label_match_is_case_insensitive() {
+        assert_eq!(
+            retry_after_from_error_msg("rate limited: RETRY-AFTER-MS: 750"),
+            Some(Duration::from_millis(750)),
+        );
+        assert_eq!(
+            retry_after_from_error_msg("Retry-After-Ms: 750"),
+            Some(Duration::from_millis(750)),
+        );
+    }
+
+    /// Pathological huge digit run: cap at 11 digits before parse,
+    /// so `Retry-After: 999999999999999999999...` doesn't overflow
+    /// or produce a 100-year wait before the upper cap clamps.
+    #[test]
+    fn retry_after_caps_pathological_digit_run() {
+        let msg = "Retry-After: 99999999999999999999999";
+        let parsed = retry_after_from_error_msg(msg);
+        // 11 digits = max ~10^11 seconds — `backoff_duration_for_msg`
+        // will cap at 5 minutes, but the unsanitized parse must
+        // produce SOMETHING (not None, not a panic). We don't pin
+        // the exact value; just verify it's bounded by the cap
+        // behavior in `backoff_duration_for_msg`.
+        assert!(parsed.is_some(), "must parse, not return None");
+        let policy = RecoveryPolicy::default();
+        let d = policy.backoff_duration_for_msg(0, msg);
+        assert!(
+            d <= Duration::from_secs(300),
+            "backoff must cap at 5min; got {:?}",
+            d,
+        );
     }
 
     /// `backoff_duration_for_msg` picks the longer of the

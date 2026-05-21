@@ -20,6 +20,14 @@ pub struct PermissionChecker {
     ext_dir_rules: Vec<(Pattern, Action)>,
     doom_loop_action: Action,
     working_dir: String,
+    /// Cached canonical form of `working_dir`, computed once at
+    /// construction (and refreshed by `set_working_dir`). Used by
+    /// `is_external_path` to compare canonical paths without
+    /// hitting the filesystem on every permission check — the
+    /// canonicalize syscall is otherwise called once per
+    /// read/write/edit/grep call, accumulating to hundreds of
+    /// stat()s per session.
+    working_dir_canonical: String,
     session_allowlist: Vec<(String, Pattern)>,
     recent_calls: VecDeque<(String, String)>,
     mode: SecurityMode,
@@ -105,6 +113,7 @@ impl PermissionChecker {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .to_string_lossy()
             .to_string();
+        let working_dir_canonical = canonicalize_for_cache(&working_dir);
 
         PermissionChecker {
             rules,
@@ -112,6 +121,7 @@ impl PermissionChecker {
             ext_dir_rules,
             doom_loop_action,
             working_dir,
+            working_dir_canonical,
             session_allowlist: Vec::new(),
             recent_calls: VecDeque::with_capacity(16),
             mode,
@@ -320,6 +330,7 @@ impl PermissionChecker {
 
     pub fn set_working_dir(&mut self, dir: &str) {
         self.working_dir = dir.to_string();
+        self.working_dir_canonical = canonicalize_for_cache(dir);
     }
 
     fn is_path_tool(&self, tool: &str) -> bool {
@@ -349,12 +360,15 @@ impl PermissionChecker {
             return false;
         }
         let cwd = Path::new(&self.working_dir);
-        // Canonicalize cwd for the comparison too — if a symlinked
-        // working_dir or one with `..` segments was stored, a
-        // canonicalized `resolved` could no longer share the
-        // prefix even when it's the same directory.
-        let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        !p.starts_with(&canonical_cwd) && !p.starts_with(cwd)
+        // Canonical cwd is precomputed (see `working_dir_canonical`).
+        // Comparing against BOTH the canonical and literal forms
+        // handles symlinked roots like macOS's `/tmp → /private/tmp`:
+        // `resolved` is canonical (`/private/tmp/...`) but `cwd`
+        // may still be the literal `/tmp` form. Without both checks
+        // every in-tree access in such a setup would classify as
+        // external.
+        let canonical_cwd = Path::new(&self.working_dir_canonical);
+        !p.starts_with(canonical_cwd) && !p.starts_with(cwd)
     }
 
     fn match_ext_dir(&self, path_str: &str) -> Option<Action> {
@@ -382,6 +396,18 @@ impl PermissionChecker {
             .count();
         count >= 3
     }
+}
+
+/// One-shot canonicalize for the working-directory cache. Best
+/// effort: if canonicalize fails (cwd doesn't exist on disk, e.g.
+/// in tests that pass a fixture path), fall back to the literal
+/// string so the `starts_with` comparisons in `is_external_path`
+/// still work for the literal form.
+fn canonicalize_for_cache(working_dir: &str) -> String {
+    std::fs::canonicalize(working_dir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| working_dir.to_string())
 }
 
 fn resolve_absolute(path: &str, working_dir: &str) -> String {
