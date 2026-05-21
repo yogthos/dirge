@@ -332,12 +332,29 @@ impl PermissionChecker {
     }
 
     fn is_external_path(&self, path_str: &str) -> bool {
-        let p = Path::new(path_str);
+        // F18: previously `!is_absolute → return false`, which
+        // treated `../../etc/passwd` as "internal" (not external).
+        // In Accept mode that bypassed external_directory rules:
+        // a relative `../../secret` would auto-allow because it
+        // wasn't classified external. Now we resolve relative
+        // paths against the working_dir (same logic as
+        // `resolve_absolute`) before the starts_with check.
+        let resolved = resolve_absolute(path_str, &self.working_dir);
+        let p = Path::new(&resolved);
         if !p.is_absolute() {
+            // resolve_absolute fell back to lexical join and the
+            // result is still relative — usually means working_dir
+            // itself is bogus. Treat as not-external; rules will
+            // fall through to the default action.
             return false;
         }
         let cwd = Path::new(&self.working_dir);
-        !p.starts_with(cwd)
+        // Canonicalize cwd for the comparison too — if a symlinked
+        // working_dir or one with `..` segments was stored, a
+        // canonicalized `resolved` could no longer share the
+        // prefix even when it's the same directory.
+        let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        !p.starts_with(&canonical_cwd) && !p.starts_with(cwd)
     }
 
     fn match_ext_dir(&self, path_str: &str) -> Option<Action> {
