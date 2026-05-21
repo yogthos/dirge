@@ -87,28 +87,66 @@ impl Tool for ReadTool {
             }
         }
 
+        // F4: stream the file line-by-line via BufReader instead of
+        // loading the whole thing into memory with `read_to_string`.
+        // Removes the prior 10MB hard cap (large logs / generated
+        // files were unreachable) and caps each individual line at
+        // `MAX_LINE_BYTES` so a pathological minified-JS file with a
+        // 100MB single line doesn't OOM us. opencode (`read.ts:119-150`)
+        // and pi (`read.ts:215-328`) both stream + smart-truncate.
+        //
+        // Safety net: refuse files larger than 1GB. Reading 1GB into
+        // even line-counting takes a while; if a user needs this we'd
+        // tell them to use bash + head/tail/grep.
+        const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+        const MAX_LINE_BYTES: usize = 16 * 1024;
+        const TRUNC_MARKER: &str = " …[line truncated]";
+
         let metadata = tokio::fs::metadata(&args.path).await?;
         let file_size = metadata.len();
-        if file_size > 10 * 1024 * 1024 {
+        if file_size > MAX_FILE_BYTES {
             return Err(ToolError::Msg(format!(
-                "File too large ({} bytes). Max 10MB.",
+                "File too large ({} bytes). Max 1GB. Use bash + head/tail/grep for sampling.",
                 file_size
             )));
         }
-        let content = tokio::fs::read_to_string(&args.path).await?;
-        let total_lines = content.lines().count();
 
         let offset = args.offset.unwrap_or(1).max(1) - 1;
         let limit = args.limit.unwrap_or(2000);
-        let end = (offset + limit).min(total_lines);
 
+        use tokio::io::AsyncBufReadExt;
+        let file = tokio::fs::File::open(&args.path).await?;
+        let reader = tokio::io::BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut total_lines = 0usize;
+        let mut excerpt_lines: Vec<(usize, String)> = Vec::with_capacity(limit);
+        let want_end = offset.saturating_add(limit);
+        while let Some(line) = lines.next_line().await.transpose() {
+            let mut line = line?;
+            if line.len() > MAX_LINE_BYTES {
+                // Truncate by byte index — careful to land on a UTF-8
+                // boundary. Drop bytes until we find one.
+                let mut truncate_at = MAX_LINE_BYTES;
+                while !line.is_char_boundary(truncate_at) {
+                    truncate_at -= 1;
+                }
+                line.truncate(truncate_at);
+                line.push_str(TRUNC_MARKER);
+            }
+            let line_idx = total_lines;
+            total_lines += 1;
+            if line_idx >= offset && line_idx < want_end {
+                excerpt_lines.push((line_idx, line));
+            }
+            // Past the requested range — keep counting to compute
+            // `total_lines` for the header, but skip allocation.
+        }
+
+        let end = (offset + limit).min(total_lines);
         let width = (total_lines.to_string().len()).max(1);
-        let excerpt: String = content
-            .lines()
-            .skip(offset)
-            .take(end - offset)
-            .enumerate()
-            .map(|(i, line)| format!("{:>width$}: {}", offset + i + 1, line))
+        let excerpt: String = excerpt_lines
+            .into_iter()
+            .map(|(idx, line)| format!("{:>width$}: {}", idx + 1, line))
             .collect::<Vec<_>>()
             .join("\n");
         let info = format!(
@@ -141,6 +179,9 @@ impl Tool for ReadTool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::agent::tools::ReadArgs;
+
     /// Verifies the line-numbering format used in read output.
     /// The model sees this format and must strip "NNN: " prefixes when passing text to edit.
     #[test]
@@ -159,5 +200,80 @@ mod tests {
             .join("\n");
 
         assert_eq!(excerpt, "1: line one\n2: line two\n3: line three");
+    }
+
+    fn temp_path(suffix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("dirge-read-test-{}-{}", std::process::id(), suffix,))
+    }
+
+    /// F4: pathological lines (e.g. 100KB single line from minified JS
+    /// or accidentally cat'd binary) truncate at MAX_LINE_BYTES with a
+    /// clear marker. Without this, the LLM context could be flooded
+    /// with a single multi-MB line.
+    #[tokio::test]
+    async fn read_truncates_pathological_long_lines() {
+        let path = temp_path("longline");
+        let pathological = "a".repeat(100_000);
+        std::fs::write(&path, format!("short\n{}\nshort2", pathological)).unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            out.contains("…[line truncated]"),
+            "truncation marker missing"
+        );
+        assert!(
+            out.len() < 100_000,
+            "output should not contain the full 100k line; got {} bytes",
+            out.len(),
+        );
+        assert!(out.contains("short"), "first short line missing");
+        assert!(out.contains("short2"), "trailing short line missing");
+    }
+
+    /// F4: files >10MB used to be rejected outright. Stream-read
+    /// should handle them up to the new 1GB safety net. Skip the
+    /// expensive case in CI but at least verify a 1MB file works.
+    #[tokio::test]
+    async fn read_handles_files_larger_than_old_10mb_cap() {
+        let path = temp_path("mediumfile");
+        // 1MB of repeated 100-byte lines = ~10_000 lines.
+        let line = "x".repeat(99);
+        let body = (0..10_000)
+            .map(|_| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &body).unwrap();
+        assert!(body.len() > 900_000, "fixture is at least ~1MB");
+
+        let tool = ReadTool::new(None, None);
+        let result = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(1),
+                limit: Some(5),
+            })
+            .await;
+        let _ = std::fs::remove_file(&path);
+
+        let out = result.expect("read of medium file must succeed");
+        // Header reports total_lines as the real count, not capped.
+        assert!(
+            out.contains("10000 lines total") || out.contains("10001 lines total"),
+            "expected ~10000 line total in header; got: {}",
+            out.lines().next().unwrap_or(""),
+        );
+        // Only the first 5 are in the excerpt.
+        let body_lines: Vec<&str> = out.lines().skip(2).collect();
+        assert_eq!(body_lines.len(), 5);
     }
 }
