@@ -14,6 +14,35 @@ mod tests {
         assert!(PluginManager::try_new().is_ok());
     }
 
+    /// Dropping an idle worker must complete promptly (well under
+    /// the `JOIN_TIMEOUT` upper bound). This is the regression guard
+    /// for the bounded-join change in `Worker::Drop` — without the
+    /// poll loop the change would have introduced a fixed 2s delay
+    /// on every shutdown.
+    #[test]
+    fn worker_drop_completes_promptly_when_idle() {
+        let mgr = PluginManager::try_new().unwrap();
+        let start = std::time::Instant::now();
+        drop(mgr);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "idle Drop should be near-instant; took {:?}",
+            elapsed,
+        );
+    }
+
+    /// Sanity-check that `eval` still returns the worker's reply
+    /// after the switch from `recv()` to `recv_timeout(EVAL_TIMEOUT)`.
+    /// Without this, a typo in the new match arms could mask the
+    /// happy-path break by always returning the timeout error.
+    #[test]
+    fn worker_eval_still_returns_reply_after_recv_timeout_switch() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        let out = mgr.eval("(+ 1 2)").unwrap();
+        assert_eq!(out, "3", "got: {out:?}");
+    }
+
     #[test]
     fn test_dispatch_returns_per_hook_results() {
         // Multiple plugins registering the same hook must each contribute

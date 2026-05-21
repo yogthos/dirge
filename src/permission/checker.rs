@@ -262,14 +262,27 @@ impl PermissionChecker {
     }
 
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
+        // Dedup against existing (tool, pattern.original) so
+        // repeated "allow always" picks for the same command don't
+        // accumulate identical entries. Cheap O(N) check — N here
+        // is per-session and typically dozens at most.
+        if self
+            .session_allowlist
+            .iter()
+            .any(|(t, p)| t == &tool && p.original == pattern_str)
+        {
+            return;
+        }
         let pattern = pattern_for_tool(&tool, pattern_str);
         self.session_allowlist.push((tool, pattern));
     }
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
+        // Route through `add_session_allowlist` so the same dedup
+        // applies on load. Prevents duplicate entries either from a
+        // malformed session file or from a host that loads twice.
         for (tool, pat) in entries {
-            self.session_allowlist
-                .push((tool.clone(), pattern_for_tool(tool, pat)));
+            self.add_session_allowlist(tool.clone(), pat);
         }
     }
 
@@ -382,6 +395,57 @@ mod tests {
 
         let r2 = checker.check("bash", "cd /Users/yogthos/src/work/rigging-workshop");
         assert!(matches!(r2, CheckResult::Allowed));
+    }
+
+    // Adding the same (tool, pattern) twice must not duplicate the
+    // entry. The audit flagged that "allow always" picks for the
+    // same command repeated across a long session accumulate
+    // identical entries, wasting space and causing redundant
+    // matches on every subsequent check.
+    #[test]
+    fn add_session_allowlist_dedupes_identical_entries() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        let entries = checker.allowlist_entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected dedup; got {} entries: {:?}",
+            entries.len(),
+            entries,
+        );
+    }
+
+    // Distinct patterns for the same tool stay separate — only
+    // exact (tool, pattern) duplicates dedupe.
+    #[test]
+    fn add_session_allowlist_keeps_distinct_patterns_for_same_tool() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "git *");
+        let entries = checker.allowlist_entries();
+        assert_eq!(entries.len(), 2, "got: {:?}", entries);
+    }
+
+    // `load_session_allowlist` (called on session resume) also
+    // dedupes against existing entries. If the host calls load
+    // twice (test harness, reconnect, etc.) the entries don't
+    // double up.
+    #[test]
+    fn load_session_allowlist_dedupes_against_existing() {
+        let mut checker = fresh_checker();
+        let entries = vec![
+            ("bash".to_string(), "cargo *".to_string()),
+            ("bash".to_string(), "cargo *".to_string()),
+        ];
+        checker.load_session_allowlist(&entries);
+        // Even within a single load, dupes get collapsed.
+        assert_eq!(checker.allowlist_entries().len(), 1);
+        // Loading the same entries again should not add more.
+        checker.load_session_allowlist(&entries);
+        assert_eq!(checker.allowlist_entries().len(), 1);
     }
 
     // Path-tool patterns still get filesystem-glob semantics — adding

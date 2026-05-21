@@ -2914,17 +2914,28 @@ pub async fn run_interactive(
 }
 
 fn suggest_pattern(tool: &str, input: &str) -> String {
+    // Refuse to suggest a catch-all wildcard for empty / whitespace-
+    // only input. A user mis-clicking "(a) allow always" on an empty
+    // invocation would otherwise pin an "allow everything for this
+    // tool forever" rule into their session. The placeholder string
+    // is intentionally not a valid glob — the UI shows it as the
+    // suggested pattern, the user edits it before confirming.
+    const PLACEHOLDER: &str = "<edit this pattern>";
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return PLACEHOLDER.to_string();
+    }
     match tool {
         "bash" => {
-            let first = input.split_whitespace().next().unwrap_or("*");
+            let first = trimmed.split_whitespace().next().unwrap_or(PLACEHOLDER);
             format!("{} *", first)
         }
         "read" | "write" | "edit" | "list_dir" => {
-            let path = std::path::Path::new(input);
+            let path = std::path::Path::new(trimmed);
             let parent = path
                 .parent()
                 .map(|p| p.to_string_lossy())
-                .unwrap_or(std::borrow::Cow::Borrowed("*"));
+                .unwrap_or(std::borrow::Cow::Borrowed(""));
             if parent.is_empty() {
                 "**".to_string()
             } else {
@@ -2932,10 +2943,12 @@ fn suggest_pattern(tool: &str, input: &str) -> String {
             }
         }
         "grep" | "find_files" => {
-            let first = input.split_whitespace().next().unwrap_or("*");
+            let first = trimmed.split_whitespace().next().unwrap_or(PLACEHOLDER);
             format!("{}*", first)
         }
-        _ => "*".to_string(),
+        // Unknown tools (MCP, semantic, etc.) — return placeholder
+        // so the user explicitly edits before allowing.
+        _ => PLACEHOLDER.to_string(),
     }
 }
 
@@ -3177,7 +3190,25 @@ fn rewind_session(
     let target = user_indices.len().saturating_sub(idx + 1);
     if let Some(&msg_idx) = user_indices.get(target) {
         let removed = session.messages.len() - msg_idx;
+        // Collect ids of the messages we're dropping BEFORE truncate
+        // so we can also prune them from `tree.entries` and
+        // `message_store`. Without this, the tree references
+        // orphaned ids (no content in store), and subsequent
+        // fork/clone/switch-to-leaf operations silently fail or
+        // corrupt the session.
+        let dropped_ids: Vec<_> = session.messages[msg_idx..]
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
         session.messages.truncate(msg_idx);
+        for id in &dropped_ids {
+            session.tree.entries.remove(id);
+            session.message_store.remove(id);
+        }
+        // Re-anchor `leaf_id` to the new tail (or None if everything
+        // was dropped). Previously the leaf was left pointing at a
+        // dropped id, which made `/tree` show a phantom branch.
+        session.tree.leaf_id = session.messages.last().map(|m| m.id.clone());
         session.total_estimated_tokens = session.messages.iter().map(|m| m.estimated_tokens).sum();
         renderer.write_line(&format!("rewound {} message(s)", removed), theme::accent())?;
     }
@@ -3312,6 +3343,109 @@ mod tests {
             !content.contains("1 tool calls ran"),
             "leaked plural for singular case: {content:?}",
         );
+    }
+
+    // Whitespace-only or empty input must NOT collapse to a "* *"
+    // / "*" wildcard pattern that matches every subsequent call.
+    // The audit flagged this as a footgun: a user accidentally
+    // hitting "(a) allow always" on an empty bash invocation would
+    // permanently auto-allow ALL bash. Now we return a literal
+    // placeholder + the user has to type the pattern themselves.
+    #[test]
+    fn suggest_pattern_refuses_wildcard_on_empty_input() {
+        // Bash: empty / whitespace input should NOT yield "* *".
+        let p = suggest_pattern("bash", "");
+        assert_ne!(p, "* *", "empty bash input must not yield catch-all");
+        assert!(
+            !p.contains('*'),
+            "empty input should not contain wildcards: {p:?}"
+        );
+
+        let p = suggest_pattern("bash", "   \t  ");
+        assert_ne!(
+            p, "* *",
+            "whitespace-only bash input must not yield catch-all"
+        );
+        assert!(
+            !p.contains('*'),
+            "ws-only input should not contain wildcards: {p:?}"
+        );
+
+        // grep / find_files: same — empty must not yield "*"
+        let p = suggest_pattern("grep", "");
+        assert!(
+            !p.contains('*'),
+            "empty grep input must not yield wildcard: {p:?}"
+        );
+
+        // Unknown tool with empty input shouldn't yield catch-all.
+        let p = suggest_pattern("mcp_tool:foo", "");
+        assert!(!p.contains('*'), "unknown tool empty input: {p:?}");
+    }
+
+    // Non-empty inputs still produce the expected suggestion.
+    #[test]
+    fn suggest_pattern_works_for_non_empty_inputs() {
+        assert_eq!(suggest_pattern("bash", "cargo test --all"), "cargo *");
+        assert_eq!(suggest_pattern("grep", "fn foo bar"), "fn*");
+    }
+
+    // Rewind must sync tree.entries + message_store + leaf_id with
+    // the truncated `messages` slice. Without this, the tree
+    // references orphaned ids that no longer have content, and the
+    // leaf_id can point past the truncation. Subsequent fork /
+    // clone / save-load operations either fail or carry stale ids.
+    #[test]
+    fn rewind_truncates_tree_and_store_in_sync_with_messages() {
+        let mut session = crate::session::Session::new("p", "m", 100_000);
+        session.add_message(crate::session::MessageRole::User, "u1");
+        session.add_message(crate::session::MessageRole::Assistant, "a1");
+        session.add_message(crate::session::MessageRole::User, "u2");
+        session.add_message(crate::session::MessageRole::Assistant, "a2");
+        let baseline_tree = session.tree.entries.len();
+        assert_eq!(baseline_tree, 4, "fixture: 4 entries");
+
+        // Rewind back to the first user message (idx=1 in the
+        // reverse-order user list means the *first* user).
+        let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+        // idx=0 = "rewind through the most recent user prompt" → cut
+        // at the position of u2 → messages become [u1, a1].
+        let _ = rewind_session(&mut session, 0, &mut renderer);
+
+        // After rewind, messages has [u1, a1]; tree must agree.
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            session.tree.entries.len(),
+            session.messages.len(),
+            "tree entries must match messages count; got tree={}, msgs={}",
+            session.tree.entries.len(),
+            session.messages.len(),
+        );
+        assert_eq!(
+            session.message_store.len(),
+            session.messages.len(),
+            "store must match messages count",
+        );
+        // Leaf points to the last remaining message.
+        let last_id = session.messages.last().unwrap().id.clone();
+        assert_eq!(
+            session.tree.leaf_id,
+            Some(last_id.clone()),
+            "leaf_id must anchor to the new tail",
+        );
+        // Every remaining message id has a tree entry + store entry.
+        for m in &session.messages {
+            assert!(
+                session.tree.entries.contains_key(&m.id),
+                "missing tree entry for {}",
+                m.id,
+            );
+            assert!(
+                session.message_store.contains_key(&m.id),
+                "missing store entry for {}",
+                m.id,
+            );
+        }
     }
 
     // The token accumulator on the abort path keeps `total_tokens`

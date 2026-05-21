@@ -329,6 +329,18 @@ impl Session {
     /// always safe to remove.
     pub fn pop_last_message(&mut self) -> Option<SessionMessage> {
         self.ensure_back_compat_initialized();
+        // Refuse to pop a compaction summary. After compress, the
+        // System message at index 0 anchors all prior context for
+        // the next agent turn; removing it would silently lose the
+        // entire compressed history. Repeated `/undo` past the
+        // recent messages must stop here. The user can `/clear` to
+        // reset entirely.
+        if let Some(last) = self.messages.last()
+            && self.messages.len() == 1
+            && last.role == MessageRole::System
+        {
+            return None;
+        }
         let msg = self.messages.pop()?;
         // Pull the popped node's parent for leaf rewind. If the tree
         // somehow lacks this node (corruption / external mutation),
@@ -506,8 +518,14 @@ impl Session {
         self.total_estimated_tokens = 0;
         self.created_at = now.clone();
         self.updated_at = now;
-        // Note: model/provider/context_window/working_dir/permission_allowlist
-        // preserved so the host can keep the same agent runtime.
+        // Least privilege: clear `permission_allowlist` too. The
+        // previous "preserved across reset" behavior let "allow
+        // always" grants for one task (e.g. `bash cargo *` from a
+        // testing session) silently transfer to an unrelated fresh
+        // session. Each new session re-asks for permissions.
+        self.permission_allowlist.clear();
+        // Note: model/provider/context_window/working_dir preserved
+        // so the host can keep the same agent runtime.
     }
 
     pub fn needs_compaction(&self, reserve_tokens: u64) -> bool {
@@ -1071,6 +1089,78 @@ mod tests {
         assert_eq!(s.context_window, 200_000);
         // Lineage left blank when no parent passed.
         assert_eq!(s.name, "");
+    }
+
+    /// `reset_to_new` must clear `permission_allowlist` to avoid
+    /// leaking "allow always" decisions from a prior conversation
+    /// into an unrelated fresh session. Least-privilege: each new
+    /// task starts with no implicit grants.
+    #[test]
+    fn reset_to_new_clears_permission_allowlist() {
+        let mut s = Session::new("openai", "gpt-4", 200_000);
+        s.permission_allowlist.push(PermissionAllowEntry {
+            tool: "bash".to_string(),
+            pattern: "rm -rf /tmp/foo".to_string(),
+        });
+        assert!(!s.permission_allowlist.is_empty());
+        s.reset_to_new(None);
+        assert!(
+            s.permission_allowlist.is_empty(),
+            "allowlist must reset on new session; got {:?}",
+            s.permission_allowlist,
+        );
+    }
+
+    /// Repeated `/undo` after a compress must NOT pop the System
+    /// summary at index 0. Removing it would unanchor the compressed
+    /// context and the next agent turn would see no history.
+    #[test]
+    fn pop_last_message_refuses_to_pop_summary_at_index_zero() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "u2");
+        s.add_message(MessageRole::Assistant, "a2");
+        s.compress("summary".to_string(), 4, 100);
+        // After compress: messages = [<summary at 0>, ...nothing else,
+        // since we drained 4 and kept 0 recent]. Verify the shape.
+        assert_eq!(s.messages.len(), 1, "post-compress shape");
+        assert_eq!(s.messages[0].role, MessageRole::System);
+
+        // Now /undo style pop. Must NOT remove the summary.
+        let popped = s.pop_last_message();
+        assert!(
+            popped.is_none(),
+            "pop must refuse the summary; got {:?}",
+            popped,
+        );
+        assert_eq!(s.messages.len(), 1, "summary must remain");
+        assert_eq!(s.messages[0].role, MessageRole::System);
+    }
+
+    /// Popping past the summary by depleting all recent messages
+    /// also must not remove the summary itself — the user has to
+    /// `/clear` to reset.
+    #[test]
+    fn pop_drains_recent_but_keeps_summary() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        s.add_message(MessageRole::Assistant, "a1");
+        s.compress("summary".to_string(), 2, 50);
+        // Re-add some recent messages after the compress.
+        s.add_message(MessageRole::User, "u2");
+        s.add_message(MessageRole::Assistant, "a2");
+        assert_eq!(s.messages.len(), 3); // [summary, u2, a2]
+
+        // Pop a2, then u2 — both should succeed.
+        assert!(s.pop_last_message().is_some());
+        assert!(s.pop_last_message().is_some());
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].role, MessageRole::System);
+
+        // One more pop attempt → refused.
+        assert!(s.pop_last_message().is_none());
+        assert_eq!(s.messages.len(), 1);
     }
 
     /// When given a parent session id, `reset_to_new` records it
