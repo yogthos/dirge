@@ -369,10 +369,41 @@ impl PermissionChecker {
 
 fn resolve_absolute(path: &str, working_dir: &str) -> String {
     let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_string_lossy().to_string()
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
     } else {
-        Path::new(working_dir).join(p).to_string_lossy().to_string()
+        Path::new(working_dir).join(p)
+    };
+    // F7: canonicalize so symlinks resolve to their real target.
+    // Without this, a symlink like `safe_link -> /etc/passwd` would
+    // be checked against rules as `safe_link`, bypassing any
+    // `/etc/**` deny / external-directory rule. opencode handles
+    // this implicitly via TypeScript fs APIs that follow links;
+    // Rust requires the explicit call.
+    //
+    // Fallback: if canonicalize fails (path doesn't exist yet —
+    // e.g. a write to a new file), normalize `.` / `..` lexically
+    // and return the joined path as-is. The non-existence is
+    // intentional for write ops; canonicalize() would return
+    // NotFound and we'd lose the path entirely.
+    match std::fs::canonicalize(&joined) {
+        Ok(canonical) => canonical.to_string_lossy().to_string(),
+        Err(_) => {
+            // The path doesn't exist (write to new file, parent
+            // also missing, etc.). Try canonicalize on the parent
+            // then re-append the basename — catches
+            // `/safe/parent/../../etc/passwd` style attacks where
+            // the parent exists but the leaf doesn't. If even the
+            // parent doesn't canonicalize, fall back to the
+            // LEXICAL join (matches pre-F7 behavior so rules on
+            // not-yet-existing paths still match).
+            if let (Some(parent), Some(name)) = (joined.parent(), joined.file_name())
+                && let Ok(canonical_parent) = std::fs::canonicalize(parent)
+            {
+                return canonical_parent.join(name).to_string_lossy().to_string();
+            }
+            joined.to_string_lossy().to_string()
+        }
     }
 }
 
@@ -387,6 +418,64 @@ mod tests {
             SecurityMode::Standard,
             Some(std::path::PathBuf::from("/tmp")),
         )
+    }
+
+    /// F7: `resolve_absolute` must follow symlinks so a symlink
+    /// pointing at a deny-listed path can't bypass the rule.
+    #[test]
+    fn resolve_absolute_follows_symlinks() {
+        // Create a temp dir with a real file + a symlink to it.
+        // Use a unique dir per test process to avoid collisions
+        // across parallel test runs.
+        let dir =
+            std::env::temp_dir().join(format!("dirge-f7-symlink-test-{}", std::process::id(),));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real-secret.txt");
+        std::fs::write(&target, "hunter2").unwrap();
+        let link = dir.join("benign-name.txt");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+        let resolved = resolve_absolute(link.to_str().unwrap(), "/");
+        // The resolved path must match the real target, not the
+        // symlink name. Canonicalize the comparand too — on macOS
+        // /tmp is itself a symlink to /private/tmp.
+        let expected = std::fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resolved, expected, "symlink should resolve to its target",);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F7: nonexistent paths (writes to new files) must still
+    /// resolve sensibly. They can't canonicalize fully but we
+    /// canonicalize the parent so `/real/parent/../../etc/passwd`
+    /// becomes `/etc/passwd` instead of staying lexical.
+    #[test]
+    fn resolve_absolute_handles_nonexistent_via_parent_canonicalize() {
+        let dir =
+            std::env::temp_dir().join(format!("dirge-f7-newfile-test-{}", std::process::id(),));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let new_file = dir.join("does-not-exist-yet.txt");
+
+        let resolved = resolve_absolute(new_file.to_str().unwrap(), "/");
+        // The leaf doesn't canonicalize but the parent does.
+        // Expected form: canonical(parent) / "does-not-exist-yet.txt"
+        let expected_parent = std::fs::canonicalize(&dir).unwrap();
+        let expected = expected_parent
+            .join("does-not-exist-yet.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resolved, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Regression: "allow always" → `cd *` saved to session allowlist must
