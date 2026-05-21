@@ -89,6 +89,16 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         return ErrorKind::RateLimit;
     }
 
+    // Anthropic's `overloaded_error` is a transient capacity signal —
+    // structurally a rate-limit response without the "rate limit" /
+    // "too many" wording. Classify as RateLimit so the retry-with-
+    // backoff policy applies; previously it fell through to `Other`
+    // and the user saw a one-shot failure on transient backend
+    // pressure.
+    if lower.contains("overloaded") {
+        return ErrorKind::RateLimit;
+    }
+
     // HTTP status codes for server errors (502/503/504 are unambiguous)
     if lower.contains(" 503 ")
         || lower.contains(" 502 ")
@@ -265,6 +275,26 @@ mod tests {
         assert_eq!(
             classify_error("429 too many requests"),
             ErrorKind::RateLimit
+        );
+    }
+
+    /// Anthropic returns `{"type": "overloaded_error", ...}` when its
+    /// service is at capacity. The body is structurally similar to a
+    /// rate-limit (transient + retryable) but doesn't contain the
+    /// "rate limit" / "too many" / "429" patterns. Without explicit
+    /// handling it falls into `Other` and dirge doesn't retry —
+    /// users see a one-shot failure on a transient backend issue.
+    #[test]
+    fn classify_anthropic_overloaded_error_as_retryable() {
+        assert_eq!(
+            classify_error("overloaded_error: Anthropic API is overloaded"),
+            ErrorKind::RateLimit,
+        );
+        // Just the lowercase token is enough — provider stringifies
+        // the structured error differently across rig versions.
+        assert_eq!(
+            classify_error("Provider overloaded; please retry later"),
+            ErrorKind::RateLimit,
         );
     }
 

@@ -2340,6 +2340,24 @@ pub async fn run_interactive(
                                     KeyCode::Char('y') => break UserDecision::AllowOnce,
                                     KeyCode::Char('a') => {
                                         let pattern = suggest_pattern(&ask_req.tool, &ask_req.input);
+                                        // Refuse to store the empty-
+                                        // input placeholder as a real
+                                        // pattern. Without this, an "a"
+                                        // press on a tool call with
+                                        // empty/whitespace args would
+                                        // pin "<edit this pattern>" as
+                                        // a literal allowlist entry —
+                                        // useless and confusing.
+                                        // Fall back to AllowOnce so the
+                                        // tool still runs, but no
+                                        // permanent rule is added.
+                                        if is_placeholder_pattern(&pattern) {
+                                            renderer.write_line(
+                                                "  -> can't derive a useful pattern from empty input; allowing once only",
+                                                theme::dim(),
+                                            )?;
+                                            break UserDecision::AllowOnce;
+                                        }
                                         renderer.write_line(
                                             &format!("  -> will allow: {}", pattern),
                                             Color::Green,
@@ -2913,6 +2931,17 @@ pub async fn run_interactive(
     Ok(())
 }
 
+const ALLOW_PLACEHOLDER: &str = "<edit this pattern>";
+
+/// Whether a pattern was returned by `suggest_pattern` as the
+/// "empty input — please type a real pattern" placeholder rather
+/// than a real glob. Used by the ask-dialog to detect when the
+/// user pressed "allow always" on a degenerate input and refuse
+/// to store the placeholder as an actual allowlist entry.
+fn is_placeholder_pattern(p: &str) -> bool {
+    p == ALLOW_PLACEHOLDER
+}
+
 fn suggest_pattern(tool: &str, input: &str) -> String {
     // Refuse to suggest a catch-all wildcard for empty / whitespace-
     // only input. A user mis-clicking "(a) allow always" on an empty
@@ -2920,7 +2949,7 @@ fn suggest_pattern(tool: &str, input: &str) -> String {
     // tool forever" rule into their session. The placeholder string
     // is intentionally not a valid glob — the UI shows it as the
     // suggested pattern, the user edits it before confirming.
-    const PLACEHOLDER: &str = "<edit this pattern>";
+    const PLACEHOLDER: &str = ALLOW_PLACEHOLDER;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return PLACEHOLDER.to_string();
@@ -3343,6 +3372,27 @@ mod tests {
             !content.contains("1 tool calls ran"),
             "leaked plural for singular case: {content:?}",
         );
+    }
+
+    /// `suggest_pattern` returns a literal placeholder for empty
+    /// input. The ask-dialog path that consumes it must detect the
+    /// placeholder and refuse to add it as an allowlist entry —
+    /// otherwise pressing "a" (allow always) on an empty invocation
+    /// would silently store `<edit this pattern>` as a real pattern.
+    /// The detection is exposed via `is_placeholder_pattern` so the
+    /// dialog code is unit-testable.
+    #[test]
+    fn placeholder_pattern_is_detectable() {
+        let p = suggest_pattern("bash", "");
+        assert!(
+            is_placeholder_pattern(&p),
+            "empty input should yield a detectable placeholder; got {p:?}",
+        );
+        let p = suggest_pattern("grep", "  \t  ");
+        assert!(is_placeholder_pattern(&p));
+        // A legit suggestion is NOT flagged as a placeholder.
+        let p = suggest_pattern("bash", "cargo test");
+        assert!(!is_placeholder_pattern(&p), "real pattern flagged: {p:?}");
     }
 
     // Whitespace-only or empty input must NOT collapse to a "* *"

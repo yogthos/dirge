@@ -807,7 +807,40 @@ pub async fn handle_slash(
         "/regen-prompts" => match crate::context::prompts::regen() {
             Ok(()) => {
                 context.prompts = crate::context::prompts::load();
-                renderer.write_line("default prompts regenerated", c_agent())?;
+                // The active prompt's content may have changed on
+                // disk during regen. Re-bind `context.current_prompt`
+                // to the freshly-loaded body and rebuild the agent
+                // so the new preamble takes effect on the next turn
+                // without the user having to `/prompt <name>` again.
+                if let Some(name) = context.current_prompt_name.clone()
+                    && let Some(content) = context.prompts.get(&name)
+                {
+                    context.current_prompt = Some(content.clone());
+                }
+                let model = client.completion_model(session.model.to_string());
+                *agent = crate::provider::build_agent(
+                    model,
+                    cli,
+                    cfg,
+                    context,
+                    permission.clone(),
+                    ask_tx.clone(),
+                    None,
+                    None,
+                    bg_store.clone(),
+                    #[cfg(feature = "lsp")]
+                    None,
+                    sandbox.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                    #[cfg(feature = "semantic")]
+                    semantic_manager,
+                )
+                .await;
+                renderer.write_line(
+                    "default prompts regenerated; agent rebuilt with refreshed prompt",
+                    c_agent(),
+                )?;
             }
             Err(e) => {
                 renderer.write_line(&format!("failed to regenerate prompts: {}", e), c_error())?;
@@ -986,7 +1019,13 @@ pub async fn handle_slash(
             }
         }
         "/cd" => {
-            let target = parts.get(1).copied().unwrap_or("");
+            // `splitn(3, ' ')` produces empty middle elements for
+            // consecutive spaces (`/cd   /tmp` → `["/cd", "", "/tmp"]`),
+            // which collapses to "cd home" — silent surprise.
+            // Re-derive the target from everything after the slash
+            // command using whitespace-aware splitting.
+            let raw_args = text.trim().strip_prefix("/cd").unwrap_or("").trim();
+            let target = raw_args;
             let path = if target.is_empty() {
                 dirs::home_dir().unwrap_or_default()
             } else if let Some(rest) = target.strip_prefix('~') {
@@ -1159,6 +1198,10 @@ pub async fn handle_slash(
             )?;
             renderer.write_line(
                 "  /compress [instr]      compress with custom instructions",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /toggle <feat> [on|off] toggle a feature (e.g. /toggle todo)",
                 c_result(),
             )?;
             #[cfg(feature = "loop")]

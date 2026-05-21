@@ -202,19 +202,31 @@ pub fn load() -> Config {
 
     #[cfg(feature = "mcp")]
     if cfg.mcp_servers.is_none() {
-        let mut headers = HashMap::new();
-        if let Some(key) = std::env::var("EXA_API_KEY").ok() {
-            headers.insert("x-api-key".to_string(), key);
+        // Only auto-register the Exa default when there's actually
+        // a non-empty API key. An empty `EXA_API_KEY=""` (e.g. unset
+        // via a `.envrc` that intentionally clears it) used to
+        // register Exa anyway with an empty header, then every web-
+        // search call failed with 401 at first use. Skip cleanly
+        // when no usable key is present.
+        match std::env::var("EXA_API_KEY") {
+            Ok(key) if !key.is_empty() => {
+                let mut headers = HashMap::new();
+                headers.insert("x-api-key".to_string(), key);
+                let mut defaults = HashMap::new();
+                defaults.insert(
+                    "Exa Web Search".to_string(),
+                    McpServerConfig::Url {
+                        url: "https://mcp.exa.ai/mcp".to_string(),
+                        headers,
+                    },
+                );
+                cfg.mcp_servers = Some(defaults);
+            }
+            _ => {
+                // Key unset or empty — leave mcp_servers as None so
+                // the host knows there's nothing to connect to.
+            }
         }
-        let mut defaults = HashMap::new();
-        defaults.insert(
-            "Exa Web Search".to_string(),
-            McpServerConfig::Url {
-                url: "https://mcp.exa.ai/mcp".to_string(),
-                headers,
-            },
-        );
-        cfg.mcp_servers = Some(defaults);
     }
 
     cfg

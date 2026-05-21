@@ -11,8 +11,30 @@ pub struct McpClientHandle {
     pub running_service: RunningService<RoleClient, ()>,
 }
 
+/// Upper bound on how long we'll wait for an MCP server to complete
+/// initialization. Command-based servers that hang on `initialize`
+/// (e.g. waiting for stdin that never comes) would otherwise pin
+/// startup indefinitely. 10s is generous for legitimate inits — npm
+/// install-on-first-run servers take a few seconds; locally-running
+/// binaries respond in <100ms. Past the cap we abort and log.
+const MCP_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl McpClientHandle {
     pub async fn connect(server_name: String, config: &McpServerConfig) -> anyhow::Result<Self> {
+        // Wrap the entire connect in a timeout so a wedged server
+        // doesn't block startup forever. Returns a clean
+        // "init timeout" error past the cap.
+        let inner = Self::connect_inner(server_name.clone(), config);
+        match tokio::time::timeout(MCP_INIT_TIMEOUT, inner).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "MCP server {server_name:?} did not initialize within {}s — skipping",
+                MCP_INIT_TIMEOUT.as_secs(),
+            )),
+        }
+    }
+
+    async fn connect_inner(server_name: String, config: &McpServerConfig) -> anyhow::Result<Self> {
         match config {
             McpServerConfig::Command { command, args, env } => {
                 let mut cmd = Command::new(command);
