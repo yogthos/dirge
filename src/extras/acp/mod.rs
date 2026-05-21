@@ -183,6 +183,12 @@ async fn run_prompt(
     let runner = agent.spawn_runner(prompt_text.to_string(), vec![]);
     let mut rx = runner.event_rx;
 
+    // Track the most-recent ToolCall id so ToolResult updates can
+    // correlate back to their originating call. dirge's runner emits
+    // ToolCall + ToolResult as separate events with no id linkage —
+    // they're paired by emission order. Capture the id at ToolCall
+    // and reuse it on the next ToolResult.
+    let mut last_tool_call_id: Option<ToolCallId> = None;
     while let Some(event) = rx.recv().await {
         match event {
             AgentEvent::Token(text) => {
@@ -205,11 +211,10 @@ async fn run_prompt(
             }
             AgentEvent::ToolCall { name, args } => {
                 let args_str = args.to_string();
-                let tool_call = ToolCall::new(
-                    ToolCallId::new(uuid::Uuid::new_v4().to_string()),
-                    name.to_string(),
-                )
-                .raw_input(serde_json::from_str(&args_str).ok());
+                let call_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
+                last_tool_call_id = Some(call_id.clone());
+                let tool_call = ToolCall::new(call_id, name.to_string())
+                    .raw_input(serde_json::from_str(&args_str).ok());
                 let notif = SessionNotification::new(
                     session_id.clone(),
                     SessionUpdate::ToolCall(tool_call),
@@ -217,12 +222,19 @@ async fn run_prompt(
                 let _ = cx.send_notification(notif);
             }
             AgentEvent::ToolResult { output } => {
+                // Use the most recent ToolCall id so the client can
+                // correlate result → call. Falls back to an empty id
+                // only if a stray ToolResult arrives without a prior
+                // ToolCall (shouldn't happen with rig's stream).
+                let id = last_tool_call_id
+                    .take()
+                    .unwrap_or_else(|| ToolCallId::new(String::new()));
                 let fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .content(vec![ToolCallContent::from(ContentBlock::Text(
                         TextContent::new(output.to_string()),
                     ))]);
-                let update = ToolCallUpdate::new(ToolCallId::new(String::new()), fields);
+                let update = ToolCallUpdate::new(id, fields);
                 let notif = SessionNotification::new(
                     session_id.clone(),
                     SessionUpdate::ToolCallUpdate(update),

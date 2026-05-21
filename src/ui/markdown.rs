@@ -305,6 +305,13 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 }
                 TagEnd::BlockQuote(_) => {
                     let mut quoted = Vec::new();
+                    // Wrap the content first (without the prefix) so
+                    // long blockquote lines split at word boundaries,
+                    // then prepend `│ ` to *every* resulting chunk so
+                    // continuation rows keep the chamber bar. The old
+                    // code prefixed once then wrapped, dropping the
+                    // bar from wrapped continuations.
+                    let inner_w = max_width.saturating_sub(2);
                     for line in acc.split('\n') {
                         let trimmed = line.trim_end_matches('\r');
                         if trimmed.is_empty() {
@@ -313,10 +320,9 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                                 color: crate::ui::theme::dim(),
                             });
                         } else {
-                            let prefixed = format!("│ {}", trimmed);
-                            for chunk in word_wrap(&prefixed, max_width) {
+                            for chunk in word_wrap(trimmed, inner_w) {
                                 quoted.push(LineEntry {
-                                    text: chunk,
+                                    text: CompactString::from(format!("│ {}", chunk)),
                                     color: crate::ui::theme::dim(),
                                 });
                             }
@@ -341,8 +347,16 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     } else {
                         bullet_prefix(in_blockquote).to_string()
                     };
+                    // Continuation lines indent to where the item text
+                    // starts (under the bullet's right edge), not the
+                    // bullet glyph itself, so multi-line items read as
+                    // a coherent block.
+                    let cont_indent: String = std::iter::repeat(' ')
+                        .take(bullet.chars().count())
+                        .collect();
+                    let inner_w = max_width.saturating_sub(bullet.chars().count());
                     let mut item_lines = Vec::new();
-                    let mut first = true;
+                    let mut first_chunk_in_item = true;
                     for line in acc.split('\n') {
                         let trimmed = line.trim_end_matches('\r');
                         if trimmed.is_empty() {
@@ -350,16 +364,19 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                                 text: CompactString::new(""),
                                 color,
                             });
-                        } else if first {
-                            let prefixed = format!("{}{}", bullet, trimmed);
-                            for chunk in word_wrap(&prefixed, max_width) {
-                                item_lines.push(LineEntry { text: chunk, color });
-                            }
-                            first = false;
-                        } else {
-                            for chunk in word_wrap(trimmed, max_width) {
-                                item_lines.push(LineEntry { text: chunk, color });
-                            }
+                            continue;
+                        }
+                        for chunk in word_wrap(trimmed, inner_w) {
+                            let prefix = if first_chunk_in_item {
+                                first_chunk_in_item = false;
+                                bullet.as_str()
+                            } else {
+                                cont_indent.as_str()
+                            };
+                            item_lines.push(LineEntry {
+                                text: CompactString::from(format!("{}{}", prefix, chunk)),
+                                color,
+                            });
                         }
                     }
                     result.extend(item_lines);

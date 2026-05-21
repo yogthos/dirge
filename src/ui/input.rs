@@ -330,6 +330,14 @@ impl InputEditor {
         self.buffer = CompactString::new(text);
         self.cursor = self.buffer.len();
         self.pastes.clear();
+        // Reset kill ring state so a subsequent yank doesn't paste
+        // text from before the set_text (which would be jarring —
+        // the editor was just rewritten by /fork). History position
+        // also resets so Up/Down navigation starts from the new
+        // baseline instead of mid-history.
+        self.kill_ring.clear();
+        self.yank_state = None;
+        self.history_pos = None;
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -535,12 +543,19 @@ impl InputEditor {
                     self.cursor = prev_char_boundary(&self.buffer, self.cursor);
                     self.buffer.remove(self.cursor);
                 } else {
-                    let at_pos = self.buffer.rfind('@');
-                    if let Some(at) = at_pos {
-                        let before: String = self.buffer.chars().take(at).collect();
-                        let after: String = self.buffer.chars().skip(at + 1).collect();
-                        self.buffer = format!("{}{}", before, after).into();
+                    // `rfind` returns a *byte* offset and `self.cursor`
+                    // is a byte offset (see line below where we add
+                    // `c.len_utf8()`). The previous version mixed byte
+                    // offsets with `chars().take(N)` which counts chars
+                    // — corrupted any buffer containing multi-byte
+                    // text before the `@`. Use byte-level slicing
+                    // throughout.
+                    if let Some(at) = self.buffer.rfind('@') {
+                        let before = &self.buffer[..at];
+                        let after = self.buffer.get(at + 1..).unwrap_or("");
+                        let new_buf = format!("{}{}", before, after);
                         self.cursor = at;
+                        self.buffer = new_buf.into();
                     }
                     picker.deactivate();
                 }
@@ -559,12 +574,13 @@ impl InputEditor {
                     self.buffer.remove(self.cursor);
                     true
                 } else {
-                    let at_pos = self.buffer.rfind('@');
-                    if let Some(at) = at_pos {
-                        let before: String = self.buffer.chars().take(at).collect();
-                        let after: String = self.buffer.chars().skip(at + 1).collect();
-                        self.buffer = format!("{}{}", before, after).into();
+                    // Same byte-vs-char fix as the Esc branch above.
+                    if let Some(at) = self.buffer.rfind('@') {
+                        let before = &self.buffer[..at];
+                        let after = self.buffer.get(at + 1..).unwrap_or("");
+                        let new_buf = format!("{}{}", before, after);
                         self.cursor = at;
+                        self.buffer = new_buf.into();
                     }
                     picker.deactivate();
                     true
@@ -592,14 +608,18 @@ impl InputEditor {
             KeyCode::Enter => {
                 if let Some(path) = picker.selected_path() {
                     let path_str = path.to_string_lossy().to_string();
-                    let at_pos = self.buffer.rfind('@');
-                    if let Some(at) = at_pos {
-                        let before: String = self.buffer.chars().take(at).collect();
-                        let after_offset = at + 1 + picker.query.len();
-                        let after: String = self.buffer.chars().skip(after_offset).collect();
-                        let new_len = before.len() + path_str.len();
-                        self.buffer = format!("{}{}{}", before, path_str, after).into();
-                        self.cursor = new_len;
+                    // Byte-level slicing — `rfind`, `picker.query.len()`,
+                    // and `self.cursor` are all byte offsets. Previous
+                    // version mixed byte indices with `chars()` iters
+                    // and corrupted the buffer on multi-byte input.
+                    if let Some(at) = self.buffer.rfind('@') {
+                        let before = &self.buffer[..at];
+                        let after_byte = at + 1 + picker.query.len();
+                        let after = self.buffer.get(after_byte..).unwrap_or("");
+                        let new_cursor = before.len() + path_str.len();
+                        let new_buf = format!("{}{}{}", before, path_str, after);
+                        self.cursor = new_cursor;
+                        self.buffer = new_buf.into();
                     }
                 }
                 picker.deactivate();
@@ -661,7 +681,27 @@ impl InputEditor {
                 // continuity across turns.
                 let submitted = self.expanded();
                 if !submitted.is_empty() {
-                    self.history.push(submitted.clone());
+                    // Dedup against the most recent entry (bash/Emacs
+                    // convention — pressing Enter on the same prompt
+                    // twice shouldn't fill history with duplicates).
+                    // Also cap history at 500 entries so a long-lived
+                    // session doesn't grow it unboundedly.
+                    const HISTORY_MAX: usize = 500;
+                    let is_dupe = self
+                        .history
+                        .last()
+                        .map(|prev| prev.as_str() == submitted.as_str())
+                        .unwrap_or(false);
+                    if !is_dupe {
+                        self.history.push(submitted.clone());
+                        if self.history.len() > HISTORY_MAX {
+                            // Drop the oldest entries in batches so we
+                            // aren't doing a shift on every submit
+                            // once we hit the cap.
+                            let drain_to = self.history.len() - HISTORY_MAX;
+                            self.history.drain(..drain_to);
+                        }
+                    }
                 }
                 self.history_pos = None;
                 self.buffer.clear();
