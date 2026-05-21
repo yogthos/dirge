@@ -249,18 +249,22 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             vec![enter, exit]
         });
 
-        // Web tools: gated on config + (for websearch) a separate
-        // env-var escape hatch. CONFIG.md documents both keys as
-        // defaulting to `true`; the previous `unwrap_or(false)`
-        // disabled them by default contrary to the docs. Now
-        // matches the documented behavior — explicit `false` in
-        // config disables; absent or `true` enables (the runtime
-        // API-key check still has to pass for websearch).
-        let websearch_enabled = cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
-            || std::env::var("WEBSEARCH_ENABLED")
+        // Web tools: gated on config + an env-var escape hatch.
+        // CONFIG.md documents both keys as defaulting to `true`;
+        // explicit `false` in config disables. The env vars are
+        // symmetric — previously only `WEBSEARCH_ENABLED` existed,
+        // forcing webfetch users to edit config.json for an
+        // equivalent toggle. The runtime API-key check still has
+        // to pass for websearch.
+        let env_true = |k: &str| {
+            std::env::var(k)
                 .map(|v| v == "true" || v == "1")
-                .unwrap_or(false);
-        let webfetch_enabled = cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true);
+                .unwrap_or(false)
+        };
+        let websearch_enabled = cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
+            || env_true("WEBSEARCH_ENABLED");
+        let webfetch_enabled = cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true)
+            || env_true("WEBFETCH_ENABLED");
 
         let websearch_tool = websearch_enabled
             .then(|| std::env::var("EXA_API_KEY").ok())

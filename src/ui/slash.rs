@@ -1331,6 +1331,7 @@ pub async fn handle_slash(
                         "webfetch",
                         "websearch",
                         "task",
+                        "task_status",
                         "memory",
                         "skill",
                         "list_symbols",

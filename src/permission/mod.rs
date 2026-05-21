@@ -51,6 +51,10 @@ pub struct PermissionConfig {
     pub websearch: Option<ToolPerm>,
     /// `task` — subagent runner. The pattern is the subagent prompt.
     pub task: Option<ToolPerm>,
+    /// `task_status` — companion query tool for `task`. Read-only;
+    /// included for completeness so users can deny it independently
+    /// (e.g. to force background-only invocations).
+    pub task_status: Option<ToolPerm>,
     /// `memory` — persistent project memory store. Pattern rules
     /// restrict the memory keys / operations.
     pub memory: Option<ToolPerm>,

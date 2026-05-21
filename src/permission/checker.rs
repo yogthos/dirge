@@ -95,6 +95,7 @@ impl PermissionChecker {
             ("webfetch", &config.webfetch),
             ("websearch", &config.websearch),
             ("task", &config.task),
+            ("task_status", &config.task_status),
             ("memory", &config.memory),
             ("skill", &config.skill),
             ("list_symbols", &config.list_symbols),

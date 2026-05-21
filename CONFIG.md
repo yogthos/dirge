@@ -94,7 +94,7 @@ Supported permission tool keys are:
   `list_dir`, `apply_patch`, `write_todo_list`
 - LSP / question: `lsp`, `question`
 - Web: `webfetch`, `websearch`
-- Subagent / state: `task`, `memory`, `skill`
+- Subagent / state: `task`, `task_status`, `memory`, `skill`
 - Semantic (tree-sitter): `list_symbols`, `get_symbol_body`,
   `find_definition`, `find_callers`, `find_callees`
 - MCP umbrella: `mcp_tool` — patterns match the full key
