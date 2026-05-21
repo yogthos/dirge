@@ -153,6 +153,20 @@ pub async fn handle_compress(
         .map(|m| m.estimated_tokens)
         .sum();
 
+    // F13: estimate the summary's own token cost so we can
+    // report TRUE net savings instead of just "tokens replaced".
+    // A pathological summary longer than the messages it
+    // replaces means we just paid more tokens for less context.
+    // We still proceed with the compress (the new prefix is the
+    // SHAPE the LLM expects), but we want to surface the
+    // misfire so the user can adjust `keep_recent_tokens` or
+    // their custom compress prompt. opencode validates the
+    // summary fits the budget BEFORE issuing the LLM call
+    // (`compaction.ts:136-294`); dirge validates AFTER because
+    // we don't know the summary's size until the LLM returns.
+    let summary_tokens_est = crate::session::Session::estimate_tokens(&summary);
+    let net_saved: i64 = tokens_before as i64 - summary_tokens_est as i64;
+
     // `compress_reporting` returns the count of non-active-path
     // tree nodes (sibling branches) pruned. We notify the user
     // about that loss explicitly — without the notification a
@@ -197,13 +211,30 @@ pub async fn handle_compress(
             c_error(),
         )?;
     }
-    renderer.write_line(
-        &format!(
-            "compressed {} messages (saved ~{} tokens)",
-            cut_idx, tokens_before,
-        ),
-        c_agent(),
-    )?;
+    if net_saved < 0 {
+        // Summary cost more than the messages it replaced. Surface
+        // visibly so the user knows the compress didn't help —
+        // suggests tightening `keep_recent_tokens` or editing the
+        // compress instructions.
+        renderer.write_line(
+            &format!(
+                "compressed {} messages but the summary ({}t) is LARGER than the replaced messages ({}t); net cost +{}t. Consider lowering keep_recent_tokens or refining compress instructions.",
+                cut_idx,
+                summary_tokens_est,
+                tokens_before,
+                -net_saved,
+            ),
+            c_error(),
+        )?;
+    } else {
+        renderer.write_line(
+            &format!(
+                "compressed {} messages (saved ~{} tokens; summary uses {}t)",
+                cut_idx, net_saved, summary_tokens_est,
+            ),
+            c_agent(),
+        )?;
+    }
 
     Ok(())
 }
