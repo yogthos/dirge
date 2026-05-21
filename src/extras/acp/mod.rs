@@ -183,12 +183,10 @@ async fn run_prompt(
     let runner = agent.spawn_runner(prompt_text.to_string(), vec![]);
     let mut rx = runner.event_rx;
 
-    // Track the most-recent ToolCall id so ToolResult updates can
-    // correlate back to their originating call. dirge's runner emits
-    // ToolCall + ToolResult as separate events with no id linkage —
-    // they're paired by emission order. Capture the id at ToolCall
-    // and reuse it on the next ToolResult.
-    let mut last_tool_call_id: Option<ToolCallId> = None;
+    // F5: correlate rig tool-call ids with ACP ids so parallel
+    // calls pair with their results correctly. See
+    // `ToolCallCorrelator` doc for the dual-mode logic.
+    let mut correlator = ToolCallCorrelator::default();
     while let Some(event) = rx.recv().await {
         match event {
             AgentEvent::Token(text) => {
@@ -209,11 +207,11 @@ async fn run_prompt(
                 );
                 let _ = cx.send_notification(notif);
             }
-            AgentEvent::ToolCall { id: _, name, args } => {
+            AgentEvent::ToolCall { id, name, args } => {
                 let args_str = args.to_string();
-                let call_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
-                last_tool_call_id = Some(call_id.clone());
-                let tool_call = ToolCall::new(call_id, name.to_string())
+                let acp_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
+                correlator.record(id.as_str(), acp_id.clone());
+                let tool_call = ToolCall::new(acp_id, name.to_string())
                     .raw_input(serde_json::from_str(&args_str).ok());
                 let notif = SessionNotification::new(
                     session_id.clone(),
@@ -221,13 +219,9 @@ async fn run_prompt(
                 );
                 let _ = cx.send_notification(notif);
             }
-            AgentEvent::ToolResult { id: _, output } => {
-                // Use the most recent ToolCall id so the client can
-                // correlate result → call. Falls back to an empty id
-                // only if a stray ToolResult arrives without a prior
-                // ToolCall (shouldn't happen with rig's stream).
-                let id = last_tool_call_id
-                    .take()
+            AgentEvent::ToolResult { id, output } => {
+                let id = correlator
+                    .resolve(id.as_str())
                     .unwrap_or_else(|| ToolCallId::new(String::new()));
                 let fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
@@ -287,6 +281,44 @@ fn build_acp_permission(state: &AcpState) -> (Option<PermCheck>, Option<AskSende
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
     spawn_acp_ask_drain(ask_rx);
     (Some(perm), Some(ask_tx))
+}
+
+/// Two-mode correlator for matching rig `ToolResult` events back
+/// to their originating `ToolCall` event when bridging to ACP.
+/// Most providers (Anthropic, OpenAI) emit a stable `tool_call.id`
+/// on the request and re-emit it on the result → use the id map.
+/// Some providers (older OpenAI compat models) emit empty ids →
+/// fall back to FIFO since rig emits results in request order.
+///
+/// Extracted from `run_prompt` so the F5 fix is unit-testable
+/// without standing up a full ACP server.
+#[derive(Default)]
+struct ToolCallCorrelator {
+    by_id: std::collections::HashMap<String, ToolCallId>,
+    fifo: std::collections::VecDeque<ToolCallId>,
+}
+
+impl ToolCallCorrelator {
+    /// Record a new `(rig_id → acp_id)` mapping. Empty rig_id
+    /// pushes onto the FIFO queue.
+    fn record(&mut self, rig_id: &str, acp_id: ToolCallId) {
+        if rig_id.is_empty() {
+            self.fifo.push_back(acp_id);
+        } else {
+            self.by_id.insert(rig_id.to_string(), acp_id);
+        }
+    }
+
+    /// Resolve a result's rig_id to the originally-issued acp_id.
+    /// Returns `None` if no matching call is in-flight; callers
+    /// emit a stub empty id in that (shouldn't-happen) case.
+    fn resolve(&mut self, rig_id: &str) -> Option<ToolCallId> {
+        if !rig_id.is_empty() {
+            self.by_id.remove(rig_id)
+        } else {
+            self.fifo.pop_front()
+        }
+    }
 }
 
 /// Drain `ask_rx` by responding to every permission ask with
@@ -352,6 +384,62 @@ mod tests {
             "ACP ask must auto-deny; got {:?}",
             resp,
         );
+    }
+
+    /// F5: two parallel tool calls with distinct rig ids → two
+    /// results MUST pair with the right ACP ids. Previously the
+    /// `last_tool_call_id` single-slot lost the first id when the
+    /// second call arrived.
+    #[test]
+    fn correlator_matches_parallel_tool_calls_by_id() {
+        let mut c = ToolCallCorrelator::default();
+        let acp_a = ToolCallId::new("acp-A".to_string());
+        let acp_b = ToolCallId::new("acp-B".to_string());
+        c.record("rig-A", acp_a.clone());
+        c.record("rig-B", acp_b.clone());
+
+        // Results can arrive in either order.
+        assert_eq!(c.resolve("rig-B"), Some(acp_b));
+        assert_eq!(c.resolve("rig-A"), Some(acp_a));
+    }
+
+    /// Provider-empty ids fall to the FIFO queue, preserving
+    /// request order (rig emits results in dispatch order for
+    /// providers that don't supply ids).
+    #[test]
+    fn correlator_uses_fifo_for_empty_rig_ids() {
+        let mut c = ToolCallCorrelator::default();
+        let acp_a = ToolCallId::new("acp-A".to_string());
+        let acp_b = ToolCallId::new("acp-B".to_string());
+        c.record("", acp_a.clone());
+        c.record("", acp_b.clone());
+
+        // First result pairs with first call; second with second.
+        assert_eq!(c.resolve(""), Some(acp_a));
+        assert_eq!(c.resolve(""), Some(acp_b));
+    }
+
+    /// Mixed: an id'd call alongside an empty-id call. Each falls
+    /// to its respective bucket — no cross-contamination.
+    #[test]
+    fn correlator_separates_id_and_fifo_buckets() {
+        let mut c = ToolCallCorrelator::default();
+        let acp_named = ToolCallId::new("acp-named".to_string());
+        let acp_anon = ToolCallId::new("acp-anon".to_string());
+        c.record("rig-X", acp_named.clone());
+        c.record("", acp_anon.clone());
+
+        assert_eq!(c.resolve(""), Some(acp_anon));
+        assert_eq!(c.resolve("rig-X"), Some(acp_named));
+    }
+
+    /// Stray result (no matching call) → resolve returns None;
+    /// the caller can choose a stub id. Don't panic.
+    #[test]
+    fn correlator_returns_none_for_unknown_id() {
+        let mut c = ToolCallCorrelator::default();
+        assert_eq!(c.resolve("missing"), None);
+        assert_eq!(c.resolve(""), None);
     }
 
     /// Multiple concurrent asks all get responded to.
