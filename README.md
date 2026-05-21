@@ -9,7 +9,7 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **Line-numbered read output**: `read` tool prefixes each line with right-aligned line numbers (`123: content`)
 - **Environment-aware**: system prompt includes OS, shell, working directory, and git branch for context
 - **Semantic code tools** (tree-sitter): list_symbols, get_symbol_body, find_definition, find_callers, find_callees — supports TypeScript/TSX and Python
-- **Claude-compatible skills**: discover skills from `.claude/skills/`, `.maki/skills/`, `.opencode/skills/`, `.dirge/skills/` directories. Agent can call the `skill` tool to load instructions on demand
+- **Claude-compatible skills**: discover skills from `.claude/skills/`, `.opencode/skills/`, `.dirge/skills/` directories. Agent can call the `skill` tool to load instructions on demand
 - **Bash permissions** (tree-sitter): parses shell commands to split `&&`/`;`/`|` into individual segments, detects command substitution and complex constructs
 - **Permission system**: four configurable modes with per-tool patterns, session allowlists, and external directory policies
 - **Session management**: save/load/resume sessions, auto-compaction to stay within context windows
@@ -200,7 +200,7 @@ The agent automatically loads `AGENTS.md` or `CLAUDE.md` from the project root, 
 
 ## Claude-compatible skills
 
-Place skill directories in `.claude/skills/`, `.maki/skills/`, or `.opencode/skills/` in your project or home directory. Each skill is a directory containing `SKILL.md` with optional YAML frontmatter:
+Place skill directories in `.claude/skills/`, `.opencode/skills/`, or `.dirge/skills/` in your project or home directory. Each skill is a directory containing `SKILL.md` with optional YAML frontmatter:
 
 ```markdown
 ---

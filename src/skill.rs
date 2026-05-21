@@ -16,7 +16,6 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     let global_dirs = dirs::home_dir().into_iter().flat_map(|home| {
         [
             home.join(".claude").join("skills"),
-            home.join(".maki").join("skills"),
             home.join(".opencode").join("skills"),
             home.join(".dirge").join("skills"),
         ]
@@ -27,7 +26,6 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
         .flat_map(|ancestor| {
             [
                 ancestor.join(".claude").join("skills"),
-                ancestor.join(".maki").join("skills"),
                 ancestor.join(".opencode").join("skills"),
                 ancestor.join(".dirge").join("skills"),
             ]
