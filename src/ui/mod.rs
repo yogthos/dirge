@@ -1536,14 +1536,23 @@ pub async fn run_interactive(
                                     for l in &lines[pre..] {
                                         let txt = sanitize_output(l).into_string();
                                         if l.starts_with("--- ") || l.starts_with("+++ ") {
+                                            // Filenames in the diff header get
+                                            // the same accent as section
+                                            // markers elsewhere in chat. Was
+                                            // hardcoded `Color::Cyan` which is
+                                            // invisible on phosphor (same hue
+                                            // as agent text).
                                             renderer.write_line(
                                                 &chamber_row(&txt, inner),
-                                                Color::Cyan,
+                                                theme::accent(),
                                             )?;
                                         } else if l.starts_with("@@") {
+                                            // Hunk position markers — use dim
+                                            // so they recede behind the +/-
+                                            // content lines below.
                                             renderer.write_line(
                                                 &chamber_row(&txt, inner),
-                                                Color::DarkCyan,
+                                                theme::dim(),
                                             )?;
                                         } else if l.starts_with('+') {
                                             renderer.write_line(

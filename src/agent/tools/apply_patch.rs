@@ -217,13 +217,54 @@ impl Tool for ApplyPatchTool {
                 }
             };
             if let Some(plan) = self.plan_file.as_ref() {
+                // Build a parent+filename comparison so we can match
+                // PLAN.md by name even when the file doesn't exist
+                // yet (the very first `apply_patch create PLAN.md` op
+                // in a fresh plan-mode session). Pure `canonicalize`
+                // fails on non-existent paths and the fallback
+                // `to_path_buf` would compare relative vs absolute
+                // unequal — refusing a legitimate create. Compare:
+                //   1. canonicalized full paths (works once PLAN.md
+                //      exists, and for both create and update),
+                //   2. resolved parent + same filename (works for the
+                //      first-create case before PLAN.md exists).
+                let plan_canon = plan.canonicalize().ok();
+                let plan_parent = plan
+                    .parent()
+                    .and_then(|p| p.canonicalize().ok())
+                    .or_else(|| {
+                        std::env::current_dir()
+                            .ok()
+                            .map(|cwd| plan.parent().map(|p| cwd.join(p)).unwrap_or(cwd))
+                    });
+                let plan_name = plan.file_name();
                 for path in &paths_to_check {
                     let target = Path::new(path);
-                    let target_canon = target
-                        .canonicalize()
-                        .unwrap_or_else(|_| target.to_path_buf());
-                    let plan_canon = plan.canonicalize().unwrap_or_else(|_| plan.clone());
-                    if target_canon != plan_canon {
+                    let target_canon = target.canonicalize().ok();
+                    let target_parent = target
+                        .parent()
+                        .and_then(|p| p.canonicalize().ok())
+                        .or_else(|| {
+                            std::env::current_dir().ok().map(|cwd| {
+                                target
+                                    .parent()
+                                    .filter(|p| !p.as_os_str().is_empty())
+                                    .map(|p| cwd.join(p))
+                                    .unwrap_or(cwd)
+                            })
+                        });
+                    let target_name = target.file_name();
+
+                    let matches_canonical = match (&plan_canon, &target_canon) {
+                        (Some(p), Some(t)) => p == t,
+                        _ => false,
+                    };
+                    let matches_by_parent_and_name =
+                        match (&plan_parent, &target_parent, plan_name, target_name) {
+                            (Some(pp), Some(tp), Some(pn), Some(tn)) => pp == tp && pn == tn,
+                            _ => false,
+                        };
+                    if !matches_canonical && !matches_by_parent_and_name {
                         return Err(ToolError::Msg(format!(
                             "plan mode is active — apply_patch can only target {}; got {}",
                             plan.display(),

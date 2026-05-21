@@ -247,6 +247,17 @@ async fn run_prompt(
             AgentEvent::Error(_) => {
                 break;
             }
+            // Observability markers added for the interactive UI's
+            // turn tracker + interjection queue. ACP doesn't have a
+            // mid-stream interjection concept (the client owns
+            // submission), so we treat these as no-ops.
+            AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. } => {}
+            AgentEvent::Interjected { .. } => {
+                // An interjected turn shouldn't reach the ACP bridge —
+                // ACP runs aren't interactive — but bail cleanly if
+                // one does rather than panic on partial state.
+                break;
+            }
         }
     }
 

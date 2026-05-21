@@ -112,7 +112,10 @@ impl Tool for TaskStatusTool {
                         }
                     },
                     None => {
-                        return Err(ToolError::Msg(format!("task not found: {}", args.task_id)));
+                        return Err(ToolError::Msg(format!(
+                            "task not found: {} (either it never existed, or it was evicted from the background store after 32 newer tasks)",
+                            args.task_id
+                        )));
                     }
                 }
             }
@@ -129,7 +132,10 @@ impl Tool for TaskStatusTool {
                         args.task_id, err
                     )),
                 },
-                None => Err(ToolError::Msg(format!("task not found: {}", args.task_id))),
+                None => Err(ToolError::Msg(format!(
+                    "task not found: {} (either it never existed, or it was evicted from the background store after 32 newer tasks)",
+                    args.task_id
+                ))),
             }
         }
     }

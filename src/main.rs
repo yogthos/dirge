@@ -282,11 +282,22 @@ async fn main() -> anyhow::Result<()> {
     // sessions don't silently snap back to the default `code` prompt.
     // Default-prompt initialization above set context.current_prompt
     // to `code`; we override it here if the session carries a name.
-    if let Some(name) = session.current_prompt_name.clone()
-        && let Some(content) = context.prompts.get(&name)
-    {
-        context.current_prompt = Some(content.clone());
-        context.current_prompt_name = Some(name);
+    // If the persisted name no longer resolves (user uninstalled the
+    // prompt), warn so the silent fallback doesn't surprise them.
+    if let Some(name) = session.current_prompt_name.clone() {
+        match context.prompts.get(&name) {
+            Some(content) => {
+                context.current_prompt = Some(content.clone());
+                context.current_prompt_name = Some(name);
+            }
+            None => {
+                eprintln!(
+                    "warning: session was using prompt {:?} but it's no longer available — falling back to default ({:?}).",
+                    name,
+                    context.current_prompt_name.as_deref().unwrap_or("none"),
+                );
+            }
+        }
     }
 
     let client = provider::create_client(

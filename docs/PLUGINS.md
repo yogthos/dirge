@@ -194,6 +194,23 @@ output.
 - `harness/replace-prompt`: think of it as "rewrite what the LLM sees
   this turn." Only meaningful from `on-prompt`.
 
+```janet
+# Capture the latest LLM response so the next `on-prompt` hook can
+# read it from the binding `harness-response`. The host calls
+# `(harness/store-response text)` itself after every turn, so you
+# normally don't need to invoke this directly — read `harness-response`
+# from inside `on-prompt` to inspect the previous assistant message.
+# If you DO want to fabricate a "previous response" for your own
+# state machine (e.g. seeding a test fixture), you can call it
+# explicitly.
+(harness/store-response "the previous assistant message text")
+```
+
+- `harness/store-response`: sets the `harness-response` binding so the
+  next `on-prompt` hook can react to what the LLM said last turn. The
+  host wires this automatically; plugins call it only for testing or
+  to seed a synthetic prior response.
+
 ### Tool interception
 
 These three set slots that the host inspects right after each tool hook.
