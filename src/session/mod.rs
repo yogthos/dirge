@@ -199,8 +199,24 @@ pub struct PluginEntry {
     pub seq: u64,
 }
 
+/// Current session-file schema version. Bump when adding fields
+/// that REQUIRE the new code to read correctly (rare — most
+/// field additions use `#[serde(default)]` and are
+/// forward-compatible). Loaders compare this against the
+/// session's stored value: equal or higher is fine (we'll just
+/// see defaults for fields we don't recognize); strictly lower
+/// triggers a migration shim.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// F8: schema version of this session file. Defaulted to 0 for
+    /// pre-F8 session files (which omit the field entirely);
+    /// `load_session` runs migrations from `schema_version` →
+    /// `SCHEMA_VERSION` after deserialize. New sessions get
+    /// `SCHEMA_VERSION` via `Session::new`.
+    #[serde(default)]
+    pub schema_version: u32,
     pub id: CompactString,
     pub name: CompactString,
     pub messages: Vec<SessionMessage>,
@@ -274,6 +290,7 @@ impl Session {
     pub fn new(provider: &str, model: &str, context_window: u64) -> Self {
         let now = CompactString::new(chrono::Utc::now().to_rfc3339());
         Session {
+            schema_version: SCHEMA_VERSION,
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(""),
             messages: Vec::new(),

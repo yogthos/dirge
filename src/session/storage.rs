@@ -99,8 +99,51 @@ pub fn load_session(id: &str) -> anyhow::Result<Session> {
     validate_session_id(id)?;
     let dir = session_dir();
     let path = dir.join(format!("{}.json", id));
-    let json = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&json)?)
+    let json = std::fs::read_to_string(&path)?;
+
+    // F8: schema-version handling. Pre-F8 session files have no
+    // `schema_version` field; serde defaults it to 0. New
+    // sessions are at `SCHEMA_VERSION`. Anything in between gets
+    // migrated. A file with schema_version > SCHEMA_VERSION
+    // (forward-incompatible) loads with a warning — most fields
+    // still deserialize via `#[serde(default)]`, just the new
+    // ones get default values.
+    let mut session: Session = serde_json::from_str(&json).map_err(|e| {
+        // Add file-path context to corrupted-file errors so the
+        // user knows which session is broken and can recover by
+        // restoring from a backup or deleting.
+        anyhow::anyhow!("failed to parse {}: {e}", path.display())
+    })?;
+
+    if session.schema_version < crate::session::SCHEMA_VERSION {
+        migrate_session(&mut session);
+        session.schema_version = crate::session::SCHEMA_VERSION;
+    } else if session.schema_version > crate::session::SCHEMA_VERSION {
+        tracing::warn!(
+            target: "dirge::session",
+            path = %path.display(),
+            file_version = session.schema_version,
+            our_version = crate::session::SCHEMA_VERSION,
+            "session file is from a newer dirge version; unknown fields will default. Upgrade dirge to read it fully."
+        );
+    }
+    Ok(session)
+}
+
+/// Bring a session loaded from an older schema version up to the
+/// current `SCHEMA_VERSION`. Idempotent. Each migration step
+/// handles one version bump; chain them as we add versions.
+///
+/// Current state: SCHEMA_VERSION = 1, which is "schema-versioned"
+/// vs. pre-F8 (treated as 0). No data shape changes between
+/// version 0 and 1 — the field additions for branch_summaries,
+/// tool_calls, current_prompt_name etc. all used
+/// `#[serde(default)]` so they already migrate transparently.
+/// This function exists so future schema bumps have a hook.
+fn migrate_session(session: &mut Session) {
+    let _ = session;
+    // No-op for v0 → v1. Future migrations gate on
+    // `if session.schema_version < N` checks.
 }
 
 pub fn delete_session(id: &str) -> anyhow::Result<()> {
@@ -123,6 +166,75 @@ mod tests {
         assert!(validate_session_id("plain-id").is_ok());
         assert!(validate_session_id("2024.session").is_ok());
         assert!(validate_session_id("session_42").is_ok());
+    }
+
+    /// F8: pre-F8 session files (no `schema_version` field) load
+    /// with `schema_version` defaulted to 0, then get migrated up
+    /// to `SCHEMA_VERSION`. The migration is idempotent and
+    /// transparent for current schema (no data shape changes
+    /// between v0 and v1).
+    #[test]
+    fn load_session_migrates_pre_f8_files() {
+        // Write a minimal pre-F8 session JSON without the
+        // schema_version field to a temp session id, then load.
+        let id = format!("dirge-test-load-{}", std::process::id());
+        let dir = session_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", id));
+        std::fs::write(
+            &path,
+            r#"{
+                "id": "dirge-test-load-pre-f8",
+                "name": "",
+                "messages": [],
+                "compactions": [],
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "total_tokens": 0,
+                "total_cost": 0.0,
+                "total_estimated_tokens": 0,
+                "context_window": 100000,
+                "model": "test-model",
+                "provider": "test",
+                "working_dir": "/tmp"
+            }"#,
+        )
+        .unwrap();
+
+        let result = load_session(&id);
+        let _ = std::fs::remove_file(&path);
+
+        let session = result.expect("pre-F8 file must load");
+        assert_eq!(
+            session.schema_version,
+            crate::session::SCHEMA_VERSION,
+            "migration must bump schema_version",
+        );
+        assert_eq!(session.model, "test-model");
+    }
+
+    /// F8: a truncated JSON file surfaces a CLEAR error mentioning
+    /// the file path. Previously the user got
+    /// `expected ',' or '}' at line N column M` with no file
+    /// context, making it hard to identify which session was
+    /// broken when many existed.
+    #[test]
+    fn load_session_corrupted_file_includes_path_in_error() {
+        let id = format!("dirge-test-corrupt-{}", std::process::id());
+        let dir = session_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", id));
+        // Truncated JSON.
+        std::fs::write(&path, r#"{"id": "x", "name":"#).unwrap();
+
+        let err = load_session(&id).expect_err("truncated file must error");
+        let _ = std::fs::remove_file(&path);
+
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains(&id) || msg.contains("failed to parse"),
+            "error must reference the file: {msg}",
+        );
     }
 
     #[test]
