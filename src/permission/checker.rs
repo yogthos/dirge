@@ -286,12 +286,28 @@ impl PermissionChecker {
         }
     }
 
-    #[allow(dead_code)]
     pub fn allowlist_entries(&self) -> Vec<(String, String)> {
         self.session_allowlist
             .iter()
             .map(|(t, p)| (t.clone(), p.original.clone()))
             .collect()
+    }
+
+    /// Remove the allowlist entry at the given index (0-based,
+    /// matching the display order in `/allow list`). Returns the
+    /// removed `(tool, pattern)` on success, or `None` if the
+    /// index is out of range. Used by `/allow remove <n>`.
+    pub fn remove_session_allowlist_at(&mut self, idx: usize) -> Option<(String, String)> {
+        if idx >= self.session_allowlist.len() {
+            return None;
+        }
+        let (tool, pat) = self.session_allowlist.remove(idx);
+        Some((tool, pat.original.clone()))
+    }
+
+    /// Remove ALL allowlist entries. Used by `/allow clear`.
+    pub fn clear_session_allowlist(&mut self) {
+        self.session_allowlist.clear();
     }
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
@@ -395,6 +411,53 @@ mod tests {
 
         let r2 = checker.check("bash", "cd /Users/yogthos/src/work/rigging-workshop");
         assert!(matches!(r2, CheckResult::Allowed));
+    }
+
+    /// Phase 5 — `/allow remove <idx>` plumbs through to
+    /// `remove_session_allowlist_at`. Returns the removed entry's
+    /// (tool, pattern) so the slash handler can confirm to the
+    /// user what was removed.
+    #[test]
+    fn remove_session_allowlist_at_returns_removed_entry() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "git *");
+        checker.add_session_allowlist("read".to_string(), "/tmp/*");
+        assert_eq!(checker.allowlist_entries().len(), 3);
+
+        let removed = checker.remove_session_allowlist_at(1);
+        assert_eq!(removed, Some(("bash".to_string(), "git *".to_string())),);
+        // After removal, the indices shift: original [0]bash:cargo*,
+        // [2]read:/tmp/* are now at [0] and [1].
+        let after = checker.allowlist_entries();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0], ("bash".to_string(), "cargo *".to_string()));
+        assert_eq!(after[1], ("read".to_string(), "/tmp/*".to_string()));
+    }
+
+    /// Out-of-range index returns None rather than panicking. The
+    /// slash handler shows a clear error in that case.
+    #[test]
+    fn remove_session_allowlist_at_out_of_range_returns_none() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        assert_eq!(checker.remove_session_allowlist_at(99), None);
+        assert_eq!(checker.remove_session_allowlist_at(1), None);
+        // Existing entry still there.
+        assert_eq!(checker.allowlist_entries().len(), 1);
+    }
+
+    /// `clear` empties the allowlist entirely. Different from
+    /// `reset_to_new` (which clears EVERYTHING) — this is the
+    /// user-facing nuke for just allowlist grants.
+    #[test]
+    fn clear_session_allowlist_empties_the_list() {
+        let mut checker = fresh_checker();
+        checker.add_session_allowlist("bash".to_string(), "cargo *");
+        checker.add_session_allowlist("bash".to_string(), "git *");
+        assert_eq!(checker.allowlist_entries().len(), 2);
+        checker.clear_session_allowlist();
+        assert!(checker.allowlist_entries().is_empty());
     }
 
     // Adding the same (tool, pattern) twice must not duplicate the

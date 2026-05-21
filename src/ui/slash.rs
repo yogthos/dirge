@@ -1149,6 +1149,143 @@ pub async fn handle_slash(
                 }
             }
         }
+        "/allow" => {
+            // Phase 5: CRUD for the session permission allowlist.
+            // Subcommands: list (default), add <tool> <pattern>,
+            // remove <idx>, clear. Without this, users can only
+            // create allowlist entries via the interactive "(a)
+            // allow always" prompt; there's no way to inspect or
+            // undo a bad grant short of editing the session JSON.
+            let sub = parts.get(1).copied().unwrap_or("list");
+            let perm = match permission {
+                Some(p) => p,
+                None => {
+                    renderer.write_line(
+                        "permission system unavailable (--no-tools mode?)",
+                        c_error(),
+                    )?;
+                    return Ok(());
+                }
+            };
+            match sub {
+                "list" => {
+                    let entries = {
+                        let guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.allowlist_entries()
+                    };
+                    if entries.is_empty() {
+                        renderer.write_line(
+                            "session allowlist is empty (use '(a) allow always' in a permission prompt to add entries)",
+                            c_agent(),
+                        )?;
+                    } else {
+                        renderer.write_line(
+                            &format!("session allowlist ({} entries):", entries.len()),
+                            c_agent(),
+                        )?;
+                        for (i, (tool, pat)) in entries.iter().enumerate() {
+                            renderer
+                                .write_line(&format!("  [{}] {} {}", i, tool, pat), c_result())?;
+                        }
+                        renderer.write_line(
+                            "use '/allow remove <idx>' to drop a single entry; '/allow clear' to drop all",
+                            theme::dim(),
+                        )?;
+                    }
+                }
+                "add" => {
+                    // `/allow add <tool> <pattern>` — third part is
+                    // the tool, rest is the pattern (may contain
+                    // spaces, so re-derive from raw text).
+                    let raw_args = text.trim().strip_prefix("/allow").unwrap_or("").trim();
+                    let rest = raw_args.strip_prefix("add").unwrap_or("").trim();
+                    let mut it = rest.splitn(2, char::is_whitespace);
+                    let tool = it.next().unwrap_or("");
+                    let pattern = it.next().unwrap_or("").trim();
+                    if tool.is_empty() || pattern.is_empty() {
+                        renderer.write_line(
+                            "usage: /allow add <tool> <pattern>  (e.g. /allow add bash 'cargo *')",
+                            c_error(),
+                        )?;
+                    } else {
+                        {
+                            let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.add_session_allowlist(tool.to_string(), pattern);
+                        }
+                        // Mirror into session.permission_allowlist
+                        // so the entry persists across save/load.
+                        let entry = crate::session::PermissionAllowEntry {
+                            tool: tool.to_string(),
+                            pattern: pattern.to_string(),
+                        };
+                        // Dedup at the session level too — checker
+                        // dedupes but we want save() to write a
+                        // clean list.
+                        if !session
+                            .permission_allowlist
+                            .iter()
+                            .any(|e| e.tool == entry.tool && e.pattern == entry.pattern)
+                        {
+                            session.permission_allowlist.push(entry);
+                        }
+                        renderer.write_line(&format!("added: {} {}", tool, pattern), c_agent())?;
+                    }
+                }
+                "remove" => {
+                    let idx_str = parts.get(2).copied().unwrap_or("");
+                    let idx: usize = match idx_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            renderer.write_line(
+                                "usage: /allow remove <idx>  (run /allow list to see indices)",
+                                c_error(),
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    let removed = {
+                        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.remove_session_allowlist_at(idx)
+                    };
+                    match removed {
+                        Some((tool, pat)) => {
+                            // Mirror removal into the session
+                            // allowlist too.
+                            session
+                                .permission_allowlist
+                                .retain(|e| !(e.tool == tool && e.pattern == pat));
+                            renderer.write_line(
+                                &format!("removed [{}]: {} {}", idx, tool, pat),
+                                c_agent(),
+                            )?;
+                        }
+                        None => {
+                            renderer.write_line(
+                                &format!("no allowlist entry at index {}", idx),
+                                c_error(),
+                            )?;
+                        }
+                    }
+                }
+                "clear" => {
+                    {
+                        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.clear_session_allowlist();
+                    }
+                    session.permission_allowlist.clear();
+                    renderer.write_line("session allowlist cleared", c_agent())?;
+                }
+                other => {
+                    renderer.write_line(
+                        &format!(
+                            "unknown /allow subcommand {:?}; try: list, add, remove, clear",
+                            other,
+                        ),
+                        c_error(),
+                    )?;
+                }
+            }
+        }
         "/help" => {
             renderer.write_line("commands:", c_agent())?;
             renderer.write_line("  /model [name]          show or switch model", c_result())?;
@@ -1221,6 +1358,22 @@ pub async fn handle_slash(
             )?;
             renderer.write_line(
                 "  /toggle <feat> [on|off] toggle a feature (e.g. /toggle todo)",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /allow list            list session allowlist entries",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /allow add <tool> <pat> add an allowlist entry",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /allow remove <idx>    drop one allowlist entry",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /allow clear           drop all allowlist entries",
                 c_result(),
             )?;
             #[cfg(feature = "loop")]
