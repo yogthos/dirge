@@ -108,6 +108,13 @@ impl Tool for WriteTool {
             tokio::fs::create_dir_all(parent).await?;
         }
         let bytes = args.content.len();
+        // Line count is useful for the LLM to confirm what it wrote
+        // landed; cheap to compute on the in-memory string before
+        // the write. `lines()` doesn't count a trailing empty line
+        // (so "a\nb\n" is 2 lines, not 3) which matches read's
+        // counting convention.
+        let line_count = args.content.lines().count();
+        let was_creation = !path.exists();
         #[cfg(feature = "lsp")]
         let write_at = Instant::now();
         tokio::fs::write(path, &args.content).await?;
@@ -117,8 +124,15 @@ impl Tool for WriteTool {
             cache.clear();
         }
 
+        // Path lives in the chamber banner (`╭─ WRITE ─ "<path>" ─╮`),
+        // so don't repeat it. Use the extra room to surface info the
+        // LLM finds actionable: bytes, line count, and whether this
+        // was a new-file creation vs overwrite. The verb up front
+        // disambiguates the two — previously the LLM had to infer
+        // creation by reading the surrounding context.
+        let verb = if was_creation { "Created" } else { "Wrote" };
         #[allow(unused_mut)]
-        let mut output = format!("Written {} bytes to {}", bytes, args.path);
+        let mut output = format!("{} {} bytes ({} lines)", verb, bytes, line_count);
         #[cfg(feature = "lsp")]
         output.push_str(&append_lsp_block(self.lsp_manager.as_ref(), path, write_at).await);
         Ok(output)
@@ -194,8 +208,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(out.starts_with("Written 5 bytes"), "got: {out}");
-        // No diagnostic block since manager is None.
+        // Path is in the chamber banner; body starts with the verb +
+        // bytes + line count. Use `Created` since the test path
+        // didn't exist beforehand. Single-line "hello" content → 1 line.
+        assert_eq!(
+            out, "Created 5 bytes (1 lines)",
+            "unexpected write summary: {out}",
+        );
         assert!(!out.contains("LSP errors"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -219,7 +238,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(out.starts_with("Written 2 bytes"));
+        assert!(
+            out.starts_with("Created 2 bytes") || out.starts_with("Wrote 2 bytes"),
+            "expected `Created`/`Wrote 2 bytes` prefix; got: {out}",
+        );
         assert!(!out.contains("LSP errors"), "got: {out}");
         std::fs::remove_dir_all(&dir).ok();
     }

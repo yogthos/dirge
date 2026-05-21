@@ -361,51 +361,105 @@ fn sanitize_single_line(s: &str, max_chars: usize) -> String {
 /// - list_dir → path
 /// - bash → command (truncated to 60 chars)
 /// - others → first string arg or nothing
-fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> String {
+/// Extract the unquoted, untruncated value for the chamber banner.
+/// Picks the most informative single argument for each tool — the
+/// path for file ops, the command for bash, etc. Returns `""` for
+/// tools without a meaningful single-value summary; the chamber
+/// header falls back to the tool name alone.
+///
+/// Used by the chamber builder, which then left-truncates the
+/// value to fill the available banner width (right side carries
+/// the meaningful info for paths — filename — so we cut from the
+/// left, not the right).
+fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
     let obj = match args {
         serde_json::Value::Object(map) => map,
-        _ => return name.to_string(),
+        _ => return String::new(),
     };
-
-    // Determine which key(s) to show based on tool name
-    let primary_keys: &[&str] = match name {
-        "read" | "write" | "edit" | "list_dir" => &["path"],
-        "grep" => &["pattern", "path"],
-        "find_files" | "glob" => &["pattern"],
-        "bash" => &["command"],
-        "question" => &["questions"],
-        "task" | "task_status" => &["prompt", "task_id"],
-        "apply_patch" => &["operations"],
-        _ => &[],
+    let key = match name {
+        "read" | "write" | "edit" | "list_dir" | "apply_patch" => "path",
+        "grep" => "pattern",
+        "find_files" | "glob" => "pattern",
+        "bash" => "command",
+        "question" => "questions",
+        "task" => "prompt",
+        "task_status" => "task_id",
+        _ => return String::new(),
     };
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
 
-    let mut shown = Vec::new();
-    for key in primary_keys {
-        if let Some(serde_json::Value::String(val)) = obj.get(*key) {
-            let truncated = if val.len() > 60 {
-                format!("\"{}...\"", &val[..57])
-            } else {
-                format!("\"{}\"", val)
-            };
-            shown.push(truncated);
-        }
+/// Build the rounded-chamber top border, left-truncating `value`
+/// to fill the available width up to `─╮`. Layout:
+///
+///   `╭─ TOOL ─ "value" ─…─╮`
+///
+/// - When `value` fits, pad with extra `─` between the closing
+///   quote and `─╮` so the border is flush right.
+/// - When too long, take the LAST `N` chars and prefix with `…`
+///   (so filenames stay readable: paths put the filename on the
+///   right). Original PR used right-truncation, which was the
+///   wrong direction for paths.
+fn fit_banner_header(name_upper: &str, value: &str, frame_w: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    let prefix = format!("╭─ {} ─ ", name_upper);
+    let suffix = " ─╮";
+    let prefix_w = prefix.as_str().width();
+    let suffix_w = suffix.width();
+    // Reserve at least 1 cell for padding-or-truncation marker.
+    // If frame_w is so small that even the prefix+suffix don't
+    // fit, just emit the prefix + truncated tool name with no
+    // value (degraded but doesn't panic).
+    if value.is_empty() {
+        let used = prefix_w + suffix_w;
+        let pad = frame_w.saturating_sub(used);
+        return format!("{}{}{}", prefix, "─".repeat(pad), suffix);
+    }
+    // Budget for `"value"` (the value + 2 quote chars). The
+    // chamber needs room for at least the closing suffix; if
+    // even that doesn't fit, fall back to no-value.
+    let quote_w = 2;
+    let value_budget = frame_w.saturating_sub(prefix_w + suffix_w + quote_w);
+    if value_budget == 0 {
+        let used = prefix_w + suffix_w;
+        let pad = frame_w.saturating_sub(used);
+        return format!("{}{}{}", prefix, "─".repeat(pad), suffix);
     }
 
-    if shown.is_empty() {
-        // fallback: show first string value if any
-        if let Some((_, serde_json::Value::String(val))) = obj.iter().next() {
-            let truncated = if val.len() > 60 {
-                format!("\"{}...\"", &val[..57])
-            } else {
-                format!("\"{}\"", val)
-            };
-            format!("{} {}", name, truncated)
-        } else {
-            name.to_string()
-        }
+    let value_w = value.width();
+    let shown_value = if value_w <= value_budget {
+        value.to_string()
     } else {
-        format!("{} {}", name, shown.join(" "))
-    }
+        // Left-truncate: take the LAST chars that fit, prefixed
+        // with `…` (1 cell). Count by display width so emoji /
+        // CJK don't break the budget.
+        use unicode_width::UnicodeWidthChar;
+        let tail_budget = value_budget.saturating_sub(1); // 1 for `…`
+        // Walk the value from the END, accumulating chars until
+        // we've used `tail_budget` cells.
+        let mut tail: Vec<char> = Vec::new();
+        let mut used = 0;
+        for ch in value.chars().rev() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > tail_budget {
+                break;
+            }
+            tail.push(ch);
+            used += w;
+        }
+        tail.reverse();
+        let tail_str: String = tail.into_iter().collect();
+        format!("…{}", tail_str)
+    };
+
+    let shown_w = shown_value.as_str().width() + quote_w;
+    let total_used = prefix_w + shown_w + suffix_w;
+    let pad = frame_w.saturating_sub(total_used);
+    format!("{}\"{}\"{}{}", prefix, shown_value, "─".repeat(pad), suffix)
 }
 
 pub async fn run_interactive(
@@ -1625,10 +1679,6 @@ pub async fn run_interactive(
                         // width so it visually mates with the closing
                         // bottom border (matching btop's framed cards).
                         let upper = name.to_ascii_uppercase();
-                        let summary = format_tool_call_summary(&name, &args);
-                        let trimmed = summary
-                            .strip_prefix(&format!("{} ", name))
-                            .unwrap_or(&summary);
                         // Blank line BEFORE the chamber top so the eye
                         // has an anchor between dense prior output (a
                         // permission alert + "allowed ..." lines) and
@@ -1639,14 +1689,10 @@ pub async fn run_interactive(
                         // chamber's content rows stayed visible —
                         // looking like a "cut off at top" chamber.
                         renderer.write_line("", Color::White)?;
-                        let pre = format!("╭─ {} ─ {} ", upper, trimmed);
-                        let pre_clean = sanitize_output(&pre).into_string();
+                        let raw_value = format_tool_banner_value(&name, &args);
+                        let raw_value = sanitize_output(&raw_value).into_string();
                         let (frame_w, _) = chamber_widths(&renderer);
-                        let pre_len = pre_clean.chars().count();
-                        let dashes = frame_w
-                            .saturating_sub(pre_len + 1) // 1 for closing ╮
-                            .max(0);
-                        let header = format!("{}{}╮", pre_clean, "─".repeat(dashes));
+                        let header = fit_banner_header(&upper, &raw_value, frame_w);
                         renderer.write_line(&header, c_tool())?;
 
                         // Note: on-tool-start fires from HookedToolDyn now,
@@ -3455,6 +3501,94 @@ async fn run_shell_command(cmd: &str, sandbox: &Sandbox) -> anyhow::Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    /// Chamber banner fills the full frame width when the value fits.
+    /// Right border is flush at frame_w; no extra trailing whitespace.
+    #[test]
+    fn banner_short_value_pads_with_dashes_to_full_width() {
+        let header = fit_banner_header("READ", "/tmp/x", 60);
+        assert_eq!(
+            header.as_str().width(),
+            60,
+            "header should fill frame_w exactly: {:?}",
+            header,
+        );
+        assert!(header.starts_with("╭─ READ ─ \"/tmp/x\""));
+        assert!(header.ends_with("─╮"));
+    }
+
+    /// Banner left-truncates long paths so the filename (right side
+    /// of a path) stays visible. The prefix `…` signals truncation.
+    #[test]
+    fn banner_long_path_left_truncates_to_preserve_filename() {
+        let path = "/very/very/very/long/nested/path/to/some/file/named/important.clj";
+        let header = fit_banner_header("READ", path, 60);
+        assert_eq!(
+            header.as_str().width(),
+            60,
+            "header must still be exactly frame_w wide",
+        );
+        // Filename must be visible (right side of path was preserved).
+        assert!(
+            header.contains("important.clj"),
+            "filename should survive truncation: {:?}",
+            header,
+        );
+        // Truncation marker is present.
+        assert!(header.contains('…'), "expected `…` marker: {:?}", header);
+        // The `/very/very` head SHOULD be gone — that's the whole
+        // point of left-truncation.
+        assert!(
+            !header.contains("/very/very/very/long"),
+            "leading head should be truncated: {:?}",
+            header,
+        );
+    }
+
+    /// Empty value (e.g. tool with no banner-worthy arg) renders
+    /// just the prefix with dash fill — no empty quote pair.
+    #[test]
+    fn banner_empty_value_renders_just_prefix_and_dashes() {
+        let header = fit_banner_header("DONE", "", 50);
+        assert_eq!(header.as_str().width(), 50);
+        assert!(
+            !header.contains("\"\""),
+            "no empty quote pair: {:?}",
+            header
+        );
+        assert!(header.starts_with("╭─ DONE ─"));
+        assert!(header.ends_with("─╮"));
+    }
+
+    /// `format_tool_banner_value` picks the right key per tool.
+    #[test]
+    fn banner_value_picks_correct_key_per_tool() {
+        let args =
+            serde_json::json!({"path": "/p", "command": "ls", "pattern": "*.rs", "task_id": "t1"});
+        assert_eq!(format_tool_banner_value("read", &args), "/p");
+        assert_eq!(format_tool_banner_value("write", &args), "/p");
+        assert_eq!(format_tool_banner_value("edit", &args), "/p");
+        assert_eq!(format_tool_banner_value("bash", &args), "ls");
+        assert_eq!(format_tool_banner_value("grep", &args), "*.rs");
+        assert_eq!(format_tool_banner_value("glob", &args), "*.rs");
+        assert_eq!(format_tool_banner_value("task_status", &args), "t1");
+        // Unknown tool → empty (header degrades to prefix-only).
+        assert_eq!(format_tool_banner_value("mystery", &args), "");
+    }
+
+    /// Edge: very narrow frame_w that can't fit even one value
+    /// char. Must degrade gracefully without panicking; just emits
+    /// prefix + dashes + suffix.
+    #[test]
+    fn banner_handles_pathologically_narrow_frame() {
+        // Just enough for "╭─ X ─ " + " ─╮" + maybe nothing else.
+        let header = fit_banner_header("READ", "/some/path", 12);
+        // Don't pin the exact string — just make sure no panic and
+        // we got SOMETHING with the borders intact.
+        assert!(header.starts_with("╭"));
+        assert!(header.ends_with("╮"));
+    }
 
     // Partial assistant reply at abort time is preserved into the
     // session with a trailer marking the interruption, so the LLM

@@ -220,9 +220,22 @@ impl Tool for EditTool {
             cache.clear();
         }
 
-        let mut result = format!("Applied edit to {}", args.path);
-        if do_replace_all {
-            result.push_str(&format!(" ({} replacements)", match_positions.len()));
+        // Path lives in the chamber banner (`╭─ EDIT ─ "<path>" ─╮`),
+        // so don't repeat it. The diff block below is the meat;
+        // this first line is a compact summary.
+        let mut result = if do_replace_all {
+            format!("Applied edit ({} replacements)", match_positions.len())
+        } else {
+            "Applied edit".to_string()
+        };
+        // Mention the line delta when adding/removing lines so the
+        // LLM can confirm the size of change without re-reading
+        // the diff block.
+        let old_lines = args.old_text.lines().count();
+        let new_lines = args.new_text.lines().count();
+        let delta = new_lines as i64 - old_lines as i64;
+        if delta != 0 {
+            result.push_str(&format!(" ({:+} lines)", delta));
         }
 
         // Always emit a diff. The earlier 20-line cap was meant to
@@ -231,8 +244,8 @@ impl Tool for EditTool {
         // per side which covers the vast majority of real edits;
         // edits larger than that are likely refactors where the
         // "edit + diff" pattern isn't the right tool anyway.
-        let old_lines = args.old_text.lines().count();
-        let new_lines = args.new_text.lines().count();
+        // `old_lines` / `new_lines` already computed above for the
+        // delta summary.
         if old_lines <= 200 && new_lines <= 200 {
             result.push_str(&Self::show_diff(
                 &args.path,

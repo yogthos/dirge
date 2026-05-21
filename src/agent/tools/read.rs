@@ -162,9 +162,12 @@ impl Tool for ReadTool {
             .map(|(idx, line)| format!("{:>width$}: {}", idx + 1, line))
             .collect::<Vec<_>>()
             .join("\n");
+        // Path lives in the chamber banner (`╭─ READ ─ "<path>" ─╮`),
+        // so don't repeat it here — that was visible duplication.
+        // The first line inside the chamber is now a compact metadata
+        // summary, followed by a blank line and the excerpt.
         let info = format!(
-            "File: {} ({} lines total, showing lines {}-{})\n\n{}",
-            args.path,
+            "({} lines total, showing lines {}-{})\n\n{}",
             total_lines,
             offset + 1,
             end,
@@ -311,7 +314,7 @@ mod tests {
             .unwrap();
         let _ = std::fs::remove_file(&path);
 
-        // Body lines (after the "File: …" header + blank line).
+        // Body lines (after the metadata header + blank line).
         let body: Vec<&str> = out.lines().skip(2).collect();
         assert_eq!(body, vec!["1: first", "2: second"]);
         // No BOM byte anywhere in the output.
