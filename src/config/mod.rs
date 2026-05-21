@@ -123,12 +123,12 @@ pub struct Config {
     #[cfg(feature = "mcp")]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
+    /// ACP server config map when compiled with the `acp` feature.
+    /// Used by the editor-integration server; dirge's ACP transport
+    /// is stdio-only — the TCP / Unix-socket forms live here for
+    /// future expansion but are not honored today.
     #[cfg(feature = "acp")]
     pub acp_servers: Option<HashMap<String, AcpServerConfig>>,
-    #[cfg(feature = "acp")]
-    pub acp_host: Option<String>,
-    #[cfg(feature = "acp")]
-    pub acp_port: Option<u16>,
 }
 
 impl Config {

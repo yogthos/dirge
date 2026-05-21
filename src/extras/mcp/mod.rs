@@ -23,7 +23,16 @@ impl McpClientManager {
                     handles.push(handle);
                 }
                 Err(e) => {
+                    // ALSO emit to stderr so users running without
+                    // RUST_LOG / --verbose see that an MCP server
+                    // failed to register. Without this, configured
+                    // tools just silently never appear and the user
+                    // has no idea why.
                     tracing::warn!("Failed to connect to MCP server '{}': {e}", name);
+                    eprintln!(
+                        "warning: MCP server '{}' failed to connect: {}; its tools won't be available this session",
+                        name, e,
+                    );
                 }
             }
         }
@@ -54,7 +63,12 @@ impl McpClientManager {
                 Err(e) => {
                     tracing::warn!(
                         "Failed to list tools from MCP server '{}': {e}",
-                        server_name
+                        server_name,
+                    );
+                    eprintln!(
+                        "warning: MCP server '{}' connected but list_tools failed: {}; \
+                         its tools won't be available this session",
+                        server_name, e,
                     );
                 }
             }

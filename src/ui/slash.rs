@@ -1322,6 +1322,7 @@ pub async fn handle_slash(
                         "edit",
                         "grep",
                         "find_files",
+                        "glob",
                         "list_dir",
                         "write_todo_list",
                         "apply_patch",
@@ -1332,6 +1333,11 @@ pub async fn handle_slash(
                         "task",
                         "memory",
                         "skill",
+                        "list_symbols",
+                        "get_symbol_body",
+                        "find_definition",
+                        "find_callers",
+                        "find_callees",
                         "mcp_tool",
                     ];
                     if tool.is_empty() || pattern.is_empty() {

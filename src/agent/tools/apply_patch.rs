@@ -69,21 +69,52 @@ pub struct ApplyPatchArgs {
     pub operations: Vec<PatchOp>,
 }
 
-fn apply_create(path: &str, content: &str) -> Result<String, String> {
+/// Cap apply_patch read/write at 100 MiB. The tool isn't meant for
+/// binary blobs or generated artifacts; an LLM pointing it at a
+/// gigabyte file should fail fast rather than OOM the process.
+const MAX_APPLY_PATCH_BYTES: u64 = 100 * 1024 * 1024;
+
+async fn apply_create(path: &str, content: &str) -> Result<String, String> {
     let p = Path::new(path);
-    if p.exists() {
+    if tokio::fs::try_exists(p).await.unwrap_or(false) {
         return Err(format!("file already exists: {}", path));
     }
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
             .map_err(|e| format!("failed to create parent dir: {}", e))?;
     }
-    std::fs::write(p, content).map_err(|e| format!("write failed: {}", e))?;
+    if content.len() as u64 > MAX_APPLY_PATCH_BYTES {
+        return Err(format!(
+            "create content too large: {} bytes (cap {} bytes)",
+            content.len(),
+            MAX_APPLY_PATCH_BYTES,
+        ));
+    }
+    tokio::fs::write(p, content)
+        .await
+        .map_err(|e| format!("write failed: {}", e))?;
     Ok(format!("created {}", path))
 }
 
-fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, String> {
-    let original = std::fs::read_to_string(path).map_err(|e| format!("read failed: {}", e))?;
+async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, String> {
+    // Pre-check size before reading the file into memory. The
+    // metadata call is cheap (single stat); rejecting here avoids
+    // a multi-GB allocation in `read_to_string`.
+    if let Ok(meta) = tokio::fs::metadata(path).await
+        && meta.len() > MAX_APPLY_PATCH_BYTES
+    {
+        return Err(format!(
+            "file too large for apply_patch: {} bytes (cap {} bytes); use bash + sed/awk for huge files",
+            meta.len(),
+            MAX_APPLY_PATCH_BYTES,
+        ));
+    }
+    let original = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| format!("read failed: {}", e))?;
 
     // CRLF normalization to match `edit.rs`. The LLM almost always
     // generates `\n` in `old_text` even when the file is CRLF on
@@ -124,17 +155,23 @@ fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, St
     } else {
         updated_normalized
     };
-    std::fs::write(path, &to_write).map_err(|e| format!("write failed: {}", e))?;
+    tokio::fs::write(path, &to_write)
+        .await
+        .map_err(|e| format!("write failed: {}", e))?;
     Ok(format!("updated {}", path))
 }
 
-fn apply_delete(path: &str) -> Result<String, String> {
-    std::fs::remove_file(path).map_err(|e| format!("delete failed: {}", e))?;
+async fn apply_delete(path: &str) -> Result<String, String> {
+    tokio::fs::remove_file(path)
+        .await
+        .map_err(|e| format!("delete failed: {}", e))?;
     Ok(format!("deleted {}", path))
 }
 
-fn apply_rename(path: &str, new_path: &str) -> Result<String, String> {
-    std::fs::rename(path, new_path).map_err(|e| format!("rename failed: {}", e))?;
+async fn apply_rename(path: &str, new_path: &str) -> Result<String, String> {
+    tokio::fs::rename(path, new_path)
+        .await
+        .map_err(|e| format!("rename failed: {}", e))?;
     Ok(format!("renamed {} -> {}", path, new_path))
 }
 
@@ -299,14 +336,14 @@ impl Tool for ApplyPatchTool {
             }
 
             let result = match op {
-                PatchOp::Create { path, content } => apply_create(path, content),
+                PatchOp::Create { path, content } => apply_create(path, content).await,
                 PatchOp::Update {
                     path,
                     old_text,
                     new_text,
-                } => apply_update(path, old_text, new_text),
-                PatchOp::Delete { path } => apply_delete(path),
-                PatchOp::Rename { path, new_path } => apply_rename(path, new_path),
+                } => apply_update(path, old_text, new_text).await,
+                PatchOp::Delete { path } => apply_delete(path).await,
+                PatchOp::Rename { path, new_path } => apply_rename(path, new_path).await,
             };
 
             match result {
@@ -372,59 +409,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_and_read() {
+    #[tokio::test]
+    async fn test_create_and_read() {
         let tf = TestFile::new("create-test.txt");
-        let result = apply_create(&tf.path, "hello world");
+        let result = apply_create(&tf.path, "hello world").await;
         assert!(result.is_ok());
         let content = std::fs::read_to_string(&tf.path).unwrap();
         assert_eq!(content, "hello world");
     }
 
-    #[test]
-    fn test_create_existing_file_fails() {
+    #[tokio::test]
+    async fn test_create_existing_file_fails() {
         let tf = TestFile::new("create-exists.txt");
         std::fs::write(&tf.path, "existing").unwrap();
-        let result = apply_create(&tf.path, "new");
+        let result = apply_create(&tf.path, "new").await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_update_text() {
+    #[tokio::test]
+    async fn test_update_text() {
         let tf = TestFile::new("update-test.txt");
         std::fs::write(&tf.path, "before after").unwrap();
-        let result = apply_update(&tf.path, "before", "replaced");
+        let result = apply_update(&tf.path, "before", "replaced").await;
         assert!(result.is_ok());
         let content = std::fs::read_to_string(&tf.path).unwrap();
         assert_eq!(content, "replaced after");
     }
 
-    #[test]
-    fn test_update_text_not_found() {
+    #[tokio::test]
+    async fn test_update_text_not_found() {
         let tf = TestFile::new("update-notfound.txt");
         std::fs::write(&tf.path, "some content").unwrap();
-        let result = apply_update(&tf.path, "nonexistent", "replacement");
+        let result = apply_update(&tf.path, "nonexistent", "replacement").await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_delete_file() {
+    #[tokio::test]
+    async fn test_delete_file() {
         let tf = TestFile::new("delete-test.txt");
         std::fs::write(&tf.path, "to delete").unwrap();
         assert!(Path::new(&tf.path).exists());
-        let result = apply_delete(&tf.path);
+        let result = apply_delete(&tf.path).await;
         assert!(result.is_ok());
         assert!(!Path::new(&tf.path).exists());
     }
 
-    #[test]
-    fn test_rename_file() {
+    #[tokio::test]
+    async fn test_rename_file() {
         let src = TestFile::new("rename-src.txt");
         let dst = "/tmp/dirge-test-rename-dst.txt";
         let _ = std::fs::remove_file(dst);
         std::fs::write(&src.path, "rename me").unwrap();
 
-        let result = apply_rename(&src.path, dst);
+        let result = apply_rename(&src.path, dst).await;
         assert!(result.is_ok());
         assert!(!Path::new(&src.path).exists());
         assert!(Path::new(dst).exists());
@@ -450,11 +487,11 @@ mod tests {
     // ambiguous matches rather than silently replacing the first one. Without
     // this guard the agent could clobber wrong code in a file with repeated
     // boilerplate (use statements, similar function bodies, etc.).
-    #[test]
-    fn regression_update_rejects_multiple_matches() {
+    #[tokio::test]
+    async fn regression_update_rejects_multiple_matches() {
         let tf = TestFile::new("update-ambiguous.txt");
         std::fs::write(&tf.path, "foo bar foo baz foo").unwrap();
-        let result = apply_update(&tf.path, "foo", "qux");
+        let result = apply_update(&tf.path, "foo", "qux").await;
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(msg.contains("3 locations"), "got: {msg}");
@@ -568,25 +605,25 @@ mod tests {
     }
 
     // create_dir_all is called on the parent — confirms nested-path creates work.
-    #[test]
-    fn create_creates_parent_dirs() {
+    #[tokio::test]
+    async fn create_creates_parent_dirs() {
         let dir = std::env::temp_dir().join(format!("dirge-test-nested-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let nested = dir.join("a/b/c/file.txt");
         let path_str = nested.to_str().unwrap();
 
-        let result = apply_create(path_str, "deep content");
+        let result = apply_create(path_str, "deep content").await;
         assert!(result.is_ok());
         assert_eq!(std::fs::read_to_string(&nested).unwrap(), "deep content");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn delete_missing_file_returns_err() {
+    #[tokio::test]
+    async fn delete_missing_file_returns_err() {
         let path = format!("/tmp/dirge-test-delete-ghost-{}.txt", std::process::id());
         let _ = std::fs::remove_file(&path);
-        let result = apply_delete(&path);
+        let result = apply_delete(&path).await;
         assert!(result.is_err());
     }
 

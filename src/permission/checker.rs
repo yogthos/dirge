@@ -39,7 +39,22 @@ pub struct PermissionChecker {
 pub(crate) fn is_path_tool_name(tool: &str) -> bool {
     matches!(
         tool,
-        "read" | "write" | "edit" | "list_dir" | "apply_patch" | "lsp"
+        "read"
+            | "write"
+            | "edit"
+            | "list_dir"
+            | "apply_patch"
+            | "lsp"
+            // grep / find_files / glob now also receive path-side
+            // checks (the search-root path), so their rules use
+            // path-glob semantics.
+            | "grep"
+            | "find_files"
+            | "glob"
+            // Semantic tools whose primary arg is a file path.
+            | "list_symbols"
+            | "get_symbol_body"
+            | "find_callees"
     )
 }
 
@@ -74,6 +89,20 @@ impl PermissionChecker {
             ("apply_patch", &config.apply_patch),
             ("lsp", &config.lsp),
             ("question", &config.question),
+            // Newly-configurable tools (previously the perm checker
+            // had no rules for them, so they always fell through to
+            // the `*` default and couldn't be individually gated).
+            ("webfetch", &config.webfetch),
+            ("websearch", &config.websearch),
+            ("task", &config.task),
+            ("memory", &config.memory),
+            ("skill", &config.skill),
+            ("list_symbols", &config.list_symbols),
+            ("get_symbol_body", &config.get_symbol_body),
+            ("find_definition", &config.find_definition),
+            ("find_callers", &config.find_callers),
+            ("find_callees", &config.find_callees),
+            ("mcp_tool", &config.mcp_tool),
         ] {
             let Some(tp) = tool_perm else { continue };
             let mut entries = Vec::new();

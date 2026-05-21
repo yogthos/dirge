@@ -88,13 +88,23 @@ Accepted top-level keys:
 
 Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping glob-like patterns to actions.
-Supported permission tool keys are `bash`, `read`, `write`, `edit`, `grep`,
-`find_files`, `list_dir`, `write_todo_list`, `apply_patch`, `lsp`, and
-`question`. MCP-backed tools are checked under
-`mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the default action,
-`external_directory` for absolute-path rules outside the working directory,
-and `doom_loop` for repeated identical tool calls (default: `ask`). If
-`bash` is omitted, dirge installs its built-in safe bash allow/deny rules.
+Supported permission tool keys are:
+
+- File / shell: `bash`, `read`, `write`, `edit`, `grep`, `find_files`,
+  `list_dir`, `apply_patch`, `write_todo_list`
+- LSP / question: `lsp`, `question`
+- Web: `webfetch`, `websearch`
+- Subagent / state: `task`, `memory`, `skill`
+- Semantic (tree-sitter): `list_symbols`, `get_symbol_body`,
+  `find_definition`, `find_callers`, `find_callees`
+- MCP umbrella: `mcp_tool` — patterns match the full key
+  `mcp_tool:{server}:{tool}` so `{"mcp_tool:fs:*": "deny"}` blocks
+  every tool from a `fs` MCP server.
+
+Use `"*"` for the default action, `external_directory` for
+absolute-path rules outside the working directory, and `doom_loop`
+for repeated identical tool calls (default: `ask`). If `bash` is
+omitted, dirge installs its built-in safe bash allow/deny rules.
 
 ### Mode semantics
 

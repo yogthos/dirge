@@ -150,6 +150,20 @@ impl Tool for EditTool {
             }
         }
 
+        // Pre-check size before reading. The edit tool isn't meant
+        // for huge generated artifacts; cap at 100 MiB so an LLM
+        // pointing it at a gigabyte log file fails fast rather
+        // than OOM-ing the process. Matches the apply_patch cap.
+        const MAX_EDIT_BYTES: u64 = 100 * 1024 * 1024;
+        if let Ok(meta) = tokio::fs::metadata(&args.path).await
+            && meta.len() > MAX_EDIT_BYTES
+        {
+            return Err(ToolError::Msg(format!(
+                "file too large for edit: {} bytes (cap {} bytes); use bash with sed/awk for huge files",
+                meta.len(),
+                MAX_EDIT_BYTES,
+            )));
+        }
         let bytes = tokio::fs::read(&args.path).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
         let content = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
