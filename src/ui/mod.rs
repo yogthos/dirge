@@ -1668,6 +1668,13 @@ pub async fn run_interactive(
                         renderer.write_line("", Color::White)?;
                         renderer.write_line("", Color::White)?;
                         session.add_message(MessageRole::Assistant, &response);
+                        // TODO(cost-tracking): `tokens` here is the heuristic
+                        // estimate (text.len()/4) and `cost` is always 0.0 —
+                        // these accumulate into placeholder fields and won't
+                        // reflect actual provider usage / billing until we
+                        // pipe rig's `FinalResponse.usage()` through into
+                        // `AgentEvent::Done`. Kept as no-op-ish additions so
+                        // the wiring is in place when real values arrive.
                         session.total_tokens = session.total_tokens.saturating_add(tokens);
                         session.total_cost += cost;
                         agent_line_started = false;
@@ -1933,6 +1940,9 @@ pub async fn run_interactive(
                         // it had said when the user spoke up.
                         if !partial_response.is_empty() {
                             session.add_message(MessageRole::Assistant, &partial_response);
+                            // TODO(cost-tracking): same caveat as the Done
+                            // branch — `tokens` is an estimate, not actual
+                            // provider usage. Wire after rig usage plumbing.
                             session.total_tokens = session.total_tokens.saturating_add(tokens);
                         }
                         agent_line_started = false;

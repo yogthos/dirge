@@ -1658,14 +1658,38 @@ impl PluginManager {
 
         let mut results = Vec::new();
         for name in &names {
-            // Wrap the call in (try ... ([err] nil)) so plugin runtime
-            // errors don't print Janet stack traces to stderr.
+            // Wrap the call so plugin runtime errors don't print
+            // Janet stack traces to stderr OR vanish silently. On
+            // error, format the message as `DIRGE_HOOK_ERR:<msg>`
+            // so the Rust side can pick it out and emit a
+            // `tracing::warn!` (visible via RUST_LOG=warn).
+            //
+            // Prior behavior: pure `(try ... ([err fib] nil))` which
+            // swallowed errors entirely. Plugin authors got no
+            // feedback on broken hooks — strictly worse than both
+            // opencode (`log.error("plugin config hook failed", …)`
+            // in `packages/opencode/src/plugin/index.ts`) and pi
+            // (which emits structured `ExtensionError` events the
+            // host UI can render — see
+            // `packages/coding-agent/src/core/extensions/runner.ts`).
+            // dirge now mirrors opencode's behavior: log structured,
+            // continue dispatch.
             let code = format!(
-                r#"(try (do (def ctx {ctx}) ({fname} ctx)) ([err fib] nil))"#,
+                r#"(try (do (def ctx {ctx}) ({fname} ctx)) ([err fib] (string "DIRGE_HOOK_ERR:" err)))"#,
                 ctx = context_janet,
                 fname = name,
             );
             if let Ok(s) = self.eval(&code) {
+                if let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:") {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        hook = %hook,
+                        function = %name,
+                        error = %msg,
+                        "plugin hook errored — continuing dispatch",
+                    );
+                    continue;
+                }
                 // Janet nil -> skip
                 if s != "nil" && !s.is_empty() {
                     results.push(s);

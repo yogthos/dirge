@@ -127,6 +127,14 @@ pub struct Session {
     pub compactions: Vec<Compaction>,
     pub created_at: CompactString,
     pub updated_at: CompactString,
+    // TODO(cost-tracking): `total_tokens` and `total_cost` are placeholders.
+    // Currently `total_tokens` accumulates the same heuristic estimate that
+    // already lives in `total_estimated_tokens` (`AgentEvent::Done` emits
+    // estimated_tokens because no provider integration has been wired
+    // through rig to extract actual usage). `total_cost` is never advanced
+    // past 0.0 because no per-provider pricing table exists. Both fields
+    // serialize for forward-compat so when actual provider usage lands
+    // they can be populated without a schema bump.
     pub total_tokens: u64,
     pub total_cost: f64,
     pub total_estimated_tokens: u64,

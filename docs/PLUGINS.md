@@ -454,8 +454,29 @@ State persists for the life of the session — survives between turns.
 
 - **`harness/log`** writes to dirge's log file (not the chat). Use it
   freely.
-- **Janet errors** in a hook are caught and rendered as a chat error,
-  not a crash. The line/file should appear in the error message.
+- **Janet errors** in a hook are caught (so a broken hook can never
+  crash the host or block other plugins from dispatching), and the
+  error is emitted via the structured logger as a `warn`-level event
+  with target `dirge::plugin` so it shows up under
+  `RUST_LOG=dirge::plugin=warn dirge ...` or under the catch-all
+  `RUST_LOG=warn`. The error line/file from Janet's stack appears in
+  the message. The hook's return value is treated as `nil` (i.e. no
+  effect on the host) and dispatch continues to the next plugin.
+
+  **Why "log-and-continue" rather than "abort the turn"**: a single
+  misbehaving plugin shouldn't be able to wedge the user out of their
+  session. This matches how opencode handles plugin errors
+  (`log.error("plugin config hook failed", { error })` then
+  `Effect.ignore`). pi is a step further and emits a structured
+  `ExtensionError` event the host UI can render as a chat
+  notification — dirge stops short of that today (a plugin gets no
+  user-visible signal beyond the log) but the structured log payload
+  makes it straightforward to wire later.
+
+  **Implication for plugin authors**: if your hook isn't taking
+  effect, run dirge with `RUST_LOG=dirge::plugin=warn` and look for
+  `plugin hook errored — continuing dispatch` lines. Don't expect
+  the chat to surface plugin errors automatically.
 - **Hook didn't fire?** Double-check the function name matches the
   hook reference exactly — `on_prompt` (underscore) is a different
   symbol than `on-prompt`.
