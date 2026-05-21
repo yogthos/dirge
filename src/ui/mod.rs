@@ -376,8 +376,25 @@ fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
         serde_json::Value::Object(map) => map,
         _ => return String::new(),
     };
+    // `apply_patch` is structurally different: its arg is
+    // `operations: Vec<PatchOp>` (an array of ops, each with its
+    // own path), not a single string. Render "N ops" so the
+    // banner has content — degrading to bare "APPLY_PATCH" with
+    // dashes was uninformative.
+    if name == "apply_patch" {
+        let n = obj
+            .get("operations")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        return match n {
+            0 => String::new(),
+            1 => "1 op".to_string(),
+            _ => format!("{n} ops"),
+        };
+    }
     let key = match name {
-        "read" | "write" | "edit" | "list_dir" | "apply_patch" => "path",
+        "read" | "write" | "edit" | "list_dir" => "path",
         "grep" => "pattern",
         "find_files" | "glob" => "pattern",
         "bash" => "command",
@@ -3559,6 +3576,34 @@ mod tests {
         );
         assert!(header.starts_with("╭─ DONE ─"));
         assert!(header.ends_with("─╮"));
+    }
+
+    /// Self-review bug 1: `apply_patch` arg is `operations`
+    /// (array), not a single string. Previously fell through to
+    /// "path" lookup which returned empty, degrading the banner
+    /// to bare "APPLY_PATCH" with dashes. Now shows op count.
+    #[test]
+    fn banner_value_apply_patch_shows_op_count() {
+        let args = serde_json::json!({"operations": [{"action": "create", "path": "/a"}]});
+        assert_eq!(format_tool_banner_value("apply_patch", &args), "1 op");
+
+        let args = serde_json::json!({
+            "operations": [
+                {"action": "create", "path": "/a"},
+                {"action": "update", "path": "/b"},
+                {"action": "delete", "path": "/c"},
+            ],
+        });
+        assert_eq!(format_tool_banner_value("apply_patch", &args), "3 ops");
+
+        // Empty operations array → empty value (banner degrades
+        // gracefully to prefix + dashes + suffix).
+        let args = serde_json::json!({"operations": []});
+        assert_eq!(format_tool_banner_value("apply_patch", &args), "");
+
+        // Missing operations key → empty.
+        let args = serde_json::json!({});
+        assert_eq!(format_tool_banner_value("apply_patch", &args), "");
     }
 
     /// `format_tool_banner_value` picks the right key per tool.

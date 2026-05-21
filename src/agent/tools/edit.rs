@@ -230,12 +230,19 @@ impl Tool for EditTool {
         };
         // Mention the line delta when adding/removing lines so the
         // LLM can confirm the size of change without re-reading
-        // the diff block.
+        // the diff block. For replace_all the per-replacement
+        // delta multiplies by the number of replacements — the
+        // user wants the FILE delta, not the per-instance delta.
         let old_lines = args.old_text.lines().count();
         let new_lines = args.new_text.lines().count();
-        let delta = new_lines as i64 - old_lines as i64;
-        if delta != 0 {
-            result.push_str(&format!(" ({:+} lines)", delta));
+        let per_replacement_delta = new_lines as i64 - old_lines as i64;
+        let total_delta = if do_replace_all {
+            per_replacement_delta * (match_positions.len() as i64)
+        } else {
+            per_replacement_delta
+        };
+        if total_delta != 0 {
+            result.push_str(&format!(" ({:+} lines)", total_delta));
         }
 
         // Always emit a diff. The earlier 20-line cap was meant to

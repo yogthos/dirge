@@ -166,13 +166,31 @@ impl Tool for ReadTool {
         // so don't repeat it here — that was visible duplication.
         // The first line inside the chamber is now a compact metadata
         // summary, followed by a blank line and the excerpt.
-        let info = format!(
-            "({} lines total, showing lines {}-{})\n\n{}",
-            total_lines,
-            offset + 1,
-            end,
-            excerpt
-        );
+        //
+        // Edge cases:
+        // - Empty file (total_lines = 0): no useful range; just say
+        //   "(empty file)" without the showing-lines clause that
+        //   would otherwise render the nonsense "showing lines 1-0".
+        // - offset past EOF (`offset >= total_lines`): no lines
+        //   match; report that explicitly instead of showing the
+        //   backwards `X-(X-1)` range.
+        let info = if total_lines == 0 {
+            "(empty file)\n".to_string()
+        } else if offset >= total_lines {
+            format!(
+                "({} lines total; offset {} is past end of file — nothing to show)\n",
+                total_lines,
+                offset + 1,
+            )
+        } else {
+            format!(
+                "({} lines total, showing lines {}-{})\n\n{}",
+                total_lines,
+                offset + 1,
+                end,
+                excerpt
+            )
+        };
 
         if let Some(ref cache) = self.cache {
             cache.set(&cache_key, info.clone());
@@ -347,5 +365,63 @@ mod tests {
 
         // The mid-file BOM stays.
         assert!(out.contains('\u{FEFF}'));
+    }
+
+    /// Self-review bug: empty file used to render the nonsense
+    /// range `"(0 lines total, showing lines 1-0)"`. Now reports
+    /// `"(empty file)"` directly.
+    #[tokio::test]
+    async fn read_reports_empty_file_explicitly() {
+        let path = temp_path("empty");
+        std::fs::write(&path, "").unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            out.contains("(empty file)"),
+            "expected explicit empty marker; got: {out:?}",
+        );
+        assert!(
+            !out.contains("showing lines 1-0"),
+            "must NOT show the nonsense backwards range: {out:?}",
+        );
+    }
+
+    /// Self-review bug: offset past EOF used to render
+    /// `"showing lines 100-1"` (backwards). Now reports the past-
+    /// end condition explicitly.
+    #[tokio::test]
+    async fn read_reports_offset_past_eof_explicitly() {
+        let path = temp_path("short");
+        std::fs::write(&path, "only line\n").unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(100),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            out.contains("past end of file"),
+            "expected past-end marker; got: {out:?}",
+        );
+        assert!(
+            !out.contains("showing lines 100-1"),
+            "must NOT show backwards range: {out:?}",
+        );
     }
 }
