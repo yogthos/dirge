@@ -116,7 +116,12 @@ impl Tool for WebSearchTool {
     async fn call(&self, args: WebSearchArgs) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "websearch", &args.query).await?;
 
-        let client = reqwest::Client::new();
+        // Match webfetch's 15s timeout — without this, a hung Exa
+        // endpoint would stall the agent turn indefinitely.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| ToolError::Msg(format!("http client init failed: {e}")))?;
         let body = ExaRequest {
             query: &args.query,
             search_type: "auto",

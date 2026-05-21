@@ -65,6 +65,20 @@ impl Tool for WriteTodoList {
     async fn call(&self, args: TodoWriteArgs) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "write_todo_list", "").await?;
 
+        // Cap the todo list so a pathological agent can't bloat
+        // memory + every subsequent prompt by spamming hundreds of
+        // todos. 50 is generous for any reasonable plan; lists
+        // longer than that are usually a sign the agent should
+        // break the task into a separate plan/loop pass.
+        const MAX_TODOS: usize = 50;
+        if args.todos.len() > MAX_TODOS {
+            return Err(ToolError::Msg(format!(
+                "todo list too long ({} items); cap is {}. Trim the list or split the work across multiple turns.",
+                args.todos.len(),
+                MAX_TODOS,
+            )));
+        }
+
         let mut list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
         *list = args.todos;
 

@@ -14,6 +14,13 @@ pub static MODIFIED_FILES: LazyLock<Mutex<IndexSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(IndexSet::new()));
 
 /// Record that `path` was modified by a write/edit/apply_patch tool call.
+/// Maximum entries retained in the modified-files set. Older entries
+/// fall off when the cap is reached so a long session editing many
+/// files doesn't grow this set unboundedly. The panel only renders
+/// the last few entries anyway, so trimming older ones is invisible
+/// to the user.
+const MAX_MODIFIED: usize = 256;
+
 /// Best-effort canonicalize; falls back to the path as given when the file
 /// doesn't exist yet or canonicalize fails.
 pub fn mark_modified(path: &Path) {
@@ -22,6 +29,11 @@ pub fn mark_modified(path: &Path) {
     // IndexSet preserves insertion order and dedups; we want the most-recent
     // touch to surface at the end, so re-insert moves the entry.
     set.shift_remove(&canonical);
+    // Cap the set BEFORE inserting so we always have room for the
+    // freshest entry. Oldest (front) gets evicted.
+    while set.len() >= MAX_MODIFIED {
+        set.shift_remove_index(0);
+    }
     set.insert(canonical);
 }
 

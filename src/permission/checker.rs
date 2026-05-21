@@ -137,16 +137,24 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
-        let mut matched: Vec<Action> = Vec::new();
+        // Track both the action AND the matching pattern so denial
+        // messages can name which rule blocked the call (was just
+        // "Blocked by permission rules", giving the user no way to
+        // identify and edit the offending rule).
+        let mut matched: Vec<(Action, String)> = Vec::new();
         if let Some(rules) = self.rules.get(tool) {
             for (pattern, action) in rules {
                 if pattern.matches(input) {
-                    matched.push(*action);
+                    matched.push((*action, pattern.original.clone()));
                 }
             }
         }
 
-        let base = matched.last().copied().unwrap_or(self.default_action);
+        let base = matched
+            .last()
+            .map(|(a, _)| *a)
+            .unwrap_or(self.default_action);
+        let last_pat = matched.last().map(|(_, p)| p.clone());
         let action = match self.mode {
             SecurityMode::Restrictive => {
                 if matched.is_empty() && self.default_action == Action::Allow {
@@ -174,9 +182,20 @@ impl PermissionChecker {
             if self.is_doom_loop(tool, input) {
                 match self.doom_loop_action {
                     Action::Deny => {
-                        return CheckResult::Denied(
-                            "Doom loop: repeated identical tool call".to_string(),
-                        );
+                        // Name the call so the user can identify and
+                        // either fix the LLM's behavior or relax the
+                        // pattern.
+                        let preview: String = input.chars().take(60).collect();
+                        return CheckResult::Denied(format!(
+                            "Doom loop: repeated identical {} call ({}{})",
+                            tool,
+                            preview,
+                            if input.chars().count() > 60 {
+                                "…"
+                            } else {
+                                ""
+                            },
+                        ));
                     }
                     Action::Ask => return CheckResult::Ask,
                     Action::Allow => {}
@@ -187,7 +206,10 @@ impl PermissionChecker {
         match action {
             Action::Allow => CheckResult::Allowed,
             Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied("Blocked by permission rules".to_string()),
+            Action::Deny => CheckResult::Denied(match last_pat {
+                Some(pat) => format!("Blocked by rule: {tool} {pat:?} → deny"),
+                None => format!("Blocked: {tool} denied by default action"),
+            }),
         }
     }
 
@@ -201,16 +223,20 @@ impl PermissionChecker {
         }
 
         let abs_path = resolve_absolute(path, &self.working_dir);
-        let mut matched: Vec<Action> = Vec::new();
+        let mut matched: Vec<(Action, String)> = Vec::new();
         if let Some(rules) = self.rules.get(tool) {
             for (pattern, action) in rules {
                 if pattern.matches(&abs_path) || pattern.matches(path) {
-                    matched.push(*action);
+                    matched.push((*action, pattern.original.clone()));
                 }
             }
         }
 
-        let base = matched.last().copied().unwrap_or(self.default_action);
+        let base = matched
+            .last()
+            .map(|(a, _)| *a)
+            .unwrap_or(self.default_action);
+        let last_pat = matched.last().map(|(_, p)| p.clone());
         let action = match self.mode {
             SecurityMode::Restrictive => {
                 if matched.is_empty() && self.default_action == Action::Allow {
@@ -245,9 +271,13 @@ impl PermissionChecker {
             if self.is_doom_loop(tool, path) {
                 match self.doom_loop_action {
                     Action::Deny => {
-                        return CheckResult::Denied(
-                            "Doom loop: repeated identical tool call".to_string(),
-                        );
+                        let preview: String = path.chars().take(80).collect();
+                        return CheckResult::Denied(format!(
+                            "Doom loop: repeated identical {} call ({}{})",
+                            tool,
+                            preview,
+                            if path.chars().count() > 80 { "…" } else { "" },
+                        ));
                     }
                     Action::Ask => return CheckResult::Ask,
                     Action::Allow => {}
@@ -258,7 +288,10 @@ impl PermissionChecker {
         match action {
             Action::Allow => CheckResult::Allowed,
             Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied("Blocked by permission rules".to_string()),
+            Action::Deny => CheckResult::Denied(match last_pat {
+                Some(pat) => format!("Blocked by rule: {tool} {pat:?} → deny"),
+                None => format!("Blocked: {tool} denied by default action"),
+            }),
         }
     }
 

@@ -148,6 +148,18 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // was checked, so users couldn't set a default in config.json.
     if let Some(temp) = cli.resolve_temperature(cfg) {
         let clamped = temp.clamp(0.0, 2.0);
+        if (clamped - temp).abs() > f64::EPSILON {
+            // Warn ONCE per process if the user's value was clamped
+            // — previously silent, so a user with `temperature: 3.5`
+            // got 2.0 and never knew.
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if WARNED.set(()).is_ok() {
+                eprintln!(
+                    "warning: temperature {} clamped to {} (valid range 0.0..=2.0)",
+                    temp, clamped,
+                );
+            }
+        }
         builder = builder.temperature(clamped);
     }
 
