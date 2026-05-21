@@ -194,17 +194,18 @@ async fn check_bash_segments(
         // checked as a single string against the bash rules and might
         // squeak through if `safe_cmd && rm` doesn't match any deny.
         // Split on the unambiguous compound separators (`&&`, `;`,
-        // `||`) so each segment is checked individually. This won't
-        // catch command substitution or subshells — those need the
-        // tree-sitter feature for correct parsing — but it covers the
-        // common compound case.
-        let segments = command
-            .split(|c| c == ';')
-            .flat_map(|s| s.split("&&"))
-            .flat_map(|s| s.split("||"))
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<&str>>();
+        // `||`) so each segment is checked individually.
+        //
+        // F10: the splitter now respects shell quoting. The naive
+        // `command.split(";")` split inside quoted strings, so
+        // `echo "; rm -rf /"` produced segments `echo "` and
+        // `rm -rf /"` — the second matched the bash rule for `rm`
+        // and could trigger a deny that the user thought was safe.
+        // The fixed splitter walks character-by-character and only
+        // emits a boundary when not inside `'…'`, `"…"`, or after
+        // a backslash escape.
+        let segments = quote_aware_split(command);
+
         // Flag command substitution / subshell constructs that need a
         // full parser. Surface as one whole-command check so the user
         // sees the unfamiliar form before any segment runs.
@@ -219,6 +220,92 @@ async fn check_bash_segments(
             check_perm(permission, ask_tx, "bash", segment).await?;
         }
         Ok(())
+    }
+}
+
+/// Split a shell command on `;`, `&&`, `||` separators that appear
+/// OUTSIDE single quotes, double quotes, or backslash escapes.
+/// Used only on the no-`semantic-bash` build path — the
+/// tree-sitter path delegates to the real bash grammar in
+/// `semantic::adapters::bash` and doesn't need this.
+///
+/// Edge cases:
+/// - `echo "; rm"` → one segment (the `;` is quoted).
+/// - `echo 'a&&b'` → one segment.
+/// - `echo \; ls` → one segment (the `;` is escaped).
+/// - `cmd1; cmd2 && cmd3` → three segments, trimmed.
+/// - Empty / whitespace-only segments dropped.
+#[cfg_attr(feature = "semantic-bash", allow(dead_code))]
+fn quote_aware_split(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_backslash = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if prev_backslash {
+            prev_backslash = false;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' && !in_single {
+            // Inside single quotes, backslash is literal; otherwise it
+            // escapes the next byte.
+            prev_backslash = true;
+            i += 1;
+            continue;
+        }
+
+        if !in_double && b == b'\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && b == b'"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+
+        if !in_single && !in_double {
+            // Check for `&&` and `||` (2-byte) BEFORE single-byte `;`.
+            if i + 1 < bytes.len()
+                && ((b == b'&' && bytes[i + 1] == b'&') || (b == b'|' && bytes[i + 1] == b'|'))
+            {
+                push_segment(command, start, i, &mut segments);
+                i += 2;
+                start = i;
+                continue;
+            }
+            if b == b';' {
+                push_segment(command, start, i, &mut segments);
+                i += 1;
+                start = i;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    push_segment(command, start, bytes.len(), &mut segments);
+    segments
+}
+
+#[cfg_attr(feature = "semantic-bash", allow(dead_code))]
+fn push_segment<'a>(command: &'a str, start: usize, end: usize, out: &mut Vec<&'a str>) {
+    if end <= start {
+        return;
+    }
+    let s = command[start..end].trim();
+    if !s.is_empty() {
+        out.push(s);
     }
 }
 
@@ -274,5 +361,57 @@ mod tests {
         let out = run_with_timeout(cmd, 5).await.expect("should succeed");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(stdout.trim(), "hi");
+    }
+
+    /// F10: a `;` inside double quotes is part of the string, not a
+    /// segment boundary. Before this, the naive splitter produced
+    /// two segments, the second being `rm -rf /"`, which could
+    /// match a bash deny rule for `rm`.
+    #[test]
+    fn quote_aware_split_keeps_semi_in_double_quotes() {
+        let segments = quote_aware_split(r#"echo "; rm -rf /""#);
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].contains("rm -rf /"));
+    }
+
+    /// `&&` inside single quotes is literal too.
+    #[test]
+    fn quote_aware_split_keeps_compound_in_single_quotes() {
+        let segments = quote_aware_split("echo 'a && b'");
+        assert_eq!(segments.len(), 1);
+    }
+
+    /// Escaped `;` is literal — `echo \; ls` is ONE command in bash.
+    #[test]
+    fn quote_aware_split_respects_backslash_escape() {
+        let segments = quote_aware_split(r"echo \; ls");
+        assert_eq!(segments.len(), 1, "got: {:?}", segments);
+    }
+
+    /// Real compounds still split correctly into segments.
+    #[test]
+    fn quote_aware_split_splits_unquoted_compounds() {
+        let segments = quote_aware_split("cmd1 && cmd2; cmd3 || cmd4");
+        assert_eq!(segments.len(), 4);
+        assert_eq!(segments[0], "cmd1");
+        assert_eq!(segments[1], "cmd2");
+        assert_eq!(segments[2], "cmd3");
+        assert_eq!(segments[3], "cmd4");
+    }
+
+    /// Empty / whitespace-only segments dropped.
+    #[test]
+    fn quote_aware_split_drops_empty_segments() {
+        let segments = quote_aware_split(";; cmd ;");
+        assert_eq!(segments, vec!["cmd"]);
+    }
+
+    /// Mixed: quoted compound + unquoted compound.
+    #[test]
+    fn quote_aware_split_mixed_quoted_and_unquoted() {
+        let segments = quote_aware_split(r#"echo "a; b" ; ls"#);
+        assert_eq!(segments.len(), 2);
+        assert!(segments[0].contains("a; b"));
+        assert_eq!(segments[1], "ls");
     }
 }
