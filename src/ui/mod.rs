@@ -412,7 +412,7 @@ fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
 /// Build the rounded-chamber top border, left-truncating `value`
 /// to fill the available width up to `─╮`. Layout:
 ///
-///   `╭─ TOOL ─ "value" ─…─╮`
+///   `╭─ TOOL ─ "value"─…─╮`
 ///
 /// - When `value` fits, pad with extra `─` between the closing
 ///   quote and `─╮` so the border is flush right.
@@ -420,11 +420,15 @@ fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
 ///   (so filenames stay readable: paths put the filename on the
 ///   right). Original PR used right-truncation, which was the
 ///   wrong direction for paths.
+/// - The suffix is a tight `─╮` (no leading space) to match the
+///   chamber bottom's `╰────╯` solid-dash style. A previous
+///   version used ` ─╮` (leading space) which produced a visible
+///   gap `── ─╮` at the right edge that looked like a defect.
 fn fit_banner_header(name_upper: &str, value: &str, frame_w: usize) -> String {
     use unicode_width::UnicodeWidthStr;
 
     let prefix = format!("╭─ {} ─ ", name_upper);
-    let suffix = " ─╮";
+    let suffix = "─╮";
     let prefix_w = prefix.as_str().width();
     let suffix_w = suffix.width();
     // Reserve at least 1 cell for padding-or-truncation marker.
@@ -2420,11 +2424,20 @@ pub async fn run_interactive(
                     agent_line_started = false;
                 }
 
-                // If a tool chamber is open (the in-flight tool that
-                // triggered this permission check), close it first so
-                // the alert renders outside the chamber rather than
-                // nested inside it.
-                close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                // DON'T close the open tool chamber here. Previously
+                // we emitted a NO_OUTPUT close before the alert,
+                // which (a) misleadingly said "tool denied" before
+                // the user had answered and (b) produced a chamber
+                // with a top border and bottom border but no body
+                // when the user later ALLOWED the tool — the
+                // subsequent ToolResult rendered into a now-closed
+                // chamber, painting `│ … │` rows + `╰` with no `╭`.
+                //
+                // New flow: leave the chamber open while the alert
+                // displays inside its visual region. After the user
+                // answers: if denied, close the chamber WITH the
+                // "denied" message; if allowed, leave it open so
+                // the ToolResult populates it normally.
                 renderer.set_avatar_state(avatar::AvatarState::Alert);
                 // Force a bottom-row repaint so the avatar updates to
                 // the Alert face immediately, before the user reads
@@ -2547,7 +2560,16 @@ pub async fn run_interactive(
                     UserDecision::AllowAlways(p) => Some(p.clone()),
                     _ => None,
                 };
+                let was_denied = matches!(decision, UserDecision::Deny);
                 let _ = ask_req.reply.send(decision);
+
+                // If the user denied, the tool will never run and
+                // no ToolResult will arrive — close the in-flight
+                // chamber here with the "denied" marker. On allow,
+                // leave it open so the ToolResult fills it in.
+                if was_denied {
+                    close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                }
 
                 if let Some(pattern) = allow_pattern {
                     session.permission_allowlist.push(PermissionAllowEntry {
@@ -3533,6 +3555,28 @@ mod tests {
         );
         assert!(header.starts_with("╭─ READ ─ \"/tmp/x\""));
         assert!(header.ends_with("─╮"));
+    }
+
+    /// Regression: the suffix must be a tight `─╮` (no leading
+    /// space). The previous ` ─╮` form left a visible gap
+    /// `── ─╮` at the right edge that looked like the dash run
+    /// was broken. Solid dashes match the chamber bottom
+    /// (`╰────╯`) style.
+    #[test]
+    fn banner_has_no_internal_space_before_corner() {
+        let header = fit_banner_header("READ", "/short", 50);
+        // Strip the closing ╮ and check the char just before it
+        // is `─`, not ` `.
+        let mut chars: Vec<char> = header.chars().collect();
+        let last = chars.pop();
+        assert_eq!(last, Some('╮'));
+        let second_last = chars.pop();
+        assert_eq!(
+            second_last,
+            Some('─'),
+            "char before closing ╮ must be `─`, not space; got {:?}",
+            second_last,
+        );
     }
 
     /// Banner left-truncates long paths so the filename (right side
