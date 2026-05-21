@@ -74,7 +74,30 @@ impl ToolDyn for McpTool {
                 .await
                 .map_err(|e| ToolError::ToolCallError(Box::new(McpToolError(e.to_string()))))?;
 
-            let arguments: Option<JsonObject> = serde_json::from_str(&args).unwrap_or_default();
+            // Malformed JSON used to silently default to `None` via
+            // `unwrap_or_default()` — the MCP server got an empty
+            // argument set and the agent saw a confusing "missing
+            // required field" error from the server instead of a
+            // dirge-side parse error. Surface the parse failure
+            // distinctly so the agent can fix its tool call.
+            //
+            // Empty / whitespace-only args is treated as the explicit
+            // no-arguments case (matches rig's default tool-call
+            // shape when the LLM omits the arguments object).
+            let trimmed = args.trim();
+            let arguments: Option<JsonObject> = if trimmed.is_empty() {
+                None
+            } else {
+                match serde_json::from_str::<JsonObject>(trimmed) {
+                    Ok(obj) => Some(obj),
+                    Err(e) => {
+                        return Err(ToolError::ToolCallError(Box::new(McpToolError(format!(
+                            "MCP tool {}::{}: malformed JSON arguments ({e}). Got: {trimmed:.200}",
+                            server_name, tool_name,
+                        )))));
+                    }
+                }
+            };
             let params = arguments
                 .map(|a| CallToolRequestParams::new(tool_name.clone()).with_arguments(a))
                 .unwrap_or_else(|| CallToolRequestParams::new(tool_name.clone()));

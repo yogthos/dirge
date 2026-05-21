@@ -1152,17 +1152,35 @@ impl Renderer {
         let d = &self.panel_data;
         let mut out: Vec<(String, Color)> = Vec::new();
 
+        // Display-width-aware truncation: `chars().count()` mis-
+        // sizes wide emoji and CJK by half. The panel previously
+        // miscounted, so a status line like `cwd: 📦 /path` ended
+        // up overflowing the right border by one cell.
+        use unicode_width::UnicodeWidthStr;
         let truncate = |s: &str, w: usize| -> String {
-            let cc = s.chars().count();
-            if cc <= w {
-                s.to_string()
-            } else if w <= 1 {
-                "…".to_string()
-            } else {
-                let mut t: String = s.chars().take(w - 1).collect();
-                t.push('…');
-                t
+            let dw = UnicodeWidthStr::width(s);
+            if dw <= w {
+                return s.to_string();
             }
+            if w <= 1 {
+                return "…".to_string();
+            }
+            // Walk chars accumulating display width until adding
+            // the next one would exceed `w-1` (reserving 1 cell
+            // for the ellipsis).
+            use unicode_width::UnicodeWidthChar;
+            let mut out = String::new();
+            let mut used = 0usize;
+            for ch in s.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if used + cw > w - 1 {
+                    break;
+                }
+                out.push(ch);
+                used += cw;
+            }
+            out.push('…');
+            out
         };
 
         // Top padding rows. Same reasoning as the chat banner — without
@@ -1181,7 +1199,9 @@ impl Renderer {
         // that overflows so the pill stays a perfect rectangle.
         let row = |text: &str| -> String {
             let trimmed = truncate(text, inner);
-            let len = trimmed.chars().count();
+            // Pad by display width too, otherwise an emoji-bearing
+            // row left a 1-cell gap before the right border.
+            let len = UnicodeWidthStr::width(trimmed.as_str());
             let pad = inner.saturating_sub(len);
             format!("│{}{}│", trimmed, " ".repeat(pad))
         };

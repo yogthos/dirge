@@ -166,7 +166,14 @@ impl PythonAdapter {
                     if let Some(node) = func_node {
                         if let Some(name_node) = node.child_by_field_name("name") {
                             let name = self.node_text(name_node, source).to_string();
-                            let is_exported = !name.starts_with('_');
+                            // Dunder methods (`__init__`, `__call__`, `__repr__`, …)
+                            // are part of Python's public protocol; they look
+                            // "private" by the leading-underscore heuristic but
+                            // are externally callable. Treat them as exported.
+                            // Single-underscore names (`_helper`, `_internal`)
+                            // stay non-exported.
+                            let is_dunder = name.starts_with("__") && name.ends_with("__");
+                            let is_exported = is_dunder || !name.starts_with('_');
                             let range = self.make_range(child);
                             let signature = self.signature_from_node(node, source);
                             symbols.push(Symbol {

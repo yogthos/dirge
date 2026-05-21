@@ -342,7 +342,7 @@ fn quote_aware_split(command: &str) -> Vec<&str> {
         }
 
         if !in_single && !in_double {
-            // Check for `&&` and `||` (2-byte) BEFORE single-byte `;`.
+            // Check for `&&` and `||` (2-byte) BEFORE single-byte `;`/`|`.
             if i + 1 < bytes.len()
                 && ((b == b'&' && bytes[i + 1] == b'&') || (b == b'|' && bytes[i + 1] == b'|'))
             {
@@ -352,6 +352,18 @@ fn quote_aware_split(command: &str) -> Vec<&str> {
                 continue;
             }
             if b == b';' {
+                push_segment(command, start, i, &mut segments);
+                i += 1;
+                start = i;
+                continue;
+            }
+            // Pipe `|` (single-byte) — must be checked AFTER `||`
+            // above. Without this, a command like `safe_cmd | rm
+            // -rf /` was treated as one segment and only `safe_cmd`'s
+            // permission rule applied; the destructive RHS rode in
+            // unchecked. The semantic-bash tree-sitter path correctly
+            // splits pipelines; this fallback didn't.
+            if b == b'|' {
                 push_segment(command, start, i, &mut segments);
                 i += 1;
                 start = i;
@@ -499,6 +511,28 @@ mod tests {
         assert_eq!(segments[1], "cmd2");
         assert_eq!(segments[2], "cmd3");
         assert_eq!(segments[3], "cmd4");
+    }
+
+    /// Regression: bare `|` pipes must split into segments. Before
+    /// this, a command like `safe_cmd | rm -rf /` was treated as
+    /// one unit and only `safe_cmd`'s permission rule applied.
+    #[test]
+    fn quote_aware_split_splits_on_bare_pipe() {
+        let segments = quote_aware_split("safe_cmd | rm -rf /tmp/x");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].trim(), "safe_cmd");
+        assert_eq!(segments[1].trim(), "rm -rf /tmp/x");
+    }
+
+    /// `||` must NOT also match the single-`|` arm (already covered
+    /// by the existing `||` test, but pin the interaction here too).
+    #[test]
+    fn quote_aware_split_or_and_pipe_distinct() {
+        let segments = quote_aware_split("a || b | c");
+        assert_eq!(segments.len(), 3, "got {segments:?}");
+        assert_eq!(segments[0].trim(), "a");
+        assert_eq!(segments[1].trim(), "b");
+        assert_eq!(segments[2].trim(), "c");
     }
 
     /// Empty / whitespace-only segments dropped.

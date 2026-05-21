@@ -738,7 +738,16 @@ pub async fn handle_slash(
                     renderer.write_line("", c_agent())?;
                     renderer.write_line("usage: /prompt <name>  |  /prompt default", c_result())?;
                 }
-            } else if parts[1] == "default" {
+            } else if parts[1] == "default" && !context.prompts.contains_key("default") {
+                // Backstop: if there's no `default` prompt file
+                // present (e.g. the user deleted it), preserve the
+                // legacy "clear back to no active prompt" behavior
+                // by accepting `/prompt default` as a clear keyword.
+                // When a `default` prompt IS registered (which is
+                // the README-documented case — `prompts/default.md`
+                // ships in dirge), this branch is skipped and the
+                // normal "activate by name" path below picks it up,
+                // matching user expectation.
                 if context.current_prompt.is_none() {
                     renderer.write_line("no active prompt to clear", c_agent())?;
                 } else {
@@ -1301,9 +1310,42 @@ pub async fn handle_slash(
                     let mut it = rest.splitn(2, char::is_whitespace);
                     let tool = it.next().unwrap_or("");
                     let pattern = it.next().unwrap_or("").trim();
+                    // Whitelist accepted tool names so a typo
+                    // (`/allow add bsah ...`) doesn't silently
+                    // create a permanently-inert rule the user
+                    // can't figure out. Matches the schema used
+                    // by `PermissionConfig`.
+                    const KNOWN_PERM_TOOLS: &[&str] = &[
+                        "bash",
+                        "read",
+                        "write",
+                        "edit",
+                        "grep",
+                        "find_files",
+                        "list_dir",
+                        "write_todo_list",
+                        "apply_patch",
+                        "lsp",
+                        "question",
+                        "webfetch",
+                        "websearch",
+                        "task",
+                        "memory",
+                        "skill",
+                        "mcp_tool",
+                    ];
                     if tool.is_empty() || pattern.is_empty() {
                         renderer.write_line(
                             "usage: /allow add <tool> <pattern>  (e.g. /allow add bash 'cargo *')",
+                            c_error(),
+                        )?;
+                    } else if !KNOWN_PERM_TOOLS.contains(&tool) {
+                        renderer.write_line(
+                            &format!(
+                                "unknown tool {:?}. Valid: {}",
+                                tool,
+                                KNOWN_PERM_TOOLS.join(", "),
+                            ),
                             c_error(),
                         )?;
                     } else {

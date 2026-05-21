@@ -60,7 +60,14 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
                 }
                 if let Ok(content) = std::fs::read_to_string(&skill_md) {
                     if let Some(skill) = parse_skill(&content, &path) {
-                        map.entry(skill.name.clone()).or_insert(skill);
+                        // README contract: "Project skills override
+                        // global skills by name." Globals are iterated
+                        // first (line 34), so use `insert` (last-write-
+                        // wins) — `or_insert` kept the global value
+                        // and silently dropped the project override.
+                        if !skill.name.is_empty() {
+                            map.insert(skill.name.clone(), skill);
+                        }
                     }
                 }
             }
@@ -105,6 +112,16 @@ fn parse_skill(content: &str, dir_path: &Path) -> Option<Skill> {
         (dir_name.to_string(), String::new())
     } else {
         parse_frontmatter(&frontmatter, dir_name)
+    };
+
+    // A frontmatter `name:` with an empty value would parse to "" and
+    // then any subsequent `skill <empty>` call would silently match
+    // the first such entry. Fall back to the directory name in that
+    // case so every skill has a usable handle.
+    let name = if name.trim().is_empty() {
+        dir_name.to_string()
+    } else {
+        name
     };
 
     Some(Skill {

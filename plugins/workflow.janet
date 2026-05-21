@@ -2,8 +2,19 @@
 # Drives architect → implementor → review phases automatically
 # Inversion of control: harness drives the model, not vice versa
 
-# Declare which hooks this plugin subscribes to
-(def hooks ["on-init" "on-prompt" "on-response" "on-tool-start"])
+# Declare which hooks this plugin subscribes to. The `workflow-on-*`
+# functions below are auto-aliased from these bare names (e.g.
+# "on-init" → `workflow-on-init`). The earlier version of this
+# plugin only listed four hooks, so `workflow-on-tool-end`,
+# `workflow-on-error`, and `workflow-on-complete` were defined but
+# never dispatched.
+(def hooks ["on-init"
+            "on-prompt"
+            "on-response"
+            "on-tool-start"
+            "on-tool-end"
+            "on-error"
+            "on-complete"])
 
 (var phase :idle)
 

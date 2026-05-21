@@ -183,6 +183,18 @@ impl Tool for GrepTool {
 
             let path_str = entry.path().to_string_lossy().to_string();
 
+            // Skip files larger than 10 MiB so a single huge file
+            // can't blow up the process memory. Anything bigger
+            // than this is realistically not source code the LLM
+            // would want grepped. `tokio::fs::read` previously
+            // pulled the whole file into RAM unconditionally.
+            const MAX_GREP_FILE_BYTES: u64 = 10 * 1024 * 1024;
+            if let Ok(meta) = tokio::fs::metadata(entry.path()).await
+                && meta.len() > MAX_GREP_FILE_BYTES
+            {
+                continue;
+            }
+
             match tokio::fs::read(entry.path()).await {
                 Ok(data) => {
                     if Self::is_binary(&data) {
