@@ -122,7 +122,13 @@ pub async fn handle_compress(
         .map(|m| m.estimated_tokens)
         .sum();
 
-    session.compress(summary, cut_idx, tokens_before);
+    // `compress_reporting` returns the count of non-active-path
+    // tree nodes (sibling branches) pruned. We notify the user
+    // about that loss explicitly — without the notification a
+    // branched session could silently lose forks during auto-
+    // compaction. opencode (`session/compaction.ts:386-396`) drops
+    // siblings silently; dirge prefers the explicit notification.
+    let pruned_branches = session.compress_reporting(summary, cut_idx, tokens_before);
 
     let model = client.completion_model(session.model.to_string());
     *agent = crate::provider::build_agent(
@@ -147,6 +153,19 @@ pub async fn handle_compress(
     renderer.write_line("prompt cleared (back to default behavior)", c_agent())?;
 
     render_session(renderer, session, cli, cfg, context)?;
+    if pruned_branches > 0 {
+        // Tell the user the branched topology shrunk. Without this,
+        // they'd notice missing forks in `/tree` without any
+        // explanation.
+        renderer.write_line(
+            &format!(
+                "discarded {} forked branch node{} that were rooted in the compressed region",
+                pruned_branches,
+                if pruned_branches == 1 { "" } else { "s" },
+            ),
+            c_error(),
+        )?;
+    }
     renderer.write_line(
         &format!(
             "compressed {} messages (saved ~{} tokens)",

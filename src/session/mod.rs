@@ -550,7 +550,30 @@ impl Session {
         }
     }
 
+    /// Legacy wrapper retained for tests that don't care about the
+    /// pruned-siblings count. New callers should use
+    /// `compress_reporting` to surface a "discarded N branches"
+    /// notification to the user when sibling subtrees are dropped.
+    #[cfg(test)]
     pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
+        let _ = self.compress_reporting(summary, first_kept_index, token_savings);
+    }
+
+    /// Same as `compress` but returns the number of NON-active-path
+    /// nodes that were pruned from the tree because their ancestor
+    /// chain rooted at a dropped message. Active-path message drops
+    /// aren't counted — they're expected and already visible to the
+    /// user as the conversation history shrinking. The host uses this
+    /// count to surface a "discarded N forked branches" notification
+    /// (matches opencode's drop-with-truncation pattern from
+    /// `session/compaction.ts:386-396` — sibling branches outside the
+    /// preserved tail are gone, full stop).
+    pub fn compress_reporting(
+        &mut self,
+        summary: String,
+        first_kept_index: usize,
+        token_savings: u64,
+    ) -> usize {
         // Bounds check — callers compute `first_kept_index` from a
         // reverse-scan of `messages` so it should always be in range,
         // but a buggy/racy caller could pass out-of-bounds. Clamp
@@ -593,7 +616,63 @@ impl Session {
         // the new summary node as the new root, and re-parent the
         // first kept node to point at the summary.
         self.ensure_back_compat_initialized();
-        for id in &dropped_ids {
+
+        // Sibling-branch prune (Phase 2). When a dropped message has
+        // children that live in a forked sibling branch (not on the
+        // active path), those children — and their descendants —
+        // would be left with a `parent` pointing at a removed id.
+        // Walk the tree and add all such descendants to the prune
+        // set, then drop the union from tree + store. Tracks the
+        // count of NON-active-path nodes removed so the host can
+        // notify the user.
+        //
+        // Active-path messages (the ones still in `self.messages`
+        // after drain + summary insert) are EXCLUDED from the
+        // prune set — they'd otherwise get caught because the new
+        // first-kept message's parent is still pointing at a dropped
+        // id at this point in the function. The re-parent to summary
+        // happens further below.
+        let active_ids: std::collections::HashSet<CompactString> =
+            self.messages.iter().map(|m| m.id.clone()).collect();
+
+        // Algorithm: fixed-point iteration. Start with the directly-
+        // dropped ids. For each pass, find any tree entry whose
+        // parent is in the prune set AND which is not on the active
+        // path, then add it. Repeat until a pass adds nothing.
+        // O(N * K) worst case where K = avg branch depth; typically
+        // tiny in practice.
+        let mut to_prune: std::collections::HashSet<CompactString> = dropped_set.clone();
+        loop {
+            let new_ids: Vec<CompactString> = self
+                .tree
+                .entries
+                .iter()
+                .filter(|(id, node)| {
+                    !to_prune.contains(id.as_str())
+                        && !active_ids.contains(id.as_str())
+                        && node
+                            .parent
+                            .as_ref()
+                            .map(|p| to_prune.contains(p))
+                            .unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if new_ids.is_empty() {
+                break;
+            }
+            for id in new_ids {
+                to_prune.insert(id);
+            }
+        }
+
+        // Count of pruned nodes that were NOT on the active-path
+        // (the dropped messages). Active drops are visible to the
+        // user as the chat shrinking; sibling drops are silent
+        // without a notification, hence the count.
+        let sibling_pruned_count = to_prune.len().saturating_sub(dropped_set.len());
+
+        for id in &to_prune {
             self.tree.entries.remove(id);
             self.message_store.remove(id);
         }
@@ -653,6 +732,7 @@ impl Session {
         });
 
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        sibling_pruned_count
     }
 }
 
@@ -1161,6 +1241,103 @@ mod tests {
         // One more pop attempt → refused.
         assert!(s.pop_last_message().is_none());
         assert_eq!(s.messages.len(), 1);
+    }
+
+    /// Phase 2 — compress drops a parent that has a sibling branch
+    /// underneath. The sibling subtree must also be pruned;
+    /// otherwise its nodes have `parent` pointing at a removed id
+    /// and the tree is dangling. Returns the count of pruned
+    /// non-active nodes so the host can surface a "discarded N
+    /// branches" notification.
+    #[test]
+    fn compress_prunes_sibling_branches_rooted_at_dropped_messages() {
+        let mut s = Session::new("p", "m", 0);
+        // Linear active branch: u1 → a1 → u2 → a2.
+        s.add_message(MessageRole::User, "u1");
+        let u1_id = s.messages.last().unwrap().id.clone();
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "u2");
+        s.add_message(MessageRole::Assistant, "a2");
+        // Manually graft a sibling branch under u1: sib1 (child of
+        // u1) → sib2 (child of sib1). These live in tree.entries +
+        // message_store but NOT in `messages` (different branch).
+        let sib1_id = CompactString::new("sib1");
+        let sib2_id = CompactString::new("sib2");
+        s.tree.entries.insert(
+            sib1_id.clone(),
+            TreeNode {
+                id: sib1_id.clone(),
+                parent: Some(u1_id.clone()),
+                timestamp: 0,
+                label: None,
+            },
+        );
+        s.tree.entries.insert(
+            sib2_id.clone(),
+            TreeNode {
+                id: sib2_id.clone(),
+                parent: Some(sib1_id.clone()),
+                timestamp: 0,
+                label: None,
+            },
+        );
+        s.message_store.insert(
+            sib1_id.clone(),
+            SessionMessage {
+                role: MessageRole::Assistant,
+                content: CompactString::from("sib1"),
+                estimated_tokens: 1,
+                id: sib1_id.clone(),
+                timestamp: 0,
+            },
+        );
+        s.message_store.insert(
+            sib2_id.clone(),
+            SessionMessage {
+                role: MessageRole::Assistant,
+                content: CompactString::from("sib2"),
+                estimated_tokens: 1,
+                id: sib2_id.clone(),
+                timestamp: 0,
+            },
+        );
+
+        // Compress drops u1+a1 (first 2 messages). Sibling branch
+        // is rooted at u1 (a dropped id), so sib1 + sib2 must be
+        // pruned from tree + store along with the dropped messages.
+        let pruned = s.compress_reporting("summary".to_string(), 2, 10);
+
+        // u1, a1 (linear), sib1, sib2 (sibling) all gone from tree.
+        assert!(!s.tree.entries.contains_key(&u1_id), "u1 still in tree");
+        assert!(!s.tree.entries.contains_key(&sib1_id), "sib1 still in tree");
+        assert!(!s.tree.entries.contains_key(&sib2_id), "sib2 still in tree");
+        assert!(
+            !s.message_store.contains_key(&sib1_id),
+            "sib1 still in store",
+        );
+        assert!(
+            !s.message_store.contains_key(&sib2_id),
+            "sib2 still in store",
+        );
+
+        // Report: 2 sibling branch nodes were pruned (sib1, sib2).
+        // The linear u1+a1 drops aren't counted as "branches" since
+        // they were on the active path.
+        assert_eq!(pruned, 2, "expected 2 sibling nodes pruned, got {pruned}",);
+    }
+
+    /// When compress drops messages but there are NO sibling branches,
+    /// the report says 0 sibling nodes pruned. Confirms the counter
+    /// isn't accidentally counting active-path nodes.
+    #[test]
+    fn compress_reports_zero_pruned_when_no_siblings() {
+        let mut s = Session::new("p", "m", 0);
+        s.add_message(MessageRole::User, "u1");
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "u2");
+        s.add_message(MessageRole::Assistant, "a2");
+        let pruned = s.compress_reporting("summary".to_string(), 2, 10);
+        assert_eq!(pruned, 0);
     }
 
     /// When given a parent session id, `reset_to_new` records it

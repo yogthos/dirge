@@ -3230,16 +3230,60 @@ fn rewind_session(
             .map(|m| m.id.clone())
             .collect();
         session.messages.truncate(msg_idx);
-        for id in &dropped_ids {
+
+        // Sibling-branch prune (Phase 2). Same logic as compress —
+        // walk descendants of dropped ids and remove any forked
+        // subtrees rooted on them. Active-path messages (still in
+        // `session.messages` after truncate) are excluded.
+        let dropped_set: std::collections::HashSet<_> = dropped_ids.iter().cloned().collect();
+        let active_ids: std::collections::HashSet<_> =
+            session.messages.iter().map(|m| m.id.clone()).collect();
+        let mut to_prune = dropped_set.clone();
+        loop {
+            let new_ids: Vec<_> = session
+                .tree
+                .entries
+                .iter()
+                .filter(|(id, node)| {
+                    !to_prune.contains(*id)
+                        && !active_ids.contains(*id)
+                        && node
+                            .parent
+                            .as_ref()
+                            .map(|p| to_prune.contains(p))
+                            .unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if new_ids.is_empty() {
+                break;
+            }
+            for id in new_ids {
+                to_prune.insert(id);
+            }
+        }
+        let pruned_siblings = to_prune.len().saturating_sub(dropped_set.len());
+        for id in &to_prune {
             session.tree.entries.remove(id);
             session.message_store.remove(id);
         }
+
         // Re-anchor `leaf_id` to the new tail (or None if everything
         // was dropped). Previously the leaf was left pointing at a
         // dropped id, which made `/tree` show a phantom branch.
         session.tree.leaf_id = session.messages.last().map(|m| m.id.clone());
         session.total_estimated_tokens = session.messages.iter().map(|m| m.estimated_tokens).sum();
         renderer.write_line(&format!("rewound {} message(s)", removed), theme::accent())?;
+        if pruned_siblings > 0 {
+            renderer.write_line(
+                &format!(
+                    "discarded {} forked branch node{} rooted in the rewound region",
+                    pruned_siblings,
+                    if pruned_siblings == 1 { "" } else { "s" },
+                ),
+                c_error(),
+            )?;
+        }
     }
     Ok(())
 }
