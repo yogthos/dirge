@@ -1,5 +1,7 @@
 # dirge roadmap
 
+theme color styles as json
+
 Forward-looking work organized into phases. Each phase is a self-
 contained PR/series with TDD coverage, scoped to ship independently.
 Gaps below were identified by comparing dirge to

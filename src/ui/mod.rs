@@ -425,9 +425,39 @@ fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
 ///   version used ` ─╮` (leading space) which produced a visible
 ///   gap `── ─╮` at the right edge that looked like a defect.
 fn fit_banner_header(name_upper: &str, value: &str, frame_w: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
     use unicode_width::UnicodeWidthStr;
 
-    let prefix = format!("╭─ {} ─ ", name_upper);
+    // Cap the tool name so a pathological long name
+    // (e.g. `mcp_tool:long_server:long_function`) doesn't push
+    // the prefix past `frame_w` and overflow the chamber. Reserve
+    // enough room for the surrounding `╭─ ` + ` ─ ` + suffix +
+    // 2 quote chars + at least 1 cell of value. If the name itself
+    // is too long, left-truncate with `…` so the part closest to
+    // the colon-separated suffix (typically the function name)
+    // survives — same rationale as path truncation.
+    const FRAME_OVERHEAD: usize = 8; // "╭─ " (3) + " ─ " (3) + "─╮" (2)
+    let name_budget = frame_w.saturating_sub(FRAME_OVERHEAD + 3); // 3 = quotes + 1 value cell
+    let name_w = name_upper.width();
+    let displayed_name: String = if name_w <= name_budget || name_budget == 0 {
+        name_upper.to_string()
+    } else {
+        let tail_budget = name_budget.saturating_sub(1); // for `…`
+        let mut tail: Vec<char> = Vec::new();
+        let mut used = 0;
+        for ch in name_upper.chars().rev() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > tail_budget {
+                break;
+            }
+            tail.push(ch);
+            used += w;
+        }
+        tail.reverse();
+        format!("…{}", tail.into_iter().collect::<String>())
+    };
+
+    let prefix = format!("╭─ {} ─ ", displayed_name);
     let suffix = "─╮";
     let prefix_w = prefix.as_str().width();
     let suffix_w = suffix.width();
@@ -2506,7 +2536,24 @@ pub async fn run_interactive(
                     tokio::select! {
                         Some(ev) = user_rx.recv() => {
                             match ev {
-                                UserEvent::Key(key) => match key.code {
+                                UserEvent::Key(key) => {
+                                    // Ctrl+C / Ctrl+D in the alert
+                                    // = "I want out" → treat as
+                                    // Deny. Without this the loop
+                                    // fell through to `_ => {}` and
+                                    // the tool hung waiting for an
+                                    // answer that never came; the
+                                    // user had to keyboard-mash to
+                                    // discover that only y/a/n/Esc
+                                    // worked.
+                                    let is_ctrl_c = key.code == KeyCode::Char('c')
+                                        && key.modifiers.contains(KeyModifiers::CONTROL);
+                                    let is_ctrl_d = key.code == KeyCode::Char('d')
+                                        && key.modifiers.contains(KeyModifiers::CONTROL);
+                                    if is_ctrl_c || is_ctrl_d {
+                                        break UserDecision::Deny;
+                                    }
+                                    match key.code {
                                     KeyCode::Char('y') => break UserDecision::AllowOnce,
                                     KeyCode::Char('a') => {
                                         let pattern = suggest_pattern(&ask_req.tool, &ask_req.input);
@@ -2536,7 +2583,8 @@ pub async fn run_interactive(
                                     }
                                     KeyCode::Char('n') | KeyCode::Esc => break UserDecision::Deny,
                                     _ => {}
-                                },
+                                    }
+                                }
                                 // Keep scroll responsive while the
                                 // alert is up — previously these
                                 // events were dropped on the floor
@@ -3675,6 +3723,25 @@ mod tests {
         let header = fit_banner_header("READ", "/some/path", 12);
         // Don't pin the exact string — just make sure no panic and
         // we got SOMETHING with the borders intact.
+        assert!(header.starts_with("╭"));
+        assert!(header.ends_with("╮"));
+    }
+
+    /// Regression: a very long tool name (e.g. an MCP-registered
+    /// tool like `MCP_TOOL:LONG_SERVER:LONG_FUNCTION`) used to
+    /// overflow frame_w because the prefix `╭─ NAME ─ ` was wider
+    /// than the entire chamber. Now the name itself gets
+    /// left-truncated to keep the header at most frame_w wide.
+    #[test]
+    fn banner_truncates_pathological_long_tool_name() {
+        let very_long = "MCP_TOOL:VERY_LONG_SERVER_NAME:VERY_LONG_FUNCTION_NAME";
+        let header = fit_banner_header(very_long, "/some/path", 40);
+        assert!(
+            header.as_str().width() <= 40,
+            "header must not exceed frame_w; got width {} for {:?}",
+            header.as_str().width(),
+            header,
+        );
         assert!(header.starts_with("╭"));
         assert!(header.ends_with("╮"));
     }
