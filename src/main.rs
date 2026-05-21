@@ -91,7 +91,19 @@ fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
             "yolo" => SecurityMode::Yolo,
             "accept" => SecurityMode::Accept,
             "restrictive" => SecurityMode::Restrictive,
-            _ => SecurityMode::Standard,
+            "standard" => SecurityMode::Standard,
+            other => {
+                // Unknown value silently mapped to Standard before
+                // this — a typo like `restritctive` ended up as
+                // Standard and the user never knew. Warn explicitly
+                // and name the valid values.
+                eprintln!(
+                    "warning: unknown default_permission_mode {:?} in config; using standard. \
+                     Valid values: yolo, accept, restrictive, standard.",
+                    other,
+                );
+                SecurityMode::Standard
+            }
         }
     } else {
         SecurityMode::Standard

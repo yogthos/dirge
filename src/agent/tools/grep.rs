@@ -86,6 +86,10 @@ impl Tool for GrepTool {
                     "context_lines": {
                         "type": "integer",
                         "description": "Number of context lines to show before and after each match (like grep -C)"
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "description": "Include dotfiles (.env, .gitignore, etc.) in the search. Default false to avoid surfacing secrets and config files."
                     }
                 },
                 "required": ["pattern"]
@@ -97,11 +101,12 @@ impl Tool for GrepTool {
         check_perm(&self.permission, &self.ask_tx, "grep", &args.pattern).await?;
 
         let cache_key = format!(
-            "grep:{}:{}:{}:{}",
+            "grep:{}:{}:{}:{}:hidden={}",
             args.pattern,
             args.path.as_deref().unwrap_or("."),
             args.include.as_deref().unwrap_or(""),
             args.context_lines.unwrap_or(0),
+            args.include_hidden,
         );
 
         if let Some(ref cache) = self.cache {
@@ -116,17 +121,32 @@ impl Tool for GrepTool {
         let search_path = args.path.as_deref().unwrap_or(".");
         let context = args.context_lines.unwrap_or(0);
 
-        let include_re = args.include.as_ref().map(|g| {
-            let pattern = format!("^(?:{})$", Self::glob_to_regex(g));
-            Regex::new(&pattern).unwrap_or_else(|_| Regex::new(".*").unwrap())
-        });
+        // Validate the include glob and surface compile errors
+        // instead of the previous silent fallback to `.*` (match
+        // everything). A user passing `include: "[a-z("` would have
+        // silently matched every file — the include filter would
+        // appear to do nothing and they'd never know why.
+        let include_re = match args.include.as_ref() {
+            Some(g) => {
+                let pattern = format!("^(?:{})$", Self::glob_to_regex(g));
+                Some(Regex::new(&pattern).map_err(|e| {
+                    ToolError::Msg(format!(
+                        "Invalid include glob {g:?}: {e}. Use forms like \"*.rs\" or \"*.{{ts,tsx}}\"."
+                    ))
+                })?)
+            }
+            None => None,
+        };
 
         let walker = WalkBuilder::new(search_path)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
             .require_git(false)
-            .hidden(false)
+            // F2 carryover: hide dotfiles by default so grep doesn't
+            // silently surface `.env` / `.git/` internals. Opt-in
+            // via `include_hidden: true`.
+            .hidden(!args.include_hidden)
             .filter_entry(|entry| {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     !is_skip_dir(entry.file_name().to_str().unwrap_or(""))

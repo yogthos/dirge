@@ -126,6 +126,7 @@ dirge --verbose
 | `/regen-prompts` | Restore built-in prompts |
 | `/mcp` | List MCP servers and tools |
 | `/panel [on\|off\|auto]` | Toggle the right-hand info panel (cwd, MCP, LSP, todos, modified files). `auto` shows it when the terminal is at least 100 cols wide. |
+| `/allow <list\|add\|remove\|clear>` | Manage the session permission allowlist (see `/help` for argument shapes) |
 | `/quit` | Exit dirge |
 | `/retry` | Retry last prompt |
 | `/help` | Show all commands |
@@ -316,6 +317,8 @@ dirge ships with an 80s-CRT phosphor green palette by default. To opt out, set `
 ```
 
 Errors stay red and warnings stay yellow under every theme — those colors are part of the load-bearing semantic contract.
+
+For custom themes, create `~/.config/dirge/<name>.theme.json` with overrides for any subset of the palette (named colors, hex `#rrggbb`, or 256-color indices), then set `theme: "<name>"` in `config.json`. See [`docs/THEMES.md`](docs/THEMES.md) for the full schema and examples.
 
 ## Supported providers
 

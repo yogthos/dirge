@@ -112,6 +112,12 @@ pub struct GrepArgs {
     pub path: Option<String>,
     pub include: Option<String>,
     pub context_lines: Option<usize>,
+    /// Include dotfiles / hidden files in the search. Default
+    /// `false` — F2 carryover from find_files/glob/list_dir: grep
+    /// also walks the filesystem and should not silently surface
+    /// `.env`, `.git/` internals, etc. by default.
+    #[serde(default)]
+    pub include_hidden: bool,
 }
 
 #[derive(Deserialize)]

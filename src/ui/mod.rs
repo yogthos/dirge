@@ -3245,11 +3245,29 @@ fn close_tool_chamber_if_open(
 /// `│   <content centered to inner>   │` — pad text on both sides so
 /// it sits horizontally centered within the chamber inner width.
 fn chamber_row_centered(content: &str, inner: usize) -> String {
-    let len = content.chars().count();
-    if len + 2 >= inner {
+    // Total row width matches `chamber_row`: exactly `inner + 4`
+    // terminal cells (`│ ` (2) + inner-cell middle + ` │` (2)).
+    // The middle is `inner` cells: left_pad + content + right_pad.
+    //
+    // TWO bugs were stacked here:
+    // (1) Used `chars().count()` instead of display width — the
+    //     NO-OUTPUT chamber starts with `⚠` (2 cells / 1 char) so
+    //     centering was off by 1 cell.
+    // (2) Subtracted `len + 2` from `inner` for the pad, leaving
+    //     the row 2 cells short of `inner + 4` total — the right
+    //     `│` didn't line up under the chamber's top `╮` /
+    //     bottom `╯`. Correct: pad = inner - len (the middle is
+    //     `inner` cells wide; subtracting only `len` reserves the
+    //     rest for padding around it).
+    //
+    // Anything wider than `inner` falls back to `chamber_row`
+    // which truncates with `…` and pads to exactly `inner` cells.
+    use unicode_width::UnicodeWidthStr;
+    let len = UnicodeWidthStr::width(content);
+    if len >= inner {
         return chamber_row(content, inner);
     }
-    let pad = inner.saturating_sub(len + 2);
+    let pad = inner - len;
     let left = pad / 2;
     let right = pad - left;
     format!("│ {}{}{} │", " ".repeat(left), content, " ".repeat(right))
@@ -3668,6 +3686,29 @@ mod tests {
         );
         assert!(header.starts_with("╭─ DONE ─"));
         assert!(header.ends_with("─╮"));
+    }
+
+    /// Regression: `chamber_row_centered` must use DISPLAY width
+    /// not char count. The NO-OUTPUT chamber message starts with
+    /// `⚠` (2 cells wide, 1 char). Before this, centering was off
+    /// by 1 cell and the right `│` border misaligned with the
+    /// chamber's top/bottom borders.
+    #[test]
+    fn chamber_row_centered_handles_wide_emoji() {
+        let row = chamber_row_centered("⚠ tool denied", 40);
+        // Row must occupy exactly `inner + 4` display cells
+        // (`│ ` + content + padding + ` │` = inner + 4 = 44).
+        let row_width = UnicodeWidthStr::width(row.as_str());
+        assert_eq!(
+            row_width, 44,
+            "row must be exactly inner+4 cells wide; got {row_width} for {row:?}",
+        );
+        // Right border `│` MUST be at the very end (no trailing
+        // pad mismatch).
+        assert!(
+            row.ends_with(" │"),
+            "right border missing or padded wrong: {row:?}"
+        );
     }
 
     /// Self-review bug 1: `apply_patch` arg is `operations`
