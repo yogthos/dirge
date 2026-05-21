@@ -177,6 +177,28 @@ some accumulate into a chat-visible response, some get ignored.
   default. If you need plugin observability into subtask work, route it
   through `harness/log` from the parent's `on-response` or `on-turn-end`
   hooks instead.
+- **Multi-file plugin load order is lexicographic.** When a plugin
+  directory contains multiple `.janet` files, they're loaded in
+  **lexicographic filename order** (e.g. `00-init.janet` before
+  `hooks.janet` before `state.janet`). The load is one shared Janet
+  worker, so later files see definitions from earlier files. If
+  one file depends on a helper defined in another, name the
+  defining file to sort first — the conventional `NN-prefix`
+  pattern (`00-`, `01-`, …) is the easiest way. Renaming files
+  silently changes load order; if hooks register in different
+  positions you may see different behavior from the same plugin
+  code.
+- **`harness/mutate-input` and `harness/replace-result` chain
+  across hooks.** When multiple plugins register for the same
+  `on-tool-start` / `on-tool-end`, the slot for the mutated value
+  is cleared once at the START of dispatch, and EACH hook sees
+  whatever the prior hook wrote. Last-write-wins for mutations:
+  hook B can read what hook A set in `harness-mutate-input` (via
+  the tool args it sees) and decide whether to overwrite, refine,
+  or no-op. This is intentional and unlike `harness/block`, which
+  stops dispatch entirely after the first writer. If you want
+  isolated mutations, gate by checking a sentinel before writing
+  (e.g. a custom key in the context table).
 
 ---
 
