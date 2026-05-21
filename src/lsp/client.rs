@@ -178,6 +178,55 @@ impl LspClient {
         Ok(version)
     }
 
+    /// Send `textDocument/didClose` for one file and drop the
+    /// associated server-side state on our end (version, push +
+    /// pull diagnostics, last-push timestamp). Per the LSP spec
+    /// the server is free to discard its parse-tree / cached
+    /// analyses once it receives this notification — without it
+    /// servers retain everything we've ever opened, growing
+    /// unbounded over a long session.
+    ///
+    /// Returns Ok even if the file wasn't open; sending a stray
+    /// didClose is harmless per the spec.
+    pub async fn notify_close(&self, path: &Path) -> Result<(), LspError> {
+        let abs = match tokio::fs::canonicalize(path).await {
+            Ok(p) => p,
+            Err(_) => path.to_path_buf(),
+        };
+        let was_open;
+        {
+            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            was_open = state.files.remove(&abs).is_some();
+            state.push.remove(&abs);
+            state.pull.remove(&abs);
+            state.last_push_at.remove(&abs);
+        }
+        if was_open {
+            let uri = path_to_file_uri_string(&abs);
+            self.rpc
+                .notify(
+                    "textDocument/didClose",
+                    json!({ "textDocument": { "uri": uri } }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Close every file currently tracked by this client. Used at
+    /// session shutdown to release server-side per-file state
+    /// before the process exits. Failures are swallowed: shutdown
+    /// is best-effort.
+    pub async fn close_all(&self) {
+        let paths: Vec<PathBuf> = {
+            let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            state.files.keys().cloned().collect()
+        };
+        for p in paths {
+            let _ = self.notify_close(&p).await;
+        }
+    }
+
     /// Merged + deduplicated diagnostics for a single file. Combines push
     /// (server-volunteered) and pull (server requested explicitly) state.
     pub fn diagnostics_for(&self, path: &Path) -> Vec<Diagnostic> {
@@ -416,6 +465,49 @@ mod tests {
         let frame = from_client.recv().await.unwrap();
         assert_eq!(frame["params"]["textDocument"]["text"], "hello world\n");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression: `notify_close` emits `textDocument/didClose` and
+    /// removes the per-file state so a subsequent `notify_open`
+    /// starts a fresh didOpen (version 0) rather than a didChange.
+    #[tokio::test]
+    async fn notify_close_emits_did_close_and_clears_state() {
+        let (client, mut from_client, _to) = pair().await;
+        let path = tempfile_with("close-flow", "fn main() {}\n");
+        client.notify_open(&path).await.unwrap();
+        let _open_frame = from_client.recv().await.unwrap();
+
+        client.notify_close(&path).await.unwrap();
+        let close_frame = from_client.recv().await.unwrap();
+        assert_eq!(close_frame["method"], "textDocument/didClose");
+        // Re-open after close must send a fresh didOpen (not didChange)
+        // because the file state was dropped.
+        client.notify_open(&path).await.unwrap();
+        let reopen_frame = from_client.recv().await.unwrap();
+        assert_eq!(reopen_frame["method"], "textDocument/didOpen");
+        assert_eq!(reopen_frame["params"]["textDocument"]["version"], 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `close_all` sends didClose for every tracked file.
+    #[tokio::test]
+    async fn close_all_emits_did_close_for_every_open_file() {
+        let (client, mut from_client, _to) = pair().await;
+        let p1 = tempfile_with("close-all-a", "a\n");
+        let p2 = tempfile_with("close-all-b", "b\n");
+        client.notify_open(&p1).await.unwrap();
+        client.notify_open(&p2).await.unwrap();
+        // Drain the didOpens.
+        let _ = from_client.recv().await.unwrap();
+        let _ = from_client.recv().await.unwrap();
+
+        client.close_all().await;
+        let f1 = from_client.recv().await.unwrap();
+        let f2 = from_client.recv().await.unwrap();
+        assert_eq!(f1["method"], "textDocument/didClose");
+        assert_eq!(f2["method"], "textDocument/didClose");
+        std::fs::remove_file(&p1).ok();
+        std::fs::remove_file(&p2).ok();
     }
 
     // Push diagnostic flow: server fires a textDocument/publishDiagnostics

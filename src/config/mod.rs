@@ -43,6 +43,16 @@ pub struct LspServerConfig {
     pub disabled: Option<bool>,
 }
 
+#[cfg(feature = "lsp")]
+impl crate::lsp::server::AsExtensionOverride for LspServerConfig {
+    fn extensions(&self) -> Option<&[String]> {
+        self.extensions.as_deref()
+    }
+    fn disabled(&self) -> bool {
+        self.disabled.unwrap_or(false)
+    }
+}
+
 /// `lsp = true`  → enable built-in servers with default commands.
 /// `lsp = false` → disable LSP entirely.
 /// `lsp = { server-id = { … } }` → enable defaults, overriding the named

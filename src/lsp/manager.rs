@@ -168,11 +168,23 @@ pub struct LspManager {
 
 impl LspManager {
     pub fn new(spawner: Arc<dyn Spawner>, worktree: impl Into<PathBuf>) -> Self {
+        Self::with_servers(spawner, worktree, server::builtin_servers())
+    }
+
+    /// Construct an `LspManager` with an explicit server set —
+    /// the host calls this when the user has per-server config
+    /// overrides (extensions, disabled, etc.). The default `new`
+    /// just delegates here with the unmodified builtin list.
+    pub fn with_servers(
+        spawner: Arc<dyn Spawner>,
+        worktree: impl Into<PathBuf>,
+        servers: Vec<ServerInfo>,
+    ) -> Self {
         Self {
             spawner,
             worktree: worktree.into(),
             state: Arc::new(Mutex::new(ManagerState::default())),
-            servers: Arc::new(server::builtin_servers()),
+            servers: Arc::new(servers),
         }
     }
 
@@ -438,6 +450,26 @@ impl LspManager {
             .filter(|(_, s)| s.still_cooling())
             .map(|((root, id), _)| (id.clone(), root.clone()))
             .collect()
+    }
+
+    /// Fan-out `textDocument/didClose` across every attached
+    /// client for every file each one has open. Called once at
+    /// session shutdown so LSP servers can release per-file
+    /// state — without this, a long session that touches dozens
+    /// of files leaks server-side parse trees / diagnostic caches
+    /// for the lifetime of the server process.
+    ///
+    /// Best-effort: a server that's already gone won't be
+    /// re-contacted, and individual `notify_close` failures are
+    /// swallowed inside the client.
+    pub async fn close_all_files(&self) {
+        let entries: Vec<_> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.clients.values().cloned().collect()
+        };
+        for entry in entries {
+            entry.client.close_all().await;
+        }
     }
 
     /// Aggregated diagnostics across all attached clients. Same key/dedupe

@@ -135,7 +135,18 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
         let worktree = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let commands = compile_lsp_commands(cfg);
         let spawner = std::sync::Arc::new(ProcessSpawner::new(commands));
-        Some(std::sync::Arc::new(LspManager::new(spawner, worktree)))
+        // Apply per-server config overrides (extensions, disabled).
+        // Without this, user config like
+        //   "lsp": { "rust": { "extensions": ["rs", "rlib"] } }
+        // was silently ignored — the manager always used the
+        // builtin list.
+        let mut servers = crate::lsp::server::builtin_servers();
+        if let Some(lsp_cfg) = &cfg.lsp {
+            crate::lsp::server::apply_extension_overrides(&mut servers, lsp_cfg.server_overrides());
+        }
+        Some(std::sync::Arc::new(LspManager::with_servers(
+            spawner, worktree, servers,
+        )))
     } else {
         None
     };
@@ -159,11 +170,9 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
 /// and applying per-server overrides from user config. A `disabled = true`
 /// override removes the entry; any non-empty `command` replaces the default.
 ///
-/// Known limitation: `extensions` on the override is currently ignored. The
-/// claimed-extensions list lives in the static `builtin_servers()` registry
-/// (`lsp/server.rs`) — making it instance-overridable requires plumbing a
-/// per-session server set down through `LspManager`. Follow-up; users who
-/// need new extensions today must edit `server.rs`.
+/// Extensions overrides are applied separately in `build_channels` via
+/// `lsp::server::apply_extension_overrides` since they live on the
+/// per-session `ServerInfo` registry, not on the spawn-command map.
 #[cfg(feature = "lsp")]
 fn compile_lsp_commands(cfg: &config::Config) -> std::collections::HashMap<String, ProcessCommand> {
     let mut commands = ProcessSpawner::default_commands();
@@ -628,6 +637,12 @@ async fn main() -> anyhow::Result<()> {
         if !initial_msg.is_empty() {
             session.add_message(MessageRole::User, &initial_msg);
         }
+        // Clone the LSP manager Arc so we can call didClose
+        // cleanup after `run_interactive` has consumed its handle.
+        // The Arc is cheap to clone; both copies point at the same
+        // manager state, which is what we need for shutdown.
+        #[cfg(feature = "lsp")]
+        let lsp_manager_for_shutdown = lsp_manager.clone();
         ui::run_interactive(
             client,
             agent,
@@ -656,6 +671,18 @@ async fn main() -> anyhow::Result<()> {
             dialog_rx,
         )
         .await?;
+
+        // Best-effort `textDocument/didClose` for every file each
+        // LSP server saw this session. Servers retain parse trees
+        // + diagnostic caches keyed on open files; without this
+        // cleanup a long session leaves them holding all that
+        // state for the lifetime of their process. The notify is
+        // fire-and-forget; individual failures are swallowed
+        // inside `close_all_files`.
+        #[cfg(feature = "lsp")]
+        if let Some(mgr) = lsp_manager_for_shutdown.as_ref() {
+            mgr.close_all_files().await;
+        }
     }
 
     #[cfg(feature = "mcp")]
