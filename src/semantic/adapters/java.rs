@@ -145,7 +145,10 @@ impl JavaAdapter {
                         }
                     }
                 }
-                "class_declaration" | "interface_declaration" | "enum_declaration" => {
+                "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration" => {
                     // Nested class — recurse from the top of the
                     // walker so the new class gets its own
                     // symbol + body walk.
@@ -192,7 +195,15 @@ impl JavaAdapter {
                     self.walk_class_body(body, s, symbols, &name);
                 }
             }
-            "enum_declaration" => {
+            "enum_declaration" | "record_declaration" => {
+                // Records (Java 16+) are immutable data carriers
+                // that look like \`public record Point(int x, int y) {}\`.
+                // tree-sitter exposes them as record_declaration; we
+                // surface them as Class so list_symbols finds them,
+                // and walk the body for any explicit methods. The
+                // auto-generated accessors aren't AST-visible so we
+                // can't list them, but the signature line preserves
+                // the component list which is the useful info.
                 let Some(name) = self.ident_name(n, s) else {
                     return;
                 };
@@ -276,7 +287,10 @@ impl LanguageAdapter for JavaAdapter {
                 continue;
             };
             match c.kind() {
-                "class_declaration" | "interface_declaration" | "enum_declaration" => {
+                "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration" => {
                     self.walk_top(c, bytes, &mut symbols);
                 }
                 "import_declaration" => self.handle_import(c, bytes, &mut imports),
@@ -432,5 +446,17 @@ mod tests {
         );
         let deep = f.symbols.iter().find(|s| s.name == "deep").unwrap();
         assert_eq!(deep.parent_class.as_deref(), Some("Inner"));
+    }
+
+    /// Records (Java 16+) — previously silently dropped.
+    #[test]
+    fn extracts_record_declaration_as_class() {
+        let src = "public record Point(int x, int y) {\n  public boolean isOrigin() { return x == 0 && y == 0; }\n}\n";
+        let f = JavaAdapter.extract(&pb("a.java"), src).unwrap();
+        let point = f.symbols.iter().find(|s| s.name == "Point").unwrap();
+        assert!(matches!(point.kind, SymbolKind::Class));
+        assert!(point.is_exported);
+        let m = f.symbols.iter().find(|s| s.name == "isOrigin").unwrap();
+        assert_eq!(m.parent_class.as_deref(), Some("Point"));
     }
 }

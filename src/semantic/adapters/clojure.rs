@@ -31,10 +31,14 @@ impl ClojureAdapter {
         }
     }
 
-    /// The text of a `sym_lit` is in its `sym_name` child. Falling back
-    /// to the full node text is fine for the simple `foo` case but
-    /// returns prefixed-namespace garbage for `clojure.string/blank?`,
-    /// so we prefer the child.
+    /// The text of a `sym_lit` is in its `sym_name` child. For
+    /// namespace-qualified symbols like `clojure.string/blank?` the
+    /// grammar exposes `sym_ns` (namespace) and `sym_name` (leaf)
+    /// children separately — we want only `blank?`. When neither
+    /// child exists (older grammar revisions or malformed input),
+    /// fall back to the raw text BUT strip any `ns/` prefix so the
+    /// callees list / symbol index don't get polluted with fully
+    /// qualified names.
     fn sym_name<'a>(&self, sym_lit: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
         for i in 0..sym_lit.named_child_count() {
             if let Some(c) = sym_lit.named_child(i)
@@ -43,9 +47,11 @@ impl ClojureAdapter {
                 return Some(self.node_text(c, source));
             }
         }
-        // Fallback: raw node text (some symbols have no sym_name child
-        // in older grammar revisions).
-        Some(self.node_text(sym_lit, source))
+        // Fallback: raw node text with the `ns/` prefix stripped so
+        // `clojure.string/blank?` is normalized to `blank?`. Symbols
+        // with no namespace prefix pass through unchanged.
+        let raw = self.node_text(sym_lit, source);
+        Some(raw.rsplit_once('/').map(|(_, leaf)| leaf).unwrap_or(raw))
     }
 
     /// Children of a `list_lit` that are actual forms (symbols / lists /
@@ -552,5 +558,33 @@ mod tests {
         for needed in [".clj", ".cljs", ".cljc", ".edn", ".bb"] {
             assert!(exts.contains(&needed), "missing extension: {needed}");
         }
+    }
+
+    /// Namespace-qualified symbols (`clojure.string/blank?`) in
+    /// call position must surface only the leaf name. Previously
+    /// the fallback returned the full `ns/name` string, polluting
+    /// the call graph.
+    #[test]
+    fn find_callees_strips_namespace_from_qualified_calls() {
+        let src = "(defn run [] (clojure.string/blank? \"x\") (str/join \", \" [1 2]))\n";
+        let f = adapter().extract(&pb("a.clj"), src).unwrap();
+        let run = &f.symbols[0];
+        let callees = adapter()
+            .find_callees_in_range(src, &pb("a.clj"), run.range)
+            .unwrap();
+        // Leaf names, not fully qualified.
+        assert!(
+            callees.iter().any(|c| c == "blank?"),
+            "expected leaf 'blank?'; got {callees:?}",
+        );
+        assert!(
+            callees.iter().any(|c| c == "join"),
+            "expected leaf 'join'; got {callees:?}",
+        );
+        // Should NOT contain the full qualified path.
+        assert!(
+            !callees.iter().any(|c| c.contains('/')),
+            "no callee should contain a /: {callees:?}",
+        );
     }
 }

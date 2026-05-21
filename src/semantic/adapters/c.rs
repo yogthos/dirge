@@ -116,16 +116,24 @@ impl CAdapter {
 
     /// `struct Foo { … }` at top level. Anonymous structs (no
     /// `type_identifier` child) are skipped — there's no useful
-    /// symbol name to attach.
+    /// symbol name to attach. Forward declarations (`struct Foo;`,
+    /// no body) are also skipped: emitting them creates a Class
+    /// symbol with no contents that confuses code navigation, and
+    /// the real definition elsewhere produces the canonical symbol.
     fn handle_struct(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>) {
         let mut name: Option<String> = None;
+        let mut has_body = false;
         for i in 0..n.named_child_count() {
-            if let Some(c) = n.named_child(i)
-                && c.kind() == "type_identifier"
-            {
+            let Some(c) = n.named_child(i) else { continue };
+            if c.kind() == "type_identifier" && name.is_none() {
                 name = Some(self.text(c, s).to_string());
-                break;
             }
+            if c.kind() == "field_declaration_list" {
+                has_body = true;
+            }
+        }
+        if !has_body {
+            return;
         }
         let Some(name) = name else { return };
         symbols.push(Symbol {
@@ -139,24 +147,64 @@ impl CAdapter {
     }
 
     fn handle_enum(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>) {
+        // Find the enum's tag name + its enumerator list in a single
+        // pass so we can emit both the parent enum AND its constants
+        // as Variable symbols. Previously the constants (`RED`,
+        // `GREEN`, …) were lost; in C they're far more frequently
+        // referenced than the enum tag itself.
         let mut name: Option<String> = None;
+        let mut enumerator_list: Option<Node> = None;
         for i in 0..n.named_child_count() {
-            if let Some(c) = n.named_child(i)
-                && c.kind() == "type_identifier"
-            {
-                name = Some(self.text(c, s).to_string());
-                break;
+            let Some(c) = n.named_child(i) else { continue };
+            match c.kind() {
+                "type_identifier" => {
+                    if name.is_none() {
+                        name = Some(self.text(c, s).to_string());
+                    }
+                }
+                "enumerator_list" => enumerator_list = Some(c),
+                _ => {}
             }
         }
-        let Some(name) = name else { return };
-        symbols.push(Symbol {
-            kind: SymbolKind::Class,
-            is_exported: true,
-            name,
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
-            parent_class: None,
-        });
+        let parent_name = name.clone();
+        if let Some(name) = name {
+            symbols.push(Symbol {
+                kind: SymbolKind::Class,
+                is_exported: true,
+                name,
+                range: self.range(n),
+                signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+                parent_class: None,
+            });
+        }
+        // Emit each constant as a Variable symbol. Anonymous enums
+        // (`enum { A, B };`) still surface their constants — the
+        // parent enum just isn't named.
+        if let Some(list) = enumerator_list {
+            for i in 0..list.named_child_count() {
+                if let Some(e) = list.named_child(i)
+                    && e.kind() == "enumerator"
+                {
+                    // Enumerator's first identifier child is the
+                    // constant name.
+                    for j in 0..e.named_child_count() {
+                        if let Some(id) = e.named_child(j)
+                            && id.kind() == "identifier"
+                        {
+                            symbols.push(Symbol {
+                                kind: SymbolKind::Variable,
+                                is_exported: true,
+                                name: self.text(id, s).to_string(),
+                                range: self.range(e),
+                                signature: self.text(e, s).to_string(),
+                                parent_class: parent_name.clone(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// `typedef <type> <alias>;`. If `<type>` is an inline struct
@@ -443,5 +491,32 @@ mod tests {
             .unwrap();
         assert!(callees.contains(&"printf".to_string()));
         assert!(callees.contains(&"helper".to_string()));
+    }
+
+    /// Enum constants — `RED`/`GREEN` are individually surfaced as
+    /// Variable symbols anchored to the parent enum tag.
+    #[test]
+    fn extracts_enum_constants_as_variables() {
+        let src = "enum Color { RED, GREEN = 5, BLUE };\n";
+        let f = CAdapter.extract(&pb("a.c"), src).unwrap();
+        for needed in ["Color", "RED", "GREEN", "BLUE"] {
+            assert!(
+                f.symbols.iter().any(|s| s.name == needed),
+                "missing: {needed}",
+            );
+        }
+        let red = f.symbols.iter().find(|s| s.name == "RED").unwrap();
+        assert!(matches!(red.kind, SymbolKind::Variable));
+        assert_eq!(red.parent_class.as_deref(), Some("Color"));
+    }
+
+    /// Forward `struct` declarations (no body) are skipped to
+    /// avoid duplicate symbols with the real definition.
+    #[test]
+    fn forward_struct_declaration_is_skipped() {
+        let src = "struct Foo;\nstruct Foo { int n; };\n";
+        let f = CAdapter.extract(&pb("a.c"), src).unwrap();
+        let foos: Vec<_> = f.symbols.iter().filter(|s| s.name == "Foo").collect();
+        assert_eq!(foos.len(), 1, "only the definition should produce a symbol");
     }
 }

@@ -71,6 +71,28 @@ impl RustAdapter {
         None
     }
 
+    /// Extract the base type name from a possibly-generic type
+    /// expression: `Foo` → `Foo`, `Foo<T>` → `Foo`, `Box<Foo<T>>` →
+    /// `Box`. Used by `handle_impl` so `impl<T> Trait for Foo<T>`
+    /// attaches its methods to `Foo`, not the generic param `T`.
+    fn type_leaf_name(&self, n: Node, s: &[u8]) -> Option<String> {
+        match n.kind() {
+            "type_identifier" => Some(self.text(n, s).to_string()),
+            "generic_type" | "scoped_type_identifier" => {
+                // First named child is the base type expr.
+                for i in 0..n.named_child_count() {
+                    if let Some(c) = n.named_child(i)
+                        && let Some(name) = self.type_leaf_name(c, s)
+                    {
+                        return Some(name);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn handle_function(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>) {
         let Some(name) = self.ident_child(n, s) else {
             return;
@@ -141,17 +163,30 @@ impl RustAdapter {
 
     fn handle_impl(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>) {
         // `impl Type { ... }` or `impl Trait for Type { ... }`. The
-        // RECEIVING type is the most useful parent_class — it's what
-        // the user types when they want "all methods on Foo".
-        let mut last_type: Option<String> = None;
-        for i in 0..n.named_child_count() {
-            if let Some(c) = n.named_child(i)
-                && c.kind() == "type_identifier"
-            {
-                last_type = Some(self.text(c, s).to_string());
-            }
-        }
-        let Some(receiving) = last_type else {
+        // RECEIVING type (the implementor) is the most useful
+        // parent_class — it's what the user types when they want
+        // "all methods on Foo".
+        //
+        // tree-sitter-rust exposes the receiving type via the `type`
+        // field, which is robust against generic args, lifetime
+        // params, and `<T as Trait>::` paths that would otherwise
+        // confuse a positional last-type_identifier walk. Fall back
+        // to the positional walk only when the field is absent.
+        let receiving = n
+            .child_by_field_name("type")
+            .and_then(|t| self.type_leaf_name(t, s))
+            .or_else(|| {
+                let mut last: Option<String> = None;
+                for i in 0..n.named_child_count() {
+                    if let Some(c) = n.named_child(i)
+                        && c.kind() == "type_identifier"
+                    {
+                        last = Some(self.text(c, s).to_string());
+                    }
+                }
+                last
+            });
+        let Some(receiving) = receiving else {
             return;
         };
         for i in 0..n.named_child_count() {
@@ -213,6 +248,104 @@ impl RustAdapter {
             signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
+    }
+
+    fn handle_mod(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>, imports: &mut Vec<Import>) {
+        let Some(name) = self.ident_child(n, s) else {
+            return;
+        };
+        symbols.push(Symbol {
+            kind: SymbolKind::Class,
+            is_exported: self.is_exported(n),
+            name,
+            range: self.range(n),
+            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            parent_class: None,
+        });
+        // Inline modules carry a `declaration_list`; file-only
+        // `mod foo;` doesn't, and we skip that case (the file's
+        // own indexing covers its contents).
+        for i in 0..n.named_child_count() {
+            let Some(c) = n.named_child(i) else { continue };
+            if c.kind() != "declaration_list" {
+                continue;
+            }
+            for j in 0..c.named_child_count() {
+                let Some(item) = c.named_child(j) else {
+                    continue;
+                };
+                match item.kind() {
+                    "function_item" => self.handle_function(item, s, symbols),
+                    "struct_item" | "enum_item" | "union_item" => {
+                        self.handle_struct_or_enum(item, s, symbols);
+                    }
+                    "trait_item" => self.handle_trait(item, s, symbols),
+                    "impl_item" => self.handle_impl(item, s, symbols),
+                    "type_item" => self.handle_type_alias(item, s, symbols),
+                    "const_item" | "static_item" => self.handle_const_or_static(item, s, symbols),
+                    "use_declaration" => self.handle_use(item, s, imports),
+                    "mod_item" => self.handle_mod(item, s, symbols, imports),
+                    "macro_definition" => self.handle_macro(item, s, symbols),
+                    "foreign_mod_item" => self.handle_extern_block(item, s, symbols),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn handle_macro(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>) {
+        // `macro_rules! NAME { ... }`. The macro name appears as an
+        // `identifier` child of the macro_definition node.
+        for i in 0..n.named_child_count() {
+            if let Some(c) = n.named_child(i)
+                && c.kind() == "identifier"
+            {
+                let name = self.text(c, s).to_string();
+                symbols.push(Symbol {
+                    kind: SymbolKind::Function,
+                    is_exported: self.is_exported(n),
+                    name,
+                    range: self.range(n),
+                    signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+                    parent_class: None,
+                });
+                return;
+            }
+        }
+    }
+
+    fn handle_extern_block(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>) {
+        // `extern "C" { ... }` — body is a `declaration_list` with
+        // `function_signature_item`, `static_item`, and
+        // `type_item` children.
+        for i in 0..n.named_child_count() {
+            let Some(c) = n.named_child(i) else { continue };
+            if c.kind() != "declaration_list" {
+                continue;
+            }
+            for j in 0..c.named_child_count() {
+                let Some(item) = c.named_child(j) else {
+                    continue;
+                };
+                match item.kind() {
+                    "function_signature_item" => {
+                        if let Some(name) = self.ident_child(item, s) {
+                            symbols.push(Symbol {
+                                kind: SymbolKind::Function,
+                                is_exported: true,
+                                name,
+                                range: self.range(item),
+                                signature: self.signature(item, s),
+                                parent_class: None,
+                            });
+                        }
+                    }
+                    "static_item" => self.handle_const_or_static(item, s, symbols),
+                    "type_item" => self.handle_type_alias(item, s, symbols),
+                    _ => {}
+                }
+            }
+        }
     }
 
     fn handle_use(&self, n: Node, s: &[u8], imports: &mut Vec<Import>) {
@@ -290,6 +423,19 @@ impl LanguageAdapter for RustAdapter {
                 "type_item" => self.handle_type_alias(c, bytes, &mut symbols),
                 "const_item" | "static_item" => self.handle_const_or_static(c, bytes, &mut symbols),
                 "use_declaration" => self.handle_use(c, bytes, &mut imports),
+                // Top-level `mod inner { ... }` — surface the module
+                // itself as a Class so list_symbols anchors on it,
+                // then recurse into the body so contents are indexed
+                // alongside top-level items.
+                "mod_item" => self.handle_mod(c, bytes, &mut symbols, &mut imports),
+                // `macro_rules! foo { ... }` — declarative macros.
+                // Treated as Function (closest match in SymbolKind);
+                // the LLM commonly invokes them like fns.
+                "macro_definition" => self.handle_macro(c, bytes, &mut symbols),
+                // `extern "ABI" { fn foo(); type Bar; }` — FFI
+                // blocks. Walk the body for declarations so the
+                // declared signatures are visible.
+                "foreign_mod_item" => self.handle_extern_block(c, bytes, &mut symbols),
                 _ => {}
             }
         }
@@ -460,5 +606,61 @@ mod tests {
         assert!(callees.contains(&"helper".to_string()));
         assert!(callees.contains(&"bar".to_string()));
         assert!(callees.contains(&"println".to_string()));
+    }
+
+    /// Inline `mod inner { ... }` — previously the module + every
+    /// item inside it were silently dropped.
+    #[test]
+    fn extracts_inline_module_and_its_items() {
+        let src = "pub mod inner {\n  pub fn deep() -> u32 { 42 }\n  pub struct Held;\n}\n";
+        let f = RustAdapter.extract(&pb("x.rs"), src).unwrap();
+        let m = f.symbols.iter().find(|s| s.name == "inner").unwrap();
+        assert!(matches!(m.kind, SymbolKind::Class));
+        assert!(m.is_exported);
+        assert!(
+            f.symbols
+                .iter()
+                .any(|s| s.name == "deep" && matches!(s.kind, SymbolKind::Function))
+        );
+        assert!(
+            f.symbols
+                .iter()
+                .any(|s| s.name == "Held" && matches!(s.kind, SymbolKind::Class))
+        );
+    }
+
+    /// `extern "C" { ... }` blocks — FFI declarations now visible.
+    #[test]
+    fn extracts_extern_block_signatures() {
+        let src =
+            "extern \"C\" {\n  fn foreign_fn(x: i32) -> i32;\n  static FOREIGN_GLOBAL: i32;\n}\n";
+        let f = RustAdapter.extract(&pb("x.rs"), src).unwrap();
+        let ff = f.symbols.iter().find(|s| s.name == "foreign_fn").unwrap();
+        assert!(matches!(ff.kind, SymbolKind::Function));
+        let g = f
+            .symbols
+            .iter()
+            .find(|s| s.name == "FOREIGN_GLOBAL")
+            .unwrap();
+        assert!(matches!(g.kind, SymbolKind::Variable));
+    }
+
+    /// `macro_rules!` declarations.
+    #[test]
+    fn extracts_macro_rules() {
+        let src = "macro_rules! my_mac { ($x:expr) => { $x + 1 }; }\n";
+        let f = RustAdapter.extract(&pb("x.rs"), src).unwrap();
+        let m = f.symbols.iter().find(|s| s.name == "my_mac").unwrap();
+        assert!(matches!(m.kind, SymbolKind::Function));
+    }
+
+    /// `impl<T> Trait for Generic<T>` — the receiving type's base
+    /// name (Generic) must be parent_class, not the generic param.
+    #[test]
+    fn impl_for_generic_type_uses_base_name() {
+        let src = "pub struct Bag<T>(T);\nimpl<T: Clone> AsRef<T> for Bag<T> { fn as_ref(&self) -> &T { &self.0 } }\n";
+        let f = RustAdapter.extract(&pb("x.rs"), src).unwrap();
+        let m = f.symbols.iter().find(|s| s.name == "as_ref").unwrap();
+        assert_eq!(m.parent_class.as_deref(), Some("Bag"));
     }
 }

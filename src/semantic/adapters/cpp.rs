@@ -106,8 +106,19 @@ impl CppAdapter {
         let Some(name) = self.function_name(n, s) else {
             return;
         };
+        // Out-of-line method definition (`void Foo::bar() {}`)
+        // carries the receiving class via a qualified_identifier
+        // in the declarator. Detect that and emit a Method with
+        // the qualifier as parent_class so users can find these
+        // alongside in-class methods via list_symbols --parent Foo.
+        let parent = self.qualified_owner(n, s);
+        let kind = if parent.is_some() {
+            SymbolKind::Method
+        } else {
+            SymbolKind::Function
+        };
         symbols.push(Symbol {
-            kind: SymbolKind::Function,
+            kind,
             // C++ top-level functions are externally visible
             // unless they're in an anonymous namespace or marked
             // `static`. We don't recurse into anonymous namespace
@@ -116,8 +127,42 @@ impl CppAdapter {
             name,
             range: self.range(n),
             signature: self.signature(n, s),
-            parent_class: None,
+            parent_class: parent,
         });
+    }
+
+    /// If the function's declarator is a `qualified_identifier`
+    /// (`Foo::bar` / `ns::Foo::bar`), return everything before the
+    /// last `::` as the parent_class. Returns None for plain
+    /// non-qualified function definitions.
+    fn qualified_owner(&self, n: Node, s: &[u8]) -> Option<String> {
+        for i in 0..n.named_child_count() {
+            let Some(decl) = n.named_child(i) else {
+                continue;
+            };
+            // Walk through the wrappers; we want the actual
+            // function_declarator's name child.
+            let inner = if matches!(
+                decl.kind(),
+                "function_declarator" | "pointer_declarator" | "reference_declarator"
+            ) {
+                // function_declarator's `declarator` field holds the name.
+                decl.child_by_field_name("declarator").unwrap_or(decl)
+            } else {
+                continue;
+            };
+            if inner.kind() != "qualified_identifier" {
+                continue;
+            }
+            // Take all text before the trailing `::name`. tree-sitter
+            // exposes scope vs name fields, but we use raw text since
+            // it round-trips namespaces correctly.
+            let raw = self.text(inner, s);
+            if let Some((scope, _name)) = raw.rsplit_once("::") {
+                return Some(scope.to_string());
+            }
+        }
+        None
     }
 
     /// Walk a `field_declaration_list` (the body of `class`/`struct`)
@@ -318,6 +363,26 @@ impl CppAdapter {
             }
             "preproc_include" => self.handle_include(c, bytes, imports),
             "using_declaration" | "using_directive" => self.handle_using(c, bytes, imports),
+            // `extern "C" { ... }` blocks. tree-sitter-cpp exposes
+            // them as `linkage_specification`. Walk the inner
+            // declaration_list as if it were the top level so FFI
+            // functions show up in list_symbols.
+            "linkage_specification" => {
+                for i in 0..c.named_child_count() {
+                    if let Some(inner) = c.named_child(i)
+                        && inner.kind() == "declaration_list"
+                    {
+                        for j in 0..inner.named_child_count() {
+                            if let Some(item) = inner.named_child(j) {
+                                self.dispatch_top(item, bytes, symbols, imports);
+                            }
+                        }
+                    } else if let Some(inner) = c.named_child(i) {
+                        // Single-statement extern (no braces).
+                        self.dispatch_top(inner, bytes, symbols, imports);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -508,5 +573,39 @@ mod tests {
         assert!(callees.contains(&"helper".to_string()));
         assert!(callees.contains(&"bar".to_string()));
         assert!(callees.contains(&"Foo".to_string()));
+    }
+
+    /// `extern "C" { ... }` blocks — previously dropped entirely.
+    #[test]
+    fn extracts_extern_c_block_contents() {
+        let src = "extern \"C\" {\n  int c_function(int x);\n  void c_void(void);\n}\nint c_function(int x) { return x; }\nvoid c_void(void) {}\n";
+        let f = CppAdapter.extract(&pb("a.cpp"), src).unwrap();
+        assert!(f.symbols.iter().any(|s| s.name == "c_function"));
+        assert!(f.symbols.iter().any(|s| s.name == "c_void"));
+    }
+
+    /// Out-of-line method definitions `void Foo::bar() {}` attach
+    /// to the qualifying class via parent_class.
+    #[test]
+    fn out_of_line_method_attaches_to_qualifying_class() {
+        let src = "class Foo { public: void bar(); };\nvoid Foo::bar() {}\n";
+        let f = CppAdapter.extract(&pb("a.cpp"), src).unwrap();
+        // There are two `bar` symbols: the declaration inside Foo,
+        // and the out-of-line definition. Both should be Methods
+        // with parent_class = "Foo".
+        let bars: Vec<_> = f.symbols.iter().filter(|s| s.name == "bar").collect();
+        assert!(!bars.is_empty(), "no bar symbols");
+        assert!(
+            bars.iter().all(|s| matches!(s.kind, SymbolKind::Method)),
+            "every bar should be a Method; got {:?}",
+            bars.iter()
+                .map(|s| (s.kind, s.parent_class.clone()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            bars.iter()
+                .all(|s| s.parent_class.as_deref() == Some("Foo")),
+            "every bar's parent_class should be Foo",
+        );
     }
 }

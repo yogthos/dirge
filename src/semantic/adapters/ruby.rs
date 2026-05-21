@@ -130,6 +130,22 @@ impl RubyAdapter {
                 }
                 // Nested class / module — recurse.
                 "class" | "module" => self.walk_top(c, s, symbols, Some(parent.to_string())),
+                // `class << self ... end` — singleton class block.
+                // Methods defined inside are class methods on the
+                // enclosing class. tree-sitter exposes the block as
+                // `singleton_class`; walk its body and emit each
+                // `method` as a Method on `parent`. Without this,
+                // the entire `class << self` block of methods was
+                // invisible to list_symbols.
+                "singleton_class" => {
+                    for j in 0..c.named_child_count() {
+                        if let Some(body) = c.named_child(j)
+                            && body.kind() == "body_statement"
+                        {
+                            self.walk_class_body(body, s, symbols, parent);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -396,5 +412,18 @@ mod tests {
             .unwrap();
         assert!(callees.contains(&"puts".to_string()));
         assert!(callees.contains(&"helper".to_string()));
+    }
+
+    /// `class << self` singleton class blocks define class methods.
+    /// Previously the entire block's methods were invisible.
+    #[test]
+    fn extracts_singleton_class_methods_as_class_methods() {
+        let src = "class A\n  class << self\n    def factory; new; end\n    def banner; puts \"hi\"; end\n  end\nend\n";
+        let f = RubyAdapter.extract(&pb("a.rb"), src).unwrap();
+        let factory = f.symbols.iter().find(|s| s.name == "factory").unwrap();
+        let banner = f.symbols.iter().find(|s| s.name == "banner").unwrap();
+        assert!(matches!(factory.kind, SymbolKind::Method));
+        assert_eq!(factory.parent_class.as_deref(), Some("A"));
+        assert_eq!(banner.parent_class.as_deref(), Some("A"));
     }
 }

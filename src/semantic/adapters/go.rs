@@ -185,6 +185,50 @@ impl GoAdapter {
         }
     }
 
+    /// Walks `var_declaration` / `const_declaration` (both bare and
+    /// grouped) and emits one Variable per declared name. Grouped
+    /// declarations have `var_spec` / `const_spec` children, each
+    /// with one or more `identifier`s. Bare declarations carry the
+    /// spec inline.
+    fn handle_var_or_const(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>) {
+        let mut emit_from_spec = |spec: Node| {
+            for j in 0..spec.named_child_count() {
+                if let Some(id) = spec.named_child(j)
+                    && id.kind() == "identifier"
+                {
+                    let name = self.text(id, s).to_string();
+                    symbols.push(Symbol {
+                        kind: SymbolKind::Variable,
+                        is_exported: self.is_exported(&name),
+                        name,
+                        range: self.range(spec),
+                        signature: self.text(spec, s).lines().next().unwrap_or("").to_string(),
+                        parent_class: None,
+                    });
+                }
+            }
+        };
+        for i in 0..n.named_child_count() {
+            let Some(c) = n.named_child(i) else { continue };
+            match c.kind() {
+                "var_spec" | "const_spec" => emit_from_spec(c),
+                // Grouped form `var ( a = 1; b = 2 )` wraps the
+                // specs in a `var_spec_list` (or `const_spec_list`);
+                // unwrap to get each spec.
+                "var_spec_list" | "const_spec_list" => {
+                    for j in 0..c.named_child_count() {
+                        if let Some(spec) = c.named_child(j)
+                            && matches!(spec.kind(), "var_spec" | "const_spec")
+                        {
+                            emit_from_spec(spec);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn handle_imports(&self, n: Node, s: &[u8], imports: &mut Vec<Import>) {
         // import_declaration has import_spec children (or import_spec_list).
         let mut harvest = |spec: Node| {
@@ -269,6 +313,14 @@ impl LanguageAdapter for GoAdapter {
                 "method_declaration" => self.handle_method(c, source_bytes, &mut symbols),
                 "type_declaration" => self.handle_type_decl(c, source_bytes, &mut symbols),
                 "import_declaration" => self.handle_imports(c, source_bytes, &mut imports),
+                // Top-level `var x = ...;` / `const x = ...;` and
+                // their grouped forms `var ( x = 1; y = 2 )`. Both
+                // shapes use the same node kinds at the top level;
+                // grouped declarations have multiple `var_spec` /
+                // `const_spec` children.
+                "var_declaration" | "const_declaration" => {
+                    self.handle_var_or_const(c, source_bytes, &mut symbols);
+                }
                 _ => {}
             }
         }
@@ -388,5 +440,25 @@ mod tests {
             .unwrap();
         assert!(callees.contains(&"Println".to_string()));
         assert!(callees.contains(&"helper".to_string()));
+    }
+
+    /// Top-level `var` / `const` (both bare and grouped) — previously
+    /// dropped entirely.
+    #[test]
+    fn extracts_var_and_const_declarations() {
+        let src = "package main\nvar Single = 1\nvar (\n  Grouped = 2\n  Other = 3\n)\nconst Max = 100\nconst (\n  A = \"a\"\n  B = \"b\"\n)\n";
+        let f = GoAdapter.extract(&pb("a.go"), src).unwrap();
+        for needed in ["Single", "Grouped", "Other", "Max", "A", "B"] {
+            assert!(
+                f.symbols.iter().any(|s| s.name == needed),
+                "missing var/const: {needed}; got {:?}",
+                f.symbols.iter().map(|s| &s.name).collect::<Vec<_>>(),
+            );
+        }
+        // All these uppercase names should be exported.
+        for needed in ["Single", "Grouped", "Max"] {
+            let sym = f.symbols.iter().find(|s| s.name == needed).unwrap();
+            assert!(sym.is_exported, "{needed} should be exported");
+        }
     }
 }
