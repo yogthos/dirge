@@ -220,22 +220,51 @@ where
                     tool_call,
                     internal_call_id,
                 }) => {
-                    // Complete tool call in one shot. Push and
-                    // emit start + end for symmetry with pi's
-                    // event vocabulary.
-                    let idx = partial.content.len();
-                    partial.content.push(ContentBlock::ToolCall {
+                    // H-7 bug fix (scenario 3): some providers
+                    // (DeepSeek, OpenAI in some configurations)
+                    // emit BOTH streaming ToolCallDelta events
+                    // AND a final Complete ToolCall for the SAME
+                    // logical call. The earlier version always
+                    // pushed a new ContentBlock here, producing
+                    // a duplicate block and causing the loop to
+                    // dispatch the tool TWICE — the next request
+                    // then sent duplicate tool_call_ids in
+                    // history and the provider rejected it
+                    // (400). Fix: if a delta-built block exists
+                    // for this `internal_call_id`, REPLACE it
+                    // with the authoritative complete payload
+                    // instead of pushing a new one. Emit only
+                    // ToolCallEnd (the Delta path already emitted
+                    // ToolCallStart) for the dedup case;
+                    // freshly-pushed blocks emit Start + End
+                    // as before.
+                    let new_block = ContentBlock::ToolCall {
                         id: tool_call.id.clone(),
                         name: tool_call.function.name.clone(),
                         arguments: tool_call.function.arguments.clone(),
-                    });
-                    tool_indices.insert(internal_call_id, idx);
+                    };
+                    let was_existing =
+                        tool_indices.contains_key(&internal_call_id);
+                    if was_existing {
+                        let idx = *tool_indices.get(&internal_call_id).unwrap();
+                        if let Some(block) = partial.content.get_mut(idx) {
+                            *block = new_block;
+                        }
+                    } else {
+                        let idx = partial.content.len();
+                        partial.content.push(new_block);
+                        tool_indices.insert(internal_call_id, idx);
+                    }
                     current_text_idx = None;
                     current_thinking_idx = None;
-                    yield StreamEvent::Delta {
-                        partial: partial.clone(),
-                        phase: DeltaPhase::ToolCallStart,
-                    };
+                    if !was_existing {
+                        // Fresh push → emit Start.
+                        yield StreamEvent::Delta {
+                            partial: partial.clone(),
+                            phase: DeltaPhase::ToolCallStart,
+                        };
+                    }
+                    // Always emit End — marks the call complete.
                     yield StreamEvent::Delta {
                         partial: partial.clone(),
                         phase: DeltaPhase::ToolCallEnd,
@@ -532,6 +561,126 @@ mod tests {
             }
             _ => panic!("expected Done"),
         }
+    }
+
+    /// H-7 regression: DeepSeek (and some OpenAI configs) emit
+    /// BOTH streaming `ToolCallDelta` events AND a final
+    /// `ToolCall { tool_call }` complete event for the SAME
+    /// logical call (same `internal_call_id`). Earlier code
+    /// pushed two separate ContentBlock::ToolCall entries,
+    /// causing the loop to dispatch the tool TWICE.
+    ///
+    /// Expected behavior: the delta-built block is REPLACED by
+    /// the complete-event payload (single block, single
+    /// dispatch). Only ToolCallStart from the first delta;
+    /// ToolCallEnd from the complete event. Provider's complete
+    /// args overwrite the accumulated-string args from deltas.
+    #[tokio::test]
+    async fn wraps_provider_emitting_both_deltas_and_complete_dedups() {
+        let raw = raw_stream(vec![
+            // Streaming deltas first.
+            Ok(StreamedAssistantContent::ToolCallDelta {
+                id: "call_x".to_string(),
+                internal_call_id: "internal_x".to_string(),
+                content: ToolCallDeltaContent::Name("echo_tool".to_string()),
+            }),
+            Ok(StreamedAssistantContent::ToolCallDelta {
+                id: "call_x".to_string(),
+                internal_call_id: "internal_x".to_string(),
+                content: ToolCallDeltaContent::Delta("{\"text\":\"pineapple\"}".to_string()),
+            }),
+            // Then the SAME logical call as a Complete event
+            // (with the same internal_call_id).
+            Ok(StreamedAssistantContent::ToolCall {
+                tool_call: ToolCall {
+                    id: "call_x".to_string(),
+                    call_id: None,
+                    function: ToolFunction {
+                        name: "echo_tool".to_string(),
+                        arguments: serde_json::json!({"text": "pineapple"}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                },
+                internal_call_id: "internal_x".to_string(),
+            }),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None)).await;
+        let final_msg = events
+            .iter()
+            .rev()
+            .find_map(|e| {
+                if let StreamEvent::Done { message, .. } = e {
+                    Some(message.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("Done");
+        // Critical assertion: ONE tool call block, not two.
+        let tool_call_count = final_msg
+            .content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolCall { .. }))
+            .count();
+        assert_eq!(
+            tool_call_count, 1,
+            "expected 1 ToolCall block after dedup; got {tool_call_count}. \
+             This is the h-7 scenario-3 regression — DeepSeek and some OpenAI \
+             configs emit both delta + complete for the same call."
+        );
+        // The single block should carry the Complete event's
+        // payload (parsed args), not the delta-accumulated
+        // string.
+        if let ContentBlock::ToolCall {
+            id,
+            name,
+            arguments,
+        } = &final_msg.content[0]
+        {
+            assert_eq!(id, "call_x");
+            assert_eq!(name, "echo_tool");
+            // Should be a parsed object, not a JSON string.
+            assert!(
+                arguments.is_object(),
+                "args should be a parsed object after dedup; got: {arguments:?}"
+            );
+            assert_eq!(arguments["text"], "pineapple");
+        } else {
+            panic!("expected ToolCall block");
+        }
+
+        // Event sequence should have ToolCallStart (from first
+        // delta) followed by ToolCallDelta(s) and a single
+        // ToolCallEnd (from the complete event). No second
+        // ToolCallStart from the complete event because dedup
+        // path skips it.
+        let starts = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    StreamEvent::Delta {
+                        phase: DeltaPhase::ToolCallStart,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let ends = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    StreamEvent::Delta {
+                        phase: DeltaPhase::ToolCallEnd,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(starts, 1, "expected 1 ToolCallStart; got {starts}");
+        assert_eq!(ends, 1, "expected 1 ToolCallEnd; got {ends}");
     }
 
     /// Reasoning deltas accumulate into a Thinking block.

@@ -25,6 +25,8 @@
 #![allow(unused_imports)]
 
 pub mod bridge;
+#[cfg(test)]
+mod h7_smoke;
 pub mod hooks;
 pub mod integration;
 pub mod message;
