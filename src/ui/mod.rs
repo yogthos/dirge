@@ -295,7 +295,12 @@ fn build_panel_data(
     };
 
     let cwd_path = Path::new(session.working_dir.as_str()).to_path_buf();
-    let modified: Vec<String> = crate::agent::tools::modified::recent(8)
+    // Pull the full tracked set (capped at MAX_MODIFIED=256 inside the
+    // tracker). The renderer's `build_panel_lines` decides how many
+    // actually fit in the panel based on remaining terminal rows and
+    // appends a `+N older` footer when truncated — matches opencode's
+    // grow-to-fit pattern.
+    let modified: Vec<String> = crate::agent::tools::modified::recent(256)
         .into_iter()
         .map(|p| {
             p.strip_prefix(&cwd_path)

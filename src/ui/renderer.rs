@@ -1159,7 +1159,7 @@ impl Renderer {
 
         // Build the rendered lines first so we know how many we have, then
         // paint top-to-bottom up to last_row-1.
-        let lines = self.build_panel_lines(width);
+        let lines = self.build_panel_lines(width, rows);
 
         // Themed panel colors. Source lines still use the legacy
         // sentinels (Color::Cyan = header, Color::Reset = dim,
@@ -1203,7 +1203,13 @@ impl Renderer {
     /// Materialize the panel content as `(line, color)` pairs of at most
     /// `width` chars each. Sections are separated by blank lines and a
     /// header. Lines past terminal height are dropped by the caller.
-    fn build_panel_lines(&self, width: usize) -> Vec<(String, Color)> {
+    ///
+    /// `total_rows` is the terminal's total row count (from
+    /// `crossterm::terminal::size`). Passed in rather than queried
+    /// here so the MODIFIED section can budget its row count
+    /// deterministically — and so tests can drive any terminal size
+    /// without spinning up a PTY.
+    fn build_panel_lines(&self, width: usize, total_rows: u16) -> Vec<(String, Color)> {
         let d = &self.panel_data;
         let mut out: Vec<(String, Color)> = Vec::new();
 
@@ -1331,18 +1337,63 @@ impl Renderer {
             .collect();
         push_section(&mut out, "TODOS", todo_items);
 
-        // Modified-files panel section: filename matters more than the
-        // path prefix, so truncate from the *left* (`…foo/bar.rs`)
-        // rather than the right. Available content width inside the
-        // chamber row is roughly `inner - 2` (the `  ` indent inside
-        // the `│ … │` borders).
+        // Modified-files panel section. Opencode-style grow-to-fit:
+        // show as many entries as the remaining panel rows allow,
+        // with a `+N older` footer when the list was truncated.
+        // Older entries (oldest at the FRONT of `d.modified`,
+        // newest at the BACK — `recent()` returns insertion order)
+        // get dropped first; the user always sees the freshest
+        // touches.
+        //
+        // Per-row width: filename matters more than the path prefix
+        // so we left-truncate (`…foo/bar.rs`).
         let mod_max = inner.saturating_sub(2);
-        let mod_items: Vec<(String, Color)> = d
-            .modified
-            .iter()
-            .map(|p| (format!("  {}", left_truncate(p, mod_max)), Color::White))
-            .collect();
-        push_section(&mut out, "MODIFIED", mod_items);
+
+        // Budget: terminal rows minus the status row at the bottom
+        // minus everything already pushed above. Each new section
+        // costs `3 + max(1, items.len())` rows (blank + header +
+        // body + bottom). MODIFIED needs ≥4 rows to be worth
+        // rendering at all (blank + header + 1 item + bottom);
+        // below that, hide it entirely.
+        let last_row = (total_rows as usize).saturating_sub(1);
+        let used = out.len();
+        let available = last_row.saturating_sub(used);
+        const MIN_MOD_SECTION_ROWS: usize = 4;
+        const FRAME_OVERHEAD: usize = 3; // blank + header + bottom
+
+        if available >= MIN_MOD_SECTION_ROWS {
+            let row_budget = available.saturating_sub(FRAME_OVERHEAD);
+            let total = d.modified.len();
+            // Reserve one row for the "+N older" footer when we
+            // know we'll truncate. If total fits in row_budget,
+            // no footer needed.
+            let (visible_count, hidden) = if total <= row_budget {
+                (total, 0)
+            } else {
+                let visible = row_budget.saturating_sub(1).max(1);
+                (visible, total - visible)
+            };
+
+            // Show the freshest `visible_count` entries. The
+            // tracker is insertion-ordered (oldest first, newest
+            // last), so we take the tail.
+            let start = total.saturating_sub(visible_count);
+            let mut mod_items: Vec<(String, Color)> = d
+                .modified
+                .iter()
+                .skip(start)
+                .map(|p| (format!("  {}", left_truncate(p, mod_max)), Color::White))
+                .collect();
+            if hidden > 0 {
+                mod_items.push((
+                    format!("  · +{} older", hidden),
+                    Color::Reset, // dim — distinguishes the footer
+                ));
+            }
+            push_section(&mut out, "MODIFIED", mod_items);
+        }
+        // Else: not enough vertical room. Better to omit the section
+        // than render a half-clipped one.
 
         out
     }
@@ -1851,5 +1902,91 @@ mod tests {
         let (rows, cr, cc) = wrap_input(&lines(&["abc"]), 0, 2, 1);
         assert_eq!(rows.len(), 3);
         assert_eq!((cr, cc), (2, 0));
+    }
+
+    /// MODIFIED section grows to fill available rows. With 100 entries
+    /// in `d.modified` and a 50-row terminal, we should see roughly
+    /// (50 - status_row - other_sections - frame_overhead) entries
+    /// plus a `+N older` footer that accounts for the rest.
+    ///
+    /// The test exercises `build_panel_lines` directly via a Renderer
+    /// instance with a forced terminal size.
+    #[test]
+    fn modified_section_grows_to_fit_terminal() {
+        use super::PanelData;
+        let mut r = Renderer::new().expect("renderer");
+        let entries: Vec<String> = (0..100).map(|i| format!("file_{i}.rs")).collect();
+        r.set_panel_data(PanelData {
+            cwd: "test".into(),
+            mcp: Vec::new(),
+            lsp: Vec::new(),
+            todos: Vec::new(),
+            modified: entries,
+        });
+        // Force a known terminal height; width irrelevant to this test.
+        let lines = r.build_panel_lines(30, 50);
+        let modified_header_idx = lines
+            .iter()
+            .position(|(s, _)| s.contains("MODIFIED"))
+            .expect("MODIFIED section present");
+        // Count rows between the header and the section bottom.
+        // The footer `+N older` should be the last content row.
+        let footer_idx = lines
+            .iter()
+            .position(|(s, _)| s.contains("+") && s.contains("older"))
+            .expect("+N older footer present when truncated");
+        assert!(footer_idx > modified_header_idx);
+        // At least a handful of files visible.
+        let visible_files = lines[modified_header_idx + 1..footer_idx]
+            .iter()
+            .filter(|(s, _)| s.contains("file_"))
+            .count();
+        assert!(
+            visible_files >= 5,
+            "expected at least 5 visible files, got {visible_files}"
+        );
+    }
+
+    /// When the list fits entirely in the available rows, no `+N older`
+    /// footer is emitted.
+    #[test]
+    fn modified_section_no_footer_when_fits() {
+        use super::PanelData;
+        let mut r = Renderer::new().expect("renderer");
+        r.set_panel_data(PanelData {
+            cwd: "test".into(),
+            mcp: Vec::new(),
+            lsp: Vec::new(),
+            todos: Vec::new(),
+            modified: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+        });
+        let lines = r.build_panel_lines(30, 50);
+        let footer_present = lines
+            .iter()
+            .any(|(s, _)| s.contains("+") && s.contains("older"));
+        assert!(!footer_present, "no footer expected when list fits");
+    }
+
+    /// On a tiny terminal (rows < MIN_MOD_SECTION_ROWS after other
+    /// sections), the MODIFIED section is omitted entirely rather than
+    /// painted as a half-clipped fragment.
+    #[test]
+    fn modified_section_omitted_when_no_room() {
+        use super::PanelData;
+        let mut r = Renderer::new().expect("renderer");
+        r.set_panel_data(PanelData {
+            cwd: "test".into(),
+            mcp: vec![("a".into(), true), ("b".into(), true)],
+            lsp: vec![("rust".into(), "/r".into(), true)],
+            todos: vec![("[~]".into(), "t".into())],
+            modified: vec!["x.rs".into()],
+        });
+        // Very short — cwd + MCP + LSP + TODOS already eat most of it.
+        let lines = r.build_panel_lines(30, 12);
+        let has_modified = lines.iter().any(|(s, _)| s.contains("MODIFIED"));
+        assert!(
+            !has_modified,
+            "MODIFIED should be omitted on a too-short terminal"
+        );
     }
 }
