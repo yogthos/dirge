@@ -4,7 +4,6 @@ mod semantic_tests {
     use std::sync::Arc;
 
     use crate::semantic::adapters::AdapterRegistry;
-    use crate::semantic::types::SymbolKind;
     use crate::semantic::{LanguageAdapter, SymbolIndex};
 
     fn fixtures_dir() -> PathBuf {
@@ -15,6 +14,7 @@ mod semantic_tests {
     }
 
     fn mk_registry() -> Arc<AdapterRegistry> {
+        #[allow(unused_mut)]
         let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
 
         #[cfg(feature = "semantic-ts")]
@@ -22,6 +22,9 @@ mod semantic_tests {
 
         #[cfg(feature = "semantic-python")]
         adapters.push(Box::new(crate::semantic::adapters::PythonAdapter));
+
+        #[cfg(feature = "semantic-elixir")]
+        adapters.push(Box::new(crate::semantic::adapters::ElixirAdapter));
 
         Arc::new(AdapterRegistry::new(adapters))
     }

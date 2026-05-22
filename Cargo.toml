@@ -32,6 +32,7 @@ semantic-rust = ["semantic", "dep:tree-sitter-rust"]
 semantic-java = ["semantic", "dep:tree-sitter-java"]
 semantic-c = ["semantic", "dep:tree-sitter-c"]
 semantic-cpp = ["semantic", "dep:tree-sitter-cpp"]
+semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 
@@ -90,6 +91,7 @@ janetrs = { version = "0.8", optional = true }
 html2text = "0.17"
 indexmap = "2"
 lsp-types = { version = "0.97", optional = true }
+tree-sitter-elixir = { version = "0.3.5", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

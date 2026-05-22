@@ -86,7 +86,13 @@ pub fn signature_first_line(node: Node, source: &[u8]) -> String {
 /// name; this returns everything before it, trimmed. Falls back to
 /// the first-line-capped form when no `body` field exists. Used by
 /// adapters whose signature concept is "the declarator + return
-/// type, minus the body" — Go, Java, C, C++, Rust.
+/// type, minus the body" — Go, C, C++, Rust.
+#[cfg(any(
+    feature = "semantic-go",
+    feature = "semantic-c",
+    feature = "semantic-cpp",
+    feature = "semantic-rust"
+))]
 pub fn signature_up_to_body(node: Node, source: &[u8]) -> String {
     if let Some(body) = node.child_by_field_name("body") {
         return String::from_utf8_lossy(&source[node.start_byte()..body.start_byte()])
@@ -98,30 +104,26 @@ pub fn signature_up_to_body(node: Node, source: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::semantic::types::ByteRange;
-    use tree_sitter::Parser;
-
     /// `ByteRange::from(Node)` produces the right line numbers
     /// (1-based) and byte offsets. Sanity check the shared
     /// converter that replaces 7 copies of the same body.
     #[test]
+    #[cfg(feature = "semantic-clojure")]
     fn byte_range_from_node_uses_1_based_lines() {
-        // Use any registered grammar; clojure is always built in
-        // the test feature set.
-        #[cfg(feature = "semantic-clojure")]
-        {
-            let mut p = Parser::new();
-            let lang: tree_sitter::Language = tree_sitter_clojure::LANGUAGE.into();
-            p.set_language(&lang).unwrap();
-            let src = "\n(defn foo [] :ok)\n";
-            let t = p.parse(src, None).unwrap();
-            // First named child of `source` is the defn list_lit.
-            let list_lit = t.root_node().named_child(0).unwrap();
-            let range = ByteRange::from(list_lit);
-            // defn is on line 2 (1-based) after the leading \n.
-            assert_eq!(range.start_line, 2);
-            assert_eq!(range.end_line, 2);
-            assert_eq!(range.start_byte, 1);
-        }
+        use crate::semantic::types::ByteRange;
+        use tree_sitter::Parser;
+
+        let mut p = Parser::new();
+        let lang: tree_sitter::Language = tree_sitter_clojure::LANGUAGE.into();
+        p.set_language(&lang).unwrap();
+        let src = "\n(defn foo [] :ok)\n";
+        let t = p.parse(src, None).unwrap();
+        // First named child of `source` is the defn list_lit.
+        let list_lit = t.root_node().named_child(0).unwrap();
+        let range = ByteRange::from(list_lit);
+        // defn is on line 2 (1-based) after the leading \n.
+        assert_eq!(range.start_line, 2);
+        assert_eq!(range.end_line, 2);
+        assert_eq!(range.start_byte, 1);
     }
 }

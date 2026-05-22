@@ -428,7 +428,6 @@ mod tests {
 
     /// `phosphor` and `plain` differ in their agent color — quick
     /// sanity check that the presets aren't accidentally identical.
-    #[test]
     /// Regression: `is_bright` must handle `Color::Rgb` and
     /// `Color::AnsiValue` introduced by PR #102's custom theme
     /// JSON. Without this, vibrant RGB colors in a user theme

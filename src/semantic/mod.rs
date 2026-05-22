@@ -58,6 +58,9 @@ impl SemanticManager {
         #[cfg(feature = "semantic-cpp")]
         adapters.push(Box::new(adapters::CppAdapter));
 
+        #[cfg(feature = "semantic-elixir")]
+        adapters.push(Box::new(adapters::ElixirAdapter));
+
         let registry = Arc::new(adapters::AdapterRegistry::new(adapters));
         let index = Arc::new(RwLock::new(SymbolIndex::new(registry)));
 
