@@ -318,6 +318,15 @@ pub async fn handle_slash(
                 .await;
                 session.model = new_model.clone();
                 session.provider = cli.resolve_provider(cfg);
+                // Re-resolve the context window for the new model.
+                // Without this, switching from a 128k model to a 1M
+                // model would leave the status indicator capped at
+                // 128k. config explicit value always wins; otherwise
+                // the per-model table is consulted.
+                let new_ctx = cfg.resolve_context_window(new_model.as_str());
+                if new_ctx != session.context_window {
+                    session.context_window = new_ctx;
+                }
                 renderer.write_line(&format!("switched to model: {}", new_model), c_agent())?;
             }
         }

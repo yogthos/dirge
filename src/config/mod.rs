@@ -186,8 +186,18 @@ impl Config {
         self.custom_providers.clone().unwrap_or_default()
     }
 
-    pub fn resolve_context_window(&self) -> u64 {
-        self.context_window.unwrap_or(128_000)
+    /// Resolve the context window for the active model. Precedence:
+    ///   1. explicit `context_window` in config.json
+    ///   2. per-model static table (`context_window_for_model`)
+    ///   3. 128_000 fallback
+    ///
+    /// `model` is the resolved model id (after CLI / config / default
+    /// resolution). Passing an empty string falls through to (3).
+    pub fn resolve_context_window(&self, model: &str) -> u64 {
+        if let Some(v) = self.context_window {
+            return v;
+        }
+        context_window_for_model(model).unwrap_or(128_000)
     }
 
     pub fn resolve_reserve_tokens(&self) -> u64 {
@@ -246,6 +256,79 @@ impl Config {
     pub fn resolve_show_edit_diff(&self) -> bool {
         self.show_edit_diff.unwrap_or(true)
     }
+}
+
+/// Static per-model context-window table. Returns `None` for unknown
+/// models so callers can fall back to a sane default. Matched by
+/// case-insensitive substring so a provider-prefixed or
+/// version-suffixed id (`openai/gpt-4o`, `claude-3.5-sonnet-20241022`,
+/// `deepseek-v4-pro`) still hits the right family. Order matters:
+/// the FIRST matching prefix wins — list longer / more-specific
+/// keys first.
+///
+/// Values are the model's documented maximum context (input + output
+/// combined where the provider quotes a unified figure). Update as
+/// providers extend their context budgets.
+pub fn context_window_for_model(model: &str) -> Option<u64> {
+    let m = model.to_lowercase();
+    // Ordered: most-specific first.
+    const TABLE: &[(&str, u64)] = &[
+        // DeepSeek
+        ("deepseek-v4", 1_000_000),
+        ("deepseek-r1", 128_000),
+        ("deepseek", 128_000),
+        // GLM / ZhipuAI
+        ("glm-4.6", 200_000),
+        ("glm-4.5", 128_000),
+        ("glm-4", 128_000),
+        // Anthropic Claude
+        ("claude-opus-4-5", 1_000_000),
+        ("claude-opus-4-7", 1_000_000),
+        ("claude-sonnet-4-5", 1_000_000),
+        ("claude-sonnet-4-6", 1_000_000),
+        ("claude-opus", 200_000),
+        ("claude-sonnet", 200_000),
+        ("claude-haiku", 200_000),
+        ("claude-3-7", 200_000),
+        ("claude-3.5", 200_000),
+        ("claude-3", 200_000),
+        ("claude", 200_000),
+        // OpenAI GPT
+        ("gpt-5", 400_000),
+        ("gpt-4.1", 1_000_000),
+        ("gpt-4o", 128_000),
+        ("gpt-4-turbo", 128_000),
+        ("gpt-4", 128_000),
+        ("o3", 200_000),
+        ("o1", 200_000),
+        // Google Gemini
+        ("gemini-2.0-flash-thinking", 32_000),
+        ("gemini-2.5-pro", 2_000_000),
+        ("gemini-2.5-flash", 1_000_000),
+        ("gemini-2.0-pro", 2_000_000),
+        ("gemini-2.0-flash", 1_000_000),
+        ("gemini-1.5-pro", 2_000_000),
+        ("gemini-1.5-flash", 1_000_000),
+        ("gemini-pro", 128_000),
+        ("gemini", 128_000),
+        // Meta / Llama (via OpenRouter and others)
+        ("llama-4", 1_000_000),
+        ("llama-3.3", 128_000),
+        ("llama-3.1", 128_000),
+        ("llama-3", 8_000),
+        // Mistral
+        ("mistral-large", 128_000),
+        ("mistral", 32_000),
+        // Qwen
+        ("qwen2.5", 128_000),
+        ("qwen", 32_000),
+    ];
+    for (key, window) in TABLE {
+        if m.contains(key) {
+            return Some(*window);
+        }
+    }
+    None
 }
 
 pub fn config_file_path() -> PathBuf {
@@ -391,5 +474,69 @@ mod tests {
             "info"
         );
         assert_eq!(overrides["typescript"].disabled, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod model_context_tests {
+    use super::*;
+
+    /// Per-model table maps common provider/version-prefixed ids to
+    /// their published context windows.
+    #[test]
+    fn known_models_resolve_to_published_windows() {
+        for (model, want) in &[
+            ("deepseek-v4-pro", 1_000_000),
+            ("deepseek/deepseek-v4-flash", 1_000_000),
+            ("claude-opus-4-7", 1_000_000),
+            ("claude-sonnet-4-6", 1_000_000),
+            ("claude-3.5-sonnet-20241022", 200_000),
+            ("openai/gpt-4o", 128_000),
+            ("gpt-5", 400_000),
+            ("gemini-2.5-pro", 2_000_000),
+            ("gemini-1.5-flash-002", 1_000_000),
+            ("glm-4.6", 200_000),
+        ] {
+            let got = context_window_for_model(model);
+            assert_eq!(
+                got,
+                Some(*want),
+                "model {model} expected {want}, got {got:?}",
+            );
+        }
+    }
+
+    /// Unknown models return `None` so the caller falls back to the
+    /// 128k default.
+    #[test]
+    fn unknown_model_returns_none() {
+        assert!(context_window_for_model("totally-fictional-model").is_none());
+        assert!(context_window_for_model("").is_none());
+    }
+
+    /// Match is case-insensitive — provider ids that uppercase
+    /// product names still hit the table.
+    #[test]
+    fn model_match_is_case_insensitive() {
+        assert_eq!(context_window_for_model("Claude-Opus-4-7"), Some(1_000_000));
+        assert_eq!(context_window_for_model("DEEPSEEK-V4-PRO"), Some(1_000_000));
+    }
+
+    /// Explicit `context_window` in config wins over the model table.
+    #[test]
+    fn explicit_config_overrides_model_table() {
+        let cfg = Config {
+            context_window: Some(50_000),
+            ..Default::default()
+        };
+        // deepseek would normally resolve to 1M.
+        assert_eq!(cfg.resolve_context_window("deepseek-v4-pro"), 50_000);
+    }
+
+    /// Default fallback (no explicit config, unknown model) = 128k.
+    #[test]
+    fn fallback_default_is_128k() {
+        let cfg = Config::default();
+        assert_eq!(cfg.resolve_context_window("unknown-model-9000"), 128_000);
     }
 }

@@ -33,8 +33,8 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 _dirge_ is one of the smallest and most performant coding agents on the market.
 
 - Lines of code: ~49k LoC
-- Binary size: 12MB
-- RAM footprint: ~8MB on an empty session, ~12MB when working (vs ~300MB for opencode or other JS-based coding agents)
+- Binary size: 25MB
+- RAM footprint: ~8MB on an empty session, ~15MB when working (vs ~300MB for opencode or other JS-based coding agents)
 
 ### Tool result caching
 

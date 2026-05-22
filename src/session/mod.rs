@@ -431,7 +431,40 @@ impl Session {
         // one — otherwise the rebuild would re-insert this new message
         // with the wrong parent.
         self.ensure_back_compat_initialized();
-        let tokens = Self::estimate_tokens(content);
+        // User-reported under-count: status line stuck at ~16k/128k
+        // after a long session. Root cause was that this estimate only
+        // counted the assistant TEXT — not the tool args the LLM sent
+        // nor the tool RESULT text the LLM re-saw on every subsequent
+        // turn. `convert_history` re-emits structured tool_use /
+        // tool_result blocks containing both, so the model's actual
+        // context grows by exactly those bytes too. Estimate the FULL
+        // serialized assistant turn here so the status indicator
+        // tracks what the model is actually carrying.
+        let mut tokens = Self::estimate_tokens(content);
+        for tc in &tool_calls {
+            // Tool args: roughly serialize_json(args).len() / 4.
+            tokens = tokens
+                .saturating_add(Self::estimate_tokens(&tc.args.to_string()))
+                // Plus the tool name + a few framing bytes
+                // (`tool_use_id`, `<tool_use>` framing). Approximate
+                // at 16 tokens of overhead per call — empirically
+                // matches what providers report for the wrapper.
+                .saturating_add(Self::estimate_tokens(&tc.name))
+                .saturating_add(16);
+            match &tc.state {
+                ToolCallState::Completed { result } => {
+                    tokens = tokens.saturating_add(Self::estimate_tokens(result));
+                }
+                ToolCallState::Failed { error } => {
+                    tokens = tokens.saturating_add(Self::estimate_tokens(error));
+                }
+                ToolCallState::Interrupted => {
+                    // Re-emitted as the fixed string "[Tool execution
+                    // was interrupted]" on resume — small constant.
+                    tokens = tokens.saturating_add(8);
+                }
+            }
+        }
         let id = new_message_id();
         let timestamp = chrono::Utc::now().timestamp();
         // Capture the parent NOW, before we touch the leaf — first
@@ -994,6 +1027,67 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 50, "ids should be unique across 50 messages");
+    }
+
+    /// User-reported: status line stuck at ~16/128k after a long
+    /// session because tool args + tool results weren't counted.
+    /// An assistant message that ran a tool with a 2 KB args blob
+    /// and got back an 8 KB result should add the COMBINED bytes
+    /// (text + args + result) / 4 — plus a small per-call overhead
+    /// — to `total_estimated_tokens`. This test pins the contract.
+    #[test]
+    fn tool_call_args_and_results_count_toward_estimate() {
+        let mut s = Session::new("p", "m", 0);
+        // Baseline: a plain user message.
+        s.add_message(MessageRole::User, "hi");
+        let baseline = s.total_estimated_tokens;
+
+        // Assistant message with one tool call carrying ~8 KB result.
+        let result = "x".repeat(8000);
+        let args = serde_json::json!({ "command": "ls -la /very/deep/path" });
+        let tc = ToolCallEntry {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            args: args.clone(),
+            state: ToolCallState::Completed {
+                result: result.clone(),
+            },
+        };
+        s.add_message_with_tool_calls(MessageRole::Assistant, "I'll run that.", vec![tc]);
+
+        let delta = s.total_estimated_tokens - baseline;
+        // Expected: text ("I'll run that.") + args (~37 chars) +
+        // result (8000 chars) + name ("bash") + 16 overhead. All
+        // estimated at chars/4. Result alone is 8000/4 = 2000
+        // tokens; delta must therefore be ≥ 1900 (allow some slack
+        // for estimator rounding differences).
+        assert!(
+            delta >= 1900,
+            "tool result must dominate the estimate: delta = {delta}",
+        );
+        // Sanity upper bound: not pathologically large either.
+        assert!(delta < 3000, "delta = {delta} should be ~2050");
+    }
+
+    /// A Failed tool call counts the error string too.
+    #[test]
+    fn failed_tool_call_counts_error_text() {
+        let mut s = Session::new("p", "m", 0);
+        let big_err = "y".repeat(4000);
+        let tc = ToolCallEntry {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({}),
+            state: ToolCallState::Failed {
+                error: big_err.clone(),
+            },
+        };
+        s.add_message_with_tool_calls(MessageRole::Assistant, "", vec![tc]);
+        assert!(
+            s.total_estimated_tokens >= 900,
+            "failed-tool error must be counted: got {}",
+            s.total_estimated_tokens,
+        );
     }
 
     /// Pre-P4a session JSON (no `id`, no `timestamp`) deserializes
