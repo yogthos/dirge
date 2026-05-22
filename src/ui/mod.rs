@@ -1096,7 +1096,17 @@ pub async fn run_interactive(
                         let ctrl_o = key.code == KeyCode::Char('o')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
                         if ctrl_o {
-                            if let Some(c) = last_collapsed.take() {
+                            // Review #5: `.as_ref().cloned()` instead
+                            // of `.take()` so Ctrl+O is re-pressable
+                            // — the body is still in scrollback from
+                            // the first expand, but a second press
+                            // would be confusing if it reported
+                            // "nothing to expand". The stash is
+                            // overwritten on the next collapse (or
+                            // cleared on prompt-send / Done /
+                            // ContextOverflow respawn for
+                            // turn-scope hygiene, see review #4).
+                            if let Some(c) = last_collapsed.as_ref().cloned() {
                                 let max_chars = cfg.resolve_tool_result_max_chars();
                                 render_collapsed_in_full(&mut renderer, &c, max_chars)?;
                             } else {
@@ -1374,6 +1384,13 @@ pub async fn run_interactive(
                             }
 
                         if let Some(text) = input.handle_key(key) {
+                            // Review #4: any submission starts a new
+                            // turn — drop the collapsed-result stash
+                            // so Ctrl+O doesn't expand a tool result
+                            // from a previous, unrelated turn. New
+                            // truncations during the turn populate
+                            // it again.
+                            last_collapsed = None;
                             #[cfg(feature = "loop")]
                             if loop_state.as_ref().is_some_and(|ls| ls.active) && !text.starts_with('/') {
                                 // Queue the message instead of dropping it.
@@ -1941,10 +1958,6 @@ pub async fn run_interactive(
                             tool_chamber_open = false;
                         }
                         if tool_chamber_open && show_details {
-                            // (a) normal completion path.
-                            let is_edit =
-                                last_tool_name.as_deref() == Some("edit") && show_diff;
-
                             // Resolve the tool name + banner for the
                             // collapse store. Prefer the just-stored
                             // `last_tool_name`; fall back to looking
@@ -1973,6 +1986,42 @@ pub async fn run_interactive(
                                 &resolved_args,
                             );
                             let max_lines = cfg.resolve_tool_result_max_lines();
+
+                            // Review #7: gate the colorized diff path
+                            // on `resolved_name`, not `last_tool_name`
+                            // — if the name slot drained we'd lose
+                            // the green/red background coloring and
+                            // fall back to plain `render_tool_output`.
+                            let is_edit = resolved_name == "edit" && show_diff;
+                            // Review #6: empty name fallback would
+                            // paint an unnamed chamber AND collapse
+                            // it. Surface a single dim trailer and
+                            // emit the chamber bottom so the chamber
+                            // doesn't orphan. Skip the rest of branch
+                            // (a).
+                            if resolved_name.is_empty() {
+                                let (frame_w, _) = chamber_widths(&renderer);
+                                let trimmed = output.trim();
+                                if !trimmed.is_empty() {
+                                    let first = trimmed.lines().next().unwrap_or("");
+                                    let inner = frame_w.saturating_sub(4);
+                                    renderer.write_line(
+                                        &chamber_row(
+                                            &format!("(unresolved tool) {}", first),
+                                            inner,
+                                        ),
+                                        theme::dim(),
+                                    )?;
+                                }
+                                renderer.write_line(
+                                    &chamber_bottom(frame_w),
+                                    theme::dim(),
+                                )?;
+                                tool_chamber_open = false;
+                                // Don't fall through to is_edit / render_tool_output.
+                                last_tool_name = None;
+                                continue;
+                            }
 
                             if is_edit {
                                 // Colorized diff rendering. The edit tool emits
@@ -2574,8 +2623,34 @@ pub async fn run_interactive(
                         )
                         .await;
 
+                        // Review #1: compress can return Ok WITHOUT
+                        // shrinking the session (three no-op paths
+                        // inside `handle_compress`). Respawning
+                        // against the unchanged history just re-emits
+                        // ContextOverflow and infinite-loops the
+                        // auto-recovery. Only respawn on `Compacted`.
+                        //
+                        // Review #2: re-issuing the same prompt
+                        // re-runs any side-effecting tool calls the
+                        // failed turn already made. The interactive
+                        // retry loop already refuses to retry when
+                        // `had_tool_calls`; the auto path used to
+                        // bypass that safety. We have no direct
+                        // `had_tool_calls` signal here (the runner
+                        // emitted ContextOverflow without telling us
+                        // whether tools fired). Approximate it by
+                        // comparing `tool_calls_this_run > 0`, which
+                        // tracks every ToolCall event observed during
+                        // the failed turn. If any tool ran, surface
+                        // the error and let the user decide.
+                        let tools_already_ran = tool_calls_this_run > 0;
+                        // Reset the abort-trailer counter regardless
+                        // — the failed run is over.
+                        tool_calls_this_run = 0;
                         match compress_result {
-                            Ok(()) => {
+                            Ok(crate::ui::slash::CompressOutcome::Compacted)
+                                if !tools_already_ran =>
+                            {
                                 // Build history from the compacted session.
                                 // Drop the trailing User message because
                                 // it's the prompt we're about to resubmit
@@ -2598,10 +2673,59 @@ pub async fn run_interactive(
                                 agent_abort = Some(runner.task);
                                 agent_interject = Some(runner.interject_tx);
                                 is_running = true;
+                                // Review #4: collapsed result from the
+                                // failed run is stale — the user will
+                                // care about results from the new
+                                // attempt, not what got truncated
+                                // before the overflow.
+                                last_collapsed = None;
                                 renderer.write_line(
                                     "  ↳ resumed run with compacted history",
                                     theme::dim(),
                                 )?;
+                            }
+                            Ok(crate::ui::slash::CompressOutcome::Compacted) => {
+                                // Compacted, but tool side-effects
+                                // already applied — refusing auto-
+                                // retry. User can re-issue manually.
+                                renderer.write_line(
+                                    "  ↳ context compacted, but the failed run already invoked tools — not auto-retrying. Re-issue your prompt manually if you want to continue.",
+                                    c_error(),
+                                )?;
+                                is_running = false;
+                                let dropped = interjection_queue.len();
+                                interjection_queue.clear();
+                                if dropped > 0 {
+                                    renderer.write_line(
+                                        &format!(
+                                            "{} queued message{} dropped due to tool-side-effect safety",
+                                            dropped,
+                                            if dropped == 1 { "" } else { "s" }
+                                        ),
+                                        c_error(),
+                                    )?;
+                                }
+                            }
+                            Ok(crate::ui::slash::CompressOutcome::NoOp { reason }) => {
+                                renderer.write_line(
+                                    &format!(
+                                        "auto-compact made no progress ({reason}); leaving session as-is. Try /compress with stricter instructions, lower keep_recent_tokens, or /clear."
+                                    ),
+                                    c_error(),
+                                )?;
+                                is_running = false;
+                                let dropped = interjection_queue.len();
+                                interjection_queue.clear();
+                                if dropped > 0 {
+                                    renderer.write_line(
+                                        &format!(
+                                            "{} queued message{} dropped due to compact no-op",
+                                            dropped,
+                                            if dropped == 1 { "" } else { "s" }
+                                        ),
+                                        c_error(),
+                                    )?;
+                                }
                             }
                             Err(ce) => {
                                 renderer.write_line(
@@ -2612,8 +2736,6 @@ pub async fn run_interactive(
                                     c_error(),
                                 )?;
                                 is_running = false;
-                                // Drop queued interjections — they assumed
-                                // the failed turn would succeed.
                                 let dropped = interjection_queue.len();
                                 interjection_queue.clear();
                                 if dropped > 0 {
@@ -3758,13 +3880,25 @@ fn chamber_row_centered(content: &str, inner: usize) -> String {
     format!("│ {}{}{} │", " ".repeat(left), content, " ".repeat(right))
 }
 
-/// Tools whose result body is the WHOLE point — diff hunks, user-
-/// facing Q&A, subagent answers. Collapsing these to 4 lines hides
-/// the value the LLM/user just paid for; keep them fully expanded.
+/// Tools whose result body is the WHOLE point. Collapsing these to
+/// 4 lines hides the value the user just asked for; keep them
+/// fully expanded.
+///
+/// - `edit` — colorized diff with backgrounds; the diff IS the value.
+/// - `question` — Q&A response; collapsing hides Anwers past Q1.
+/// - `task` / `task_status` — subagent results.
+/// - `read` — when the LLM (or user via /read) asked to read a file,
+///   they want to see the file content; defaulting to 4 lines defeats
+///   the request.
+///
+/// `apply_patch` deliberately NOT exempt: its output is usually a
+/// short "N ops applied" summary that fits in 4 lines; on the rare
+/// failure with per-op errors, the collapse + Ctrl+O is the right
+/// affordance. Reviewer feedback led to this trim.
 fn tool_skips_collapse(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "edit" | "apply_patch" | "question" | "task" | "task_status"
+        "edit" | "read" | "question" | "task" | "task_status"
     )
 }
 
@@ -3828,10 +3962,17 @@ fn render_tool_output(
     }
     renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
 
-    if hidden_lines > 0 {
+    // Review #3 + #8: stash for Ctrl+O when EITHER line OR char
+    // truncation hid data; the char-only case previously returned
+    // `None` and Ctrl+O reported "nothing to expand" despite the
+    // visible `+N chars truncated` footer. Sanitize `banner_value`
+    // here once — the expand path re-emits the banner through
+    // `fit_banner_header` and would otherwise paint raw ANSI from
+    // MCP / attacker-shaped args at expand time.
+    if hidden_lines > 0 || chars_truncated > 0 {
         Ok(Some(CollapsedToolResult {
             tool_name: tool_name.to_string(),
-            banner_value: banner_value.to_string(),
+            banner_value: sanitize_output(banner_value).into_string(),
             full_output: output.to_string(),
         }))
     } else {
@@ -4371,18 +4512,21 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let collapsed = render_tool_output(&mut renderer, "read", "/tmp/foo", &output, 10_000, 4)
+        // Pick a tool NOT in tool_skips_collapse — `grep` qualifies.
+        // (`read` was moved to the exempt set per reviewer feedback.)
+        let collapsed = render_tool_output(&mut renderer, "grep", "pattern", &output, 10_000, 4)
             .expect("render ok");
-        let c = collapsed.expect("read should collapse past 4 lines");
-        assert_eq!(c.tool_name, "read");
-        assert_eq!(c.banner_value, "/tmp/foo");
+        let c = collapsed.expect("grep should collapse past 4 lines");
+        assert_eq!(c.tool_name, "grep");
+        assert_eq!(c.banner_value, "pattern");
         assert!(c.full_output.contains("line 19"));
     }
 
-    /// Exempt tools (edit/apply_patch/question/task/task_status)
+    /// Exempt tools (edit / read / question / task / task_status)
     /// pass the line cap through unchanged — `tool_skips_collapse`
     /// forces `usize::MAX`. The render call returns None (no
-    /// collapse store) even when the output is 100 lines long.
+    /// collapse store) even when the output is 20 lines long.
+    /// `apply_patch` is deliberately NOT in the exempt set.
     #[test]
     fn render_tool_output_does_not_collapse_exempt_tools() {
         let mut renderer = Renderer::new().expect("renderer");
@@ -4390,7 +4534,7 @@ mod tests {
             .map(|i| format!("+ added line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        for tool in ["edit", "apply_patch", "question", "task", "task_status"] {
+        for tool in ["edit", "read", "question", "task", "task_status"] {
             let collapsed = render_tool_output(&mut renderer, tool, "arg", &output, 10_000, 4)
                 .expect("render ok");
             assert!(
@@ -4399,6 +4543,52 @@ mod tests {
                 tool,
             );
         }
+    }
+
+    /// `apply_patch` was removed from the exempt set (reviewer
+    /// feedback). A long apply_patch output should collapse + stash
+    /// so Ctrl+O works on per-op error spew.
+    #[test]
+    fn render_tool_output_apply_patch_collapses() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let output = (0..20)
+            .map(|i| format!("op {i} applied"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let collapsed =
+            render_tool_output(&mut renderer, "apply_patch", "20 ops", &output, 10_000, 4)
+                .expect("render ok");
+        assert!(
+            collapsed.is_some(),
+            "apply_patch must collapse past max_lines",
+        );
+    }
+
+    /// Review #3: char-truncated output whose char-sliced form fits
+    /// inside `max_lines` still has data hidden — `chars_truncated >
+    /// 0` even though `hidden_lines == 0`. Before the fix, this
+    /// returned `None` and Ctrl+O reported "nothing to expand"
+    /// while the `+N chars truncated` footer was visibly hinting at
+    /// hidden content. The expected behavior: stash so Ctrl+O can
+    /// expand to the full output.
+    #[test]
+    fn render_tool_output_stashes_on_char_truncation_alone() {
+        let mut renderer = Renderer::new().expect("renderer");
+        // Single very long line — line cap (4) is irrelevant, only
+        // char cap fires. Pick a tool that ISN'T in
+        // tool_skips_collapse so the cap engages.
+        let long_single_line = "a".repeat(50_000);
+        let collapsed = render_tool_output(
+            &mut renderer,
+            "grep",
+            "pattern",
+            &long_single_line,
+            500, // hard char cap
+            4,
+        )
+        .expect("render ok");
+        let c = collapsed.expect("char-truncation alone must still stash for Ctrl+O");
+        assert_eq!(c.full_output.len(), 50_000);
     }
 
     /// Output that fits in `max_lines` returns None (no collapse

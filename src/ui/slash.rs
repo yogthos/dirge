@@ -83,6 +83,18 @@ pub fn undo_last(session: &mut Session) -> usize {
     0
 }
 
+/// Result of an attempted compression. `Compacted` means messages
+/// were actually replaced; `NoOp` covers every path that returned
+/// without shrinking the session (already-within-limits, nothing to
+/// cut, summary too large). Callers driving auto-recovery (the
+/// `ContextOverflow` handler) MUST distinguish these — respawning
+/// the run against an unchanged history just re-emits the same
+/// ContextLength error and loops.
+pub enum CompressOutcome {
+    Compacted,
+    NoOp { reason: &'static str },
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_compress(
     instructions: Option<&str>,
@@ -99,7 +111,7 @@ pub async fn handle_compress(
     sandbox: &Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CompressOutcome> {
     renderer.write_line("compressing...", c_agent())?;
     renderer.write_line("", Color::White)?;
 
@@ -109,7 +121,9 @@ pub async fn handle_compress(
 
     if session.total_estimated_tokens <= max_tokens {
         renderer.write_line("context within limits, no compression needed", c_agent())?;
-        return Ok(());
+        return Ok(CompressOutcome::NoOp {
+            reason: "context within limits",
+        });
     }
 
     let mut accumulated = 0u64;
@@ -133,7 +147,9 @@ pub async fn handle_compress(
 
     if cut_idx == 0 {
         renderer.write_line("nothing to compress (entire context is recent)", c_agent())?;
-        return Ok(());
+        return Ok(CompressOutcome::NoOp {
+            reason: "entire context is within keep_recent_tokens — lower it to compress further",
+        });
     }
 
     let messages_to_summarize = &session.messages[..cut_idx];
@@ -186,7 +202,9 @@ pub async fn handle_compress(
             ),
             c_error(),
         )?;
-        return Ok(());
+        return Ok(CompressOutcome::NoOp {
+            reason: "summary would be larger than the messages it replaces",
+        });
     }
 
     // `compress_reporting` returns the count of non-active-path
@@ -246,7 +264,7 @@ pub async fn handle_compress(
         )?;
     }
 
-    Ok(())
+    Ok(CompressOutcome::Compacted)
 }
 
 #[allow(clippy::too_many_arguments)]
