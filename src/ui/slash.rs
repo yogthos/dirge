@@ -167,6 +167,28 @@ pub async fn handle_compress(
     let summary_tokens_est = crate::session::Session::estimate_tokens(&summary);
     let net_saved: i64 = tokens_before as i64 - summary_tokens_est as i64;
 
+    // Audit M9: previously the summary was installed via
+    // `compress_reporting` BEFORE the net-saved check, so an
+    // oversized summary still landed in the session — we only
+    // told the user *afterwards*. Refuse to install when the
+    // summary would cost more than the messages it replaces; the
+    // user can adjust `keep_recent_tokens` / their compress prompt
+    // and re-issue. Skipping the install also avoids polluting the
+    // session-tree with a node we'd want to revert.
+    if net_saved < 0 {
+        renderer.write_line(
+            &format!(
+                "compress aborted — summary ({}t) is LARGER than the {} messages it would replace ({}t); net cost +{}t. Compression rejected. Consider lowering keep_recent_tokens or refining compress instructions, then re-run /compress.",
+                summary_tokens_est,
+                cut_idx,
+                tokens_before,
+                -net_saved,
+            ),
+            c_error(),
+        )?;
+        return Ok(());
+    }
+
     // `compress_reporting` returns the count of non-active-path
     // tree nodes (sibling branches) pruned. We notify the user
     // about that loss explicitly — without the notification a
@@ -211,22 +233,10 @@ pub async fn handle_compress(
             c_error(),
         )?;
     }
-    if net_saved < 0 {
-        // Summary cost more than the messages it replaced. Surface
-        // visibly so the user knows the compress didn't help —
-        // suggests tightening `keep_recent_tokens` or editing the
-        // compress instructions.
-        renderer.write_line(
-            &format!(
-                "compressed {} messages but the summary ({}t) is LARGER than the replaced messages ({}t); net cost +{}t. Consider lowering keep_recent_tokens or refining compress instructions.",
-                cut_idx,
-                summary_tokens_est,
-                tokens_before,
-                -net_saved,
-            ),
-            c_error(),
-        )?;
-    } else {
+    // Net-saved is guaranteed non-negative here: the early-return
+    // above (audit M9) aborts the compress when the summary would
+    // cost more than the messages it replaced.
+    {
         renderer.write_line(
             &format!(
                 "compressed {} messages (saved ~{} tokens; summary uses {}t)",
@@ -382,10 +392,55 @@ pub async fn handle_slash(
                 } else if sessions.len() == 1 {
                     if let Some(s) = sessions.into_iter().next() {
                         let msg_count = s.messages.len();
+                        // Cancel any in-flight background subagent
+                        // tasks belonging to the previous session
+                        // before swapping it out. Otherwise they
+                        // would keep consuming API budget against a
+                        // session their parent agent no longer sees.
+                        if let Some(store) = bg_store.as_ref() {
+                            store.cancel_all();
+                        }
                         *session = s;
+                        // Restore the prompt that was active when the
+                        // session was saved. Without this, `/sessions
+                        // <id>` would always rebuild the agent with the
+                        // default prompt, even if the saved session
+                        // recorded `current_prompt_name = Some("plan")`.
+                        // Sets both context fields + rebuilds the agent
+                        // so the new prompt actually takes effect.
+                        let restored = session.current_prompt_name.clone();
+                        if let Some(name) = restored.as_deref()
+                            && let Some(content) = context.prompts.get(name)
+                        {
+                            context.current_prompt = Some(content.clone());
+                            context.current_prompt_name = Some(name.to_string());
+                            let model = client.completion_model(session.model.to_string());
+                            *agent = crate::provider::build_agent(
+                                model,
+                                cli,
+                                cfg,
+                                context,
+                                permission.clone(),
+                                ask_tx.clone(),
+                                None,
+                                None,
+                                bg_store.clone(),
+                                #[cfg(feature = "lsp")]
+                                None,
+                                sandbox.clone(),
+                                #[cfg(feature = "mcp")]
+                                mcp_manager,
+                                #[cfg(feature = "semantic")]
+                                semantic_manager,
+                            )
+                            .await;
+                        }
                         render_session(renderer, session, cli, cfg, context)?;
+                        let prompt_note = restored
+                            .map(|n| format!("; prompt: {}", n))
+                            .unwrap_or_default();
                         renderer.write_line(
-                            &format!("loaded session ({} msgs)", msg_count),
+                            &format!("loaded session ({} msgs{})", msg_count, prompt_note),
                             c_agent(),
                         )?;
                     }
@@ -701,7 +756,16 @@ pub async fn handle_slash(
                     renderer.write_line("", c_agent())?;
                     renderer.write_line("usage: /prompt <name>  |  /prompt default", c_result())?;
                 }
-            } else if parts[1] == "default" {
+            } else if parts[1] == "default" && !context.prompts.contains_key("default") {
+                // Backstop: if there's no `default` prompt file
+                // present (e.g. the user deleted it), preserve the
+                // legacy "clear back to no active prompt" behavior
+                // by accepting `/prompt default` as a clear keyword.
+                // When a `default` prompt IS registered (which is
+                // the README-documented case — `prompts/default.md`
+                // ships in dirge), this branch is skipped and the
+                // normal "activate by name" path below picks it up,
+                // matching user expectation.
                 if context.current_prompt.is_none() {
                     renderer.write_line("no active prompt to clear", c_agent())?;
                 } else {
@@ -1121,10 +1185,11 @@ pub async fn handle_slash(
                     let canonical = std::fs::canonicalize(&path).unwrap_or(path);
                     session.working_dir =
                         compact_str::CompactString::new(canonical.to_string_lossy());
-                    if let Some(perm) = permission
-                        && let Ok(mut guard) = perm.lock() {
+                    if let Some(perm) = permission {
+                        if let Ok(mut guard) = perm.lock() {
                             guard.set_working_dir(&session.working_dir);
                         }
+                    }
                     context.reload();
                     let model = client.completion_model(session.model.to_string());
                     *agent = crate::provider::build_agent(
@@ -1263,9 +1328,49 @@ pub async fn handle_slash(
                     let mut it = rest.splitn(2, char::is_whitespace);
                     let tool = it.next().unwrap_or("");
                     let pattern = it.next().unwrap_or("").trim();
+                    // Whitelist accepted tool names so a typo
+                    // (`/allow add bsah ...`) doesn't silently
+                    // create a permanently-inert rule the user
+                    // can't figure out. Matches the schema used
+                    // by `PermissionConfig`.
+                    const KNOWN_PERM_TOOLS: &[&str] = &[
+                        "bash",
+                        "read",
+                        "write",
+                        "edit",
+                        "grep",
+                        "find_files",
+                        "glob",
+                        "list_dir",
+                        "write_todo_list",
+                        "apply_patch",
+                        "lsp",
+                        "question",
+                        "webfetch",
+                        "websearch",
+                        "task",
+                        "task_status",
+                        "memory",
+                        "skill",
+                        "list_symbols",
+                        "get_symbol_body",
+                        "find_definition",
+                        "find_callers",
+                        "find_callees",
+                        "mcp_tool",
+                    ];
                     if tool.is_empty() || pattern.is_empty() {
                         renderer.write_line(
                             "usage: /allow add <tool> <pattern>  (e.g. /allow add bash 'cargo *')",
+                            c_error(),
+                        )?;
+                    } else if !KNOWN_PERM_TOOLS.contains(&tool) {
+                        renderer.write_line(
+                            &format!(
+                                "unknown tool {:?}. Valid: {}",
+                                tool,
+                                KNOWN_PERM_TOOLS.join(", "),
+                            ),
                             c_error(),
                         )?;
                     } else {
@@ -1456,8 +1561,18 @@ pub async fn handle_slash(
                 "  /prompt                list available prompts",
                 c_result(),
             )?;
-            renderer.write_line("  /prompt <name>         activate a prompt", c_result())?;
-            renderer.write_line("  /prompt default        clear active prompt", c_result())?;
+            renderer.write_line(
+                "  /prompt <name>         activate a prompt by name",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "  /prompt default        activate the 'default' prompt if installed,",
+                c_result(),
+            )?;
+            renderer.write_line(
+                "                         otherwise clears the active prompt",
+                c_result(),
+            )?;
             renderer.write_line(
                 "  /regen-prompts        restore built-in prompts to global dir",
                 c_result(),

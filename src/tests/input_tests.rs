@@ -915,6 +915,40 @@ fn ctrl_j_during_picker_is_noop() {
 }
 
 #[test]
+fn at_picker_triggers_after_multibyte_char() {
+    // Regression: `at_word_start` used to do
+    //   self.buffer.as_bytes().get(self.cursor - 1) == Some(&b' ')
+    // which inspects a UTF-8 continuation byte when the prior char is
+    // multibyte (e.g. `é` is 0xC3 0xA9). The continuation byte never
+    // equals `b' '`, so the picker silently failed to open. Must
+    // accept "start of word" via the actual prior `char`, not a raw
+    // byte. After typing "é @" the picker should be active because
+    // `@` follows whitespace; after typing "é@" (no gap) it should
+    // NOT activate (still mid-word). Both cases used to be wrong.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "é ");
+    editor.handle_key(press(KeyCode::Char('@')));
+    assert!(
+        editor.picker.as_ref().is_some_and(|p| p.active),
+        "picker should activate when `@` follows a space, even when the previous word ends in a multibyte char"
+    );
+}
+
+#[test]
+fn at_picker_does_not_trigger_mid_word_after_multibyte() {
+    // Symmetric guard: `@` directly after a non-whitespace multibyte
+    // char (no separating space) is mid-word; the picker must stay
+    // closed. A pure byte check could now flip-flop the wrong way
+    // after the fix if we're sloppy — pin the inverse case too.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "café@");
+    assert!(
+        editor.picker.is_none() || !editor.picker.as_ref().unwrap().active,
+        "picker must stay closed when `@` lands mid-word after a multibyte char"
+    );
+}
+
+#[test]
 fn paste_with_crlf_line_endings_collapses() {
     // Regression: a paste from a clipboard/source that uses \r\n line
     // endings used to be treated as a single line because matches('\n')

@@ -133,7 +133,7 @@ fn render_table(
             // Truncate with ellipsis if the next char would overflow.
             // The ellipsis itself is 1 cell wide.
             if used + cw > w {
-                if w >= 1 && used < w {
+                if w >= 1 && used + 1 <= w {
                     out.push('…');
                     used += 1;
                 }
@@ -179,7 +179,7 @@ fn render_table(
 
     if !header.is_empty() {
         out.push(LineEntry {
-            text: CompactString::new(render_row(header, &widths)),
+            text: CompactString::new(&render_row(header, &widths)),
             color: crate::ui::theme::header(),
         });
         out.push(LineEntry {
@@ -189,7 +189,7 @@ fn render_table(
     }
     for row in rows {
         out.push(LineEntry {
-            text: CompactString::new(render_row(row, &widths)),
+            text: CompactString::new(&render_row(row, &widths)),
             color: crate::ui::theme::agent(),
         });
     }
@@ -367,7 +367,8 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     // starts (under the bullet's right edge), not the
                     // bullet glyph itself, so multi-line items read as
                     // a coherent block.
-                    let cont_indent: String = std::iter::repeat_n(' ', bullet.chars().count())
+                    let cont_indent: String = std::iter::repeat(' ')
+                        .take(bullet.chars().count())
                         .collect();
                     let inner_w = max_width.saturating_sub(bullet.chars().count());
                     let mut item_lines = Vec::new();
@@ -427,6 +428,8 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
             Event::Text(t) => {
                 if in_table {
                     current_cell.push_str(&t);
+                } else if in_code_block {
+                    acc.push_str(&t);
                 } else {
                     acc.push_str(&t);
                 }
@@ -434,6 +437,8 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
             Event::Code(t) => {
                 if in_table {
                     current_cell.push_str(&t);
+                } else if in_code_block {
+                    acc.push_str(&t);
                 } else {
                     acc.push_str(&t);
                 }
@@ -453,7 +458,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
             Event::Rule => {
                 flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
                 acc.clear();
-                let rule: String = std::iter::repeat_n('─', max_width.min(40)).collect();
+                let rule: String = std::iter::repeat('─').take(max_width.min(40)).collect();
                 result.push(LineEntry {
                     text: CompactString::from(rule),
                     color: crate::ui::theme::dim(),

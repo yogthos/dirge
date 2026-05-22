@@ -83,9 +83,29 @@ impl Tool for QuestionTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Description mirrors opencode's question.txt structure —
+        // the explicit \"when to use\" list + \"usage notes\" gets
+        // the model to actually reach for this tool instead of
+        // either guessing or asking in plain prose. The
+        // \"(Recommended)\" convention helps the model communicate
+        // its preferred answer without taking choice away from
+        // the user.
         ToolDefinition {
             name: "question".to_string(),
-            description: "Ask the user one or more structured questions. Use when you need clarification, decisions, or preferences. The tool blocks until the user answers. Each question has options with labels and descriptions; set multi_select to true for multiple-choice. The custom option (default true) adds a free-text 'Type your own answer' choice."
+            description: "Ask the user structured questions during execution. Use this when you need to:\n\
+                1. Gather user preferences or requirements\n\
+                2. Clarify ambiguous instructions before proceeding\n\
+                3. Get decisions on implementation choices as you work\n\
+                4. Offer choices about what direction to take\n\
+                \n\
+                The tool blocks until the user answers. Multiple questions can be asked in one call.\n\
+                \n\
+                Usage notes:\n\
+                - When `custom` is enabled (default), a \"Type your own answer\" option is added automatically; don't include \"Other\" or catch-all options yourself.\n\
+                - Answers are returned per question (one array of selected labels each); set `multi_select: true` to allow more than one selection.\n\
+                - If you recommend a specific option, make it the first option and add \" (Recommended)\" at the end of the label.\n\
+                - Use `header` to group related questions under a short section title.\n\
+                - Prefer asking over guessing when the user's request is genuinely ambiguous — but don't over-ask for clearly-decidable details."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

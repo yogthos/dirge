@@ -12,6 +12,18 @@ use crate::agent::tools::ToolCache;
 use crate::event::AgentEvent;
 use crate::session::{MessageRole, Session};
 
+/// Per-chunk read deadline for streaming provider responses. Applied
+/// to every `stream.next().await` in both the interactive and
+/// `run_print` paths. If the provider stalls mid-stream (TCP alive
+/// but no SSE events — common with overloaded proxies, dropped
+/// connections that never RST, hung server-side queues), the stream
+/// would otherwise block forever and freeze the agent. Treat a
+/// chunk timeout as a transient error so the retry loop in
+/// `spawn_agent` can classify it as `Network`, back off, and
+/// re-issue. 120s matches opencode's default and is well above any
+/// reasonable real chunk gap for streaming providers.
+const STREAM_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Turn-boundary detector. Rig's multi-turn stream is a flat sequence
 /// of assistant content + tool results + a final response; consumers
 /// downstream (plugin hooks in P3, session-tree branch accounting in
@@ -256,7 +268,30 @@ where
         }
     }
 
-    while let Some(item) = stream.next().await {
+    loop {
+        let item = match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, stream.next()).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => {
+                // Chunk-read deadline hit. Surface as a transient
+                // network-style error so `spawn_agent` retries. The
+                // message shape matches what `classify_error` already
+                // treats as `Network` (substring "timeout").
+                flush_boundaries(turns.observe_stream_end(), event_tx).await;
+                // Phrasing intentionally uses "timed out" so the
+                // existing `recovery::classify_error` substring match
+                // routes this to `ErrorKind::Network` and the retry
+                // loop picks it up — same as "connection timed out"
+                // from reqwest. Without "timed out" in the message
+                // this would fall through to `Other` and surface as
+                // a hard failure.
+                outcome.error = Some(format!(
+                    "stream chunk timed out after {}s (provider stalled or connection silently dropped)",
+                    STREAM_CHUNK_TIMEOUT.as_secs(),
+                ));
+                return outcome;
+            }
+        };
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
                 flush_boundaries(turns.observe_assistant_content(), event_tx).await;
@@ -300,6 +335,28 @@ where
                         }
                         output.push_str(&t.text);
                     }
+                }
+                // Final global cap on tool output, applied here at the
+                // single entry point so MCP tools, plugin tools, and
+                // any new built-in tool that forgets its own cap can't
+                // blow the agent's context. Per-tool caps still apply
+                // (bash 256 KiB, read per-line, grep/find_files/list_dir
+                // result count) — this is the belt-and-suspenders
+                // last line of defense. Matches opencode's tool.ts
+                // 100 KiB default.
+                const TOOL_OUTPUT_CAP_BYTES: usize = 100 * 1024;
+                if output.len() > TOOL_OUTPUT_CAP_BYTES {
+                    let original_len = output.len();
+                    // Truncate on a UTF-8 boundary at or before the cap.
+                    let mut cut = TOOL_OUTPUT_CAP_BYTES;
+                    while cut > 0 && !output.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    output.truncate(cut);
+                    output.push_str(&format!(
+                        "\n\n[…truncated by host: {} bytes original, {} bytes shown]",
+                        original_len, cut,
+                    ));
                 }
                 let _ = event_tx
                     .send(AgentEvent::ToolResult {
@@ -459,9 +516,31 @@ where
             // message if present — retrying before the server's
             // requested wait just earns another 429. Otherwise the
             // exponential-backoff computed delay applies.
+            //
+            // Audit M6: race the sleep against the interject channel.
+            // Previously a bare `sleep(delay).await` made the user
+            // wait the FULL backoff (potentially many seconds for a
+            // 429 with Retry-After) before any Ctrl+C / interjection
+            // could be processed — task.abort() would kill the whole
+            // agent state. Now an interject signal during the wait
+            // exits the retry loop gracefully with `interjected=true`
+            // so the partial response is preserved.
             let delay = policy.backoff_duration_for_msg(attempts, &msg);
-            tokio::time::sleep(delay).await;
-            attempts += 1;
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {
+                    attempts += 1;
+                }
+                _ = interject_rx.recv() => {
+                    // Drain any further pending signals before bailing.
+                    while interject_rx.try_recv().is_ok() {}
+                    let _ = event_tx
+                        .send(AgentEvent::Reasoning(CompactString::new(
+                            "retry cancelled by user".to_string(),
+                        )))
+                        .await;
+                    break;
+                }
+            }
         }
     });
 
@@ -482,37 +561,94 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
     P: rig::agent::PromptHook<M> + 'static,
 {
-    let mut stream = agent
-        .stream_chat(prompt.to_string(), Vec::<Message>::new())
-        .multi_turn(max_turns)
-        .await;
+    // Retry loop. Print mode (`dirge --print "..."`) is commonly used
+    // in scripts and CI where a single transient 502 or rate-limit
+    // would otherwise turn a 5-line shell snippet into a flaky one.
+    // Use the same RecoveryPolicy as the interactive path.
+    //
+    // Caveat: we only retry when NO bytes of the response have been
+    // emitted to stdout yet. Once a byte is out, retrying would
+    // duplicate visible output — better to surface the error and let
+    // the script decide whether to re-run. This matches what
+    // opencode does for its non-interactive path.
+    let policy = RecoveryPolicy::default();
+    let mut attempts: usize = 0;
+    loop {
+        let mut stream = agent
+            .stream_chat(prompt.to_string(), Vec::<Message>::new())
+            .multi_turn(max_turns)
+            .await;
 
-    let mut full_response = String::new();
+        let mut full_response = String::new();
+        let mut had_output = false;
+        let mut stream_error: Option<String> = None;
 
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                full_response.push_str(&text.text);
-                print!("{}", text.text);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
-                r,
-            ))) => {
-                eprint!("{}", r.display_text());
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-            }
-            Ok(MultiTurnStreamItem::FinalResponse(_)) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                break;
+        loop {
+            let item = match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    stream_error = Some(format!(
+                        "stream chunk timed out after {}s (provider stalled or connection silently dropped)",
+                        STREAM_CHUNK_TIMEOUT.as_secs(),
+                    ));
+                    break;
+                }
+            };
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Text(text),
+                )) => {
+                    full_response.push_str(&text.text);
+                    print!("{}", text.text);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    had_output = true;
+                }
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Reasoning(r),
+                )) => {
+                    eprint!("{}", r.display_text());
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                Ok(MultiTurnStreamItem::FinalResponse(_)) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    stream_error = Some(e.to_string());
+                    break;
+                }
             }
         }
-    }
 
-    println!();
-    Ok(full_response)
+        if let Some(msg) = stream_error {
+            let kind = recovery::classify_error(&msg);
+            if !had_output && policy.should_retry(attempts, kind) {
+                let delay = policy.backoff_duration_for_msg(attempts, &msg);
+                eprintln!(
+                    "(retry {}/{} in {:.1}s — {:?})",
+                    attempts + 1,
+                    policy.max_retries(),
+                    delay.as_secs_f64(),
+                    kind,
+                );
+                tokio::time::sleep(delay).await;
+                attempts += 1;
+                continue;
+            }
+            // Either we already wrote bytes to stdout (can't safely
+            // retry without duplicating) or the retry policy says
+            // give up. Newline-terminate any in-flight output before
+            // the error so the diagnostic doesn't share a line with
+            // half a response.
+            if had_output {
+                println!();
+            }
+            eprintln!("Error: {}", msg);
+            return Err(anyhow::anyhow!("{}", msg));
+        }
+
+        println!();
+        return Ok(full_response);
+    }
 }
 
 #[cfg(test)]

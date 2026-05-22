@@ -5,7 +5,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm, check_perm_path};
 use crate::semantic::SymbolIndex;
 
 pub struct FindCallersTool {
@@ -63,10 +63,21 @@ impl Tool for FindCallersTool {
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {
+        // Name-side check: existing rules keyed on the symbol name
+        // still apply.
         check_perm(&self.permission, &self.ask_tx, "find_callers", &args.name).await?;
+        // Path-side check: the optional `path` arg scopes the
+        // search and was previously unchecked — an LLM could
+        // request `find_callers(name=\"foo\", path=\"/etc\")` and
+        // walk external dirs without consulting
+        // external_directory rules. Default to \".\" so the check
+        // runs against the working dir when no path was supplied.
+        let perm_path = args.path.as_deref().unwrap_or(".");
+        check_perm_path(&self.permission, &self.ask_tx, "find_callers", perm_path).await?;
 
         let search_path = args
             .path
+            .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 

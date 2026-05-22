@@ -20,6 +20,45 @@ pub(crate) struct InterleavedOutput {
     pub exit_code: i32,
 }
 
+/// On Unix, SIGKILL the bash process group on drop. Used to clean up
+/// grandchildren when the agent task is aborted (Ctrl+C) — tokio's
+/// `kill_on_drop` only signals the immediate child, leaving descendants
+/// orphaned. Disarmed via [`PgKillGuard::disarm`] on graceful paths
+/// (successful completion, timeout — which already calls killpg itself)
+/// so we don't double-signal.
+#[cfg(unix)]
+struct PgKillGuard {
+    pid: u32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl PgKillGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PgKillGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: killpg with negative pid sends to the process
+        // group. SIGKILL is the same on every POSIX platform;
+        // libc::pid_t is i32 on every platform dirge supports. The
+        // pid was set by us via `process_group(0)` so we know this
+        // group exists and is bash + descendants.
+        unsafe {
+            let _ = libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+}
+
 /// Spawn `cmd` into its own process group and wait for it,
 /// capped at `secs`. On timeout, send SIGKILL to the process
 /// group so the whole subprocess tree dies — not just bash. On
@@ -50,6 +89,16 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, 
         .spawn()
         .map_err(|e| ToolError::Msg(format!("failed to spawn: {}", e)))?;
     let pid = child.id();
+
+    // Drop guard: on Unix, `kill_on_drop(true)` SIGKILLs the immediate
+    // bash child when the future is dropped (e.g. user Ctrl+C aborts
+    // the agent task) but leaves bash's *descendants* running as
+    // grandchildren of pid 1. The timeout branch below already
+    // handles this by calling `killpg(-pid, SIGKILL)`; the same is
+    // needed for any other drop path. Holding a `PgKillGuard` for
+    // the lifetime of the future does that.
+    #[cfg(unix)]
+    let _pgguard = pid.map(PgKillGuard::new);
 
     // F12: drain stdout + stderr concurrently into a single buffer
     // so the order of lines reflects actual arrival time. The prior
@@ -111,21 +160,43 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, 
         Ok::<_, std::io::Error>((merged, status))
     };
 
-    match tokio::time::timeout(Duration::from_secs(secs), wait).await {
-        Ok(Ok((merged, status))) => Ok(InterleavedOutput {
-            merged,
-            exit_code: status.code().unwrap_or(-1),
-        }),
+    let outcome = tokio::time::timeout(Duration::from_secs(secs), wait).await;
+    match outcome {
+        Ok(Ok((merged, status))) => {
+            // Graceful completion — process group is already gone.
+            // Disarm the guard so its Drop doesn't issue a useless
+            // SIGKILL against a reaped pgid (worst case: signal
+            // races into a PID re-used by the OS).
+            #[cfg(unix)]
+            {
+                let mut g = _pgguard;
+                if let Some(ref mut gg) = g {
+                    gg.disarm();
+                }
+            }
+            Ok(InterleavedOutput {
+                merged,
+                exit_code: status.code().unwrap_or(-1),
+            })
+        }
         Ok(Err(e)) => Err(ToolError::Msg(format!("wait failed: {}", e))),
         Err(_) => {
+            // Timeout path already issues the killpg below; disarm
+            // the drop guard so we don't double-signal.
             #[cfg(unix)]
-            if let Some(pid) = pid {
-                // SAFETY: killpg with negative pid sends to the
-                // process group. SIGKILL is the same on every
-                // POSIX platform; libc::pid_t is i32 on every
-                // platform dirge supports.
-                unsafe {
-                    let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            {
+                let mut g = _pgguard;
+                if let Some(ref mut gg) = g {
+                    gg.disarm();
+                }
+                if let Some(pid) = pid {
+                    // SAFETY: killpg with negative pid sends to the
+                    // process group. SIGKILL is the same on every
+                    // POSIX platform; libc::pid_t is i32 on every
+                    // platform dirge supports.
+                    unsafe {
+                        let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    }
                 }
             }
             let _ = pid;
@@ -210,6 +281,29 @@ impl Tool for BashTool {
         // order. Previously we concatenated stdout then stderr,
         // mis-ordering interleaved output.
         let mut result = output.merged;
+        // Cap raw bash output before it enters LLM context. The
+        // UI's `render_tool_output` already truncates the display,
+        // but the full string was being persisted to
+        // `ToolCallState::Completed` → fed back to the LLM on the
+        // next turn. `cat /dev/urandom | head -c 10M` would have
+        // shoved millions of tokens at the model. Apply the cap
+        // here at the source. 256 KiB ≈ 65k tokens worst-case,
+        // already well above any sensible single-command output.
+        const BASH_OUTPUT_CAP_BYTES: usize = 256 * 1024;
+        if result.len() > BASH_OUTPUT_CAP_BYTES {
+            // Slice at UTF-8 char boundary.
+            let mut cut = BASH_OUTPUT_CAP_BYTES;
+            while cut > 0 && !result.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let dropped = result.len() - cut;
+            result.truncate(cut);
+            result.push_str(&format!(
+                "\n…[bash output truncated: dropped {} bytes ({} KiB total); pipe through head/grep to keep the LLM context lean]",
+                dropped,
+                (cut + dropped) / 1024,
+            ));
+        }
         if output.exit_code != 0 {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
@@ -342,7 +436,7 @@ fn quote_aware_split(command: &str) -> Vec<&str> {
         }
 
         if !in_single && !in_double {
-            // Check for `&&` and `||` (2-byte) BEFORE single-byte `;`.
+            // Check for `&&` and `||` (2-byte) BEFORE single-byte `;`/`|`.
             if i + 1 < bytes.len()
                 && ((b == b'&' && bytes[i + 1] == b'&') || (b == b'|' && bytes[i + 1] == b'|'))
             {
@@ -352,6 +446,18 @@ fn quote_aware_split(command: &str) -> Vec<&str> {
                 continue;
             }
             if b == b';' {
+                push_segment(command, start, i, &mut segments);
+                i += 1;
+                start = i;
+                continue;
+            }
+            // Pipe `|` (single-byte) — must be checked AFTER `||`
+            // above. Without this, a command like `safe_cmd | rm
+            // -rf /` was treated as one segment and only `safe_cmd`'s
+            // permission rule applied; the destructive RHS rode in
+            // unchecked. The semantic-bash tree-sitter path correctly
+            // splits pipelines; this fallback didn't.
+            if b == b'|' {
                 push_segment(command, start, i, &mut segments);
                 i += 1;
                 start = i;
@@ -499,6 +605,28 @@ mod tests {
         assert_eq!(segments[1], "cmd2");
         assert_eq!(segments[2], "cmd3");
         assert_eq!(segments[3], "cmd4");
+    }
+
+    /// Regression: bare `|` pipes must split into segments. Before
+    /// this, a command like `safe_cmd | rm -rf /` was treated as
+    /// one unit and only `safe_cmd`'s permission rule applied.
+    #[test]
+    fn quote_aware_split_splits_on_bare_pipe() {
+        let segments = quote_aware_split("safe_cmd | rm -rf /tmp/x");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].trim(), "safe_cmd");
+        assert_eq!(segments[1].trim(), "rm -rf /tmp/x");
+    }
+
+    /// `||` must NOT also match the single-`|` arm (already covered
+    /// by the existing `||` test, but pin the interaction here too).
+    #[test]
+    fn quote_aware_split_or_and_pipe_distinct() {
+        let segments = quote_aware_split("a || b | c");
+        assert_eq!(segments.len(), 3, "got {segments:?}");
+        assert_eq!(segments[0].trim(), "a");
+        assert_eq!(segments[1].trim(), "b");
+        assert_eq!(segments[2].trim(), "c");
     }
 
     /// Empty / whitespace-only segments dropped.

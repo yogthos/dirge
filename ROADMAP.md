@@ -1,5 +1,8 @@
 # dirge roadmap
 
+minor fixes:
+* read cache could return stale "past EOF" result across sessions
+
 Forward-looking work organized into phases. Each phase is a self-
 contained PR/series with TDD coverage, scoped to ship independently.
 Gaps below were identified by comparing dirge to

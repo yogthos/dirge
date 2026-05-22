@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,7 +10,14 @@ const MAX_INDEX_FILES: usize = 2000;
 use crate::semantic::adapters::AdapterRegistry;
 use crate::semantic::types::{ExtractedFile, Symbol, SymbolKind};
 
-type FileCache = HashMap<PathBuf, ExtractedFile>;
+/// Per-file cache. `IndexMap` preserves insertion order so the
+/// LRU-eviction in `ensure_file` can drop the oldest entry by
+/// position. Switched from `HashMap` for audit L14 — the per-file
+/// `ensure_file` path used to insert unconditionally with no cap,
+/// only the bulk `ensure_all` honored `MAX_INDEX_FILES`. A long
+/// session repeatedly inspecting different files in a giant
+/// monorepo grew the cache without bound.
+type FileCache = IndexMap<PathBuf, ExtractedFile>;
 
 pub struct SymbolIndex {
     registry: Arc<AdapterRegistry>,
@@ -21,35 +28,75 @@ impl SymbolIndex {
     pub fn new(registry: Arc<AdapterRegistry>) -> Self {
         Self {
             registry,
-            cache: HashMap::new(),
+            cache: IndexMap::new(),
         }
     }
 
     pub fn ensure_file(&mut self, path: &Path) -> Result<&ExtractedFile, String> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-        let adapter = self
-            .registry
-            .find_for_file(&canonical)
-            .ok_or_else(|| format!("No language adapter for file: {}", canonical.display()))?;
+        let meta = std::fs::metadata(&canonical).ok();
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+        let size = meta.as_ref().map(|m| m.len());
 
-        let mtime = std::fs::metadata(&canonical)
-            .ok()
-            .and_then(|m| m.modified().ok());
-
+        // Audit C5+M7: mtime alone is unreliable on filesystems with
+        // second (or worse) granularity — a same-second write after
+        // the cache fill produces an identical mtime and we serve
+        // stale extracts. Combine mtime + size; size catches almost
+        // every real edit (anything but a same-size in-place patch)
+        // without the cost of hashing the file content.
         let needs_refresh = match self.cache.get(&canonical) {
-            Some(entry) => mtime != Some(entry.mtime),
+            Some(entry) => {
+                let mtime_changed = mtime.map_or(true, |mt| mt != entry.mtime);
+                let size_changed = size.map_or(true, |sz| sz != entry.size);
+                mtime_changed || size_changed
+            }
             None => true,
         };
 
         if needs_refresh {
             let source =
                 std::fs::read_to_string(&canonical).map_err(|e| format!("Read error: {e}"))?;
+            // Audit L3: when picking the adapter for `.h` files,
+            // pass the source content so a C++ header (with `class`,
+            // `namespace`, `template`, etc.) routes to the C++
+            // adapter instead of being parsed as C.
+            let adapter = self
+                .registry
+                .find_for_file_with_content(&canonical, Some(&source))
+                .ok_or_else(|| format!("No language adapter for file: {}", canonical.display()))?;
             let mut extracted = adapter.extract(&canonical, &source)?;
             if let Some(mt) = mtime {
                 extracted.mtime = mt;
             }
+            if let Some(sz) = size {
+                extracted.size = sz;
+            }
+            // Audit L14: LRU-evict the oldest entry before insert if
+            // we're at the cap. Only fires when the path isn't
+            // already in the cache (an in-place refresh keeps the
+            // existing slot and bumps it to most-recent below).
+            if !self.cache.contains_key(&canonical)
+                && self.cache.len() >= MAX_INDEX_FILES
+            {
+                self.cache.shift_remove_index(0);
+            }
             self.cache.insert(canonical.clone(), extracted);
+            // Move the just-touched entry to the most-recent end so
+            // it survives the next eviction. `IndexMap::move_index`
+            // is O(N) worst case but the cache is bounded by
+            // MAX_INDEX_FILES, so this stays fast.
+            if let Some((idx, _, _)) = self.cache.get_full(&canonical) {
+                let last = self.cache.len().saturating_sub(1);
+                if idx != last {
+                    self.cache.move_index(idx, last);
+                }
+            }
+        } else {
+            // Cache hit — adapter lookup unused, but keep the
+            // existing extension-only path so a registry without
+            // C++ doesn't error on `.h`.
+            let _ = self.registry.find_for_file(&canonical);
         }
 
         self.cache
@@ -99,10 +146,11 @@ impl SymbolIndex {
 
             if let Some(pattern) = include {
                 let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if let Ok(re) = regex::Regex::new(pattern)
-                    && !re.is_match(fname) {
+                if let Ok(re) = regex::Regex::new(pattern) {
+                    if !re.is_match(fname) {
                         continue;
                     }
+                }
             }
 
             if let Ok(meta) = path.metadata()
@@ -160,8 +208,13 @@ impl SymbolIndex {
             .hidden(false)
             .filter_entry(|entry| {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    // Share the central skip list with find_files /
+                    // glob / list_dir / grep — the previous inline
+                    // `matches!` only listed 4 dirs and diverged
+                    // silently from the canonical set in
+                    // `agent::tools::is_skip_dir`.
                     let name = entry.file_name().to_str().unwrap_or("");
-                    !matches!(name, "node_modules" | "target" | ".git" | "__pycache__")
+                    !crate::agent::tools::is_skip_dir(name)
                 } else {
                     true
                 }
@@ -209,11 +262,11 @@ impl SymbolIndex {
 
             for (line_num, line) in content.lines().enumerate() {
                 if re.is_match(line) {
-                    if let Some(entry) = entry {
+                    if let Some(ref entry) = entry {
                         let is_definition = entry.symbols.iter().any(|s| {
                             s.name == name
                                 && s.range.start_line <= line_num + 1
-                                && s.range.end_line > line_num
+                                && s.range.end_line >= line_num + 1
                         });
                         if is_definition {
                             continue;
@@ -320,7 +373,7 @@ impl SymbolIndex {
             let symbols: Vec<Symbol> = entry
                 .symbols
                 .iter()
-                .filter(|s| kind_filter.is_none_or(|k| s.kind == k))
+                .filter(|s| kind_filter.map_or(true, |k| s.kind == k))
                 .cloned()
                 .collect();
             result.push((entry.file_path.clone(), symbols));
@@ -339,7 +392,7 @@ impl SymbolIndex {
                 let symbols: Vec<Symbol> = entry
                     .symbols
                     .iter()
-                    .filter(|s| kind_filter.is_none_or(|k| s.kind == k))
+                    .filter(|s| kind_filter.map_or(true, |k| s.kind == k))
                     .cloned()
                     .collect();
                 if !symbols.is_empty() {

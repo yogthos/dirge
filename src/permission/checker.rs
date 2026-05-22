@@ -39,7 +39,22 @@ pub struct PermissionChecker {
 pub(crate) fn is_path_tool_name(tool: &str) -> bool {
     matches!(
         tool,
-        "read" | "write" | "edit" | "list_dir" | "apply_patch" | "lsp"
+        "read"
+            | "write"
+            | "edit"
+            | "list_dir"
+            | "apply_patch"
+            | "lsp"
+            // grep / find_files / glob now also receive path-side
+            // checks (the search-root path), so their rules use
+            // path-glob semantics.
+            | "grep"
+            | "find_files"
+            | "glob"
+            // Semantic tools whose primary arg is a file path.
+            | "list_symbols"
+            | "get_symbol_body"
+            | "find_callees"
     )
 }
 
@@ -74,6 +89,21 @@ impl PermissionChecker {
             ("apply_patch", &config.apply_patch),
             ("lsp", &config.lsp),
             ("question", &config.question),
+            // Newly-configurable tools (previously the perm checker
+            // had no rules for them, so they always fell through to
+            // the `*` default and couldn't be individually gated).
+            ("webfetch", &config.webfetch),
+            ("websearch", &config.websearch),
+            ("task", &config.task),
+            ("task_status", &config.task_status),
+            ("memory", &config.memory),
+            ("skill", &config.skill),
+            ("list_symbols", &config.list_symbols),
+            ("get_symbol_body", &config.get_symbol_body),
+            ("find_definition", &config.find_definition),
+            ("find_callers", &config.find_callers),
+            ("find_callees", &config.find_callees),
+            ("mcp_tool", &config.mcp_tool),
         ] {
             let Some(tp) = tool_perm else { continue };
             let mut entries = Vec::new();
@@ -137,16 +167,24 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
-        let mut matched: Vec<Action> = Vec::new();
+        // Track both the action AND the matching pattern so denial
+        // messages can name which rule blocked the call (was just
+        // "Blocked by permission rules", giving the user no way to
+        // identify and edit the offending rule).
+        let mut matched: Vec<(Action, String)> = Vec::new();
         if let Some(rules) = self.rules.get(tool) {
             for (pattern, action) in rules {
                 if pattern.matches(input) {
-                    matched.push(*action);
+                    matched.push((*action, pattern.original.clone()));
                 }
             }
         }
 
-        let base = matched.last().copied().unwrap_or(self.default_action);
+        let base = matched
+            .last()
+            .map(|(a, _)| *a)
+            .unwrap_or(self.default_action);
+        let last_pat = matched.last().map(|(_, p)| p.clone());
         let action = match self.mode {
             SecurityMode::Restrictive => {
                 if matched.is_empty() && self.default_action == Action::Allow {
@@ -174,9 +212,20 @@ impl PermissionChecker {
             if self.is_doom_loop(tool, input) {
                 match self.doom_loop_action {
                     Action::Deny => {
-                        return CheckResult::Denied(
-                            "Doom loop: repeated identical tool call".to_string(),
-                        );
+                        // Name the call so the user can identify and
+                        // either fix the LLM's behavior or relax the
+                        // pattern.
+                        let preview: String = input.chars().take(60).collect();
+                        return CheckResult::Denied(format!(
+                            "Doom loop: repeated identical {} call ({}{})",
+                            tool,
+                            preview,
+                            if input.chars().count() > 60 {
+                                "…"
+                            } else {
+                                ""
+                            },
+                        ));
                     }
                     Action::Ask => return CheckResult::Ask,
                     Action::Allow => {}
@@ -187,7 +236,10 @@ impl PermissionChecker {
         match action {
             Action::Allow => CheckResult::Allowed,
             Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied("Blocked by permission rules".to_string()),
+            Action::Deny => CheckResult::Denied(match last_pat {
+                Some(pat) => format!("Blocked by rule: {tool} {pat:?} → deny"),
+                None => format!("Blocked: {tool} denied by default action"),
+            }),
         }
     }
 
@@ -201,19 +253,39 @@ impl PermissionChecker {
         }
 
         let abs_path = resolve_absolute(path, &self.working_dir);
-        let mut matched: Vec<Action> = Vec::new();
+        let mut matched: Vec<(Action, String)> = Vec::new();
         if let Some(rules) = self.rules.get(tool) {
             for (pattern, action) in rules {
                 if pattern.matches(&abs_path) || pattern.matches(path) {
-                    matched.push(*action);
+                    matched.push((*action, pattern.original.clone()));
                 }
             }
         }
 
-        let base = matched.last().copied().unwrap_or(self.default_action);
+        let base = matched
+            .last()
+            .map(|(a, _)| *a)
+            .unwrap_or(self.default_action);
+        let last_pat = matched.last().map(|(_, p)| p.clone());
+
+        // Audit H9: `external_directory` rules used to fire only in
+        // `SecurityMode::Accept`. A user who configured
+        // `external_directory = { "/external/safe/**" = "allow" }`
+        // saw the rule silently ignored under Standard/Restrictive.
+        // Pre-compute the overlay so each mode can opt into it
+        // uniformly.
+        let is_external = self.is_external_path(&abs_path);
+        let ext_dir_action = if is_external {
+            self.match_ext_dir(&abs_path)
+        } else {
+            None
+        };
+
         let action = match self.mode {
             SecurityMode::Restrictive => {
-                if matched.is_empty() && self.default_action == Action::Allow {
+                if let Some(a) = ext_dir_action {
+                    a
+                } else if matched.is_empty() && self.default_action == Action::Allow {
                     Action::Ask
                 } else {
                     base
@@ -221,20 +293,31 @@ impl PermissionChecker {
             }
             SecurityMode::Accept => match base {
                 Action::Ask => {
-                    if self.is_external_path(&abs_path) {
-                        self.match_ext_dir(&abs_path).unwrap_or(Action::Ask)
+                    if is_external {
+                        ext_dir_action.unwrap_or(Action::Ask)
                     } else {
                         Action::Allow
                     }
                 }
                 other => other,
             },
-            SecurityMode::Standard => base,
+            SecurityMode::Standard => {
+                // Explicit ext_dir rule overrides the base for external
+                // paths. For non-external paths (or external paths
+                // without a matching ext_dir rule) keep the prior
+                // base-action behavior — the catch-all below will
+                // demote unmatched external Allows to Ask.
+                if let Some(a) = ext_dir_action {
+                    a
+                } else {
+                    base
+                }
+            }
             SecurityMode::Yolo => unreachable!(),
         };
 
         let action =
-            if matched.is_empty() && action == Action::Allow && self.is_external_path(&abs_path) {
+            if matched.is_empty() && action == Action::Allow && is_external && ext_dir_action.is_none() {
                 Action::Ask
             } else {
                 action
@@ -245,9 +328,13 @@ impl PermissionChecker {
             if self.is_doom_loop(tool, path) {
                 match self.doom_loop_action {
                     Action::Deny => {
-                        return CheckResult::Denied(
-                            "Doom loop: repeated identical tool call".to_string(),
-                        );
+                        let preview: String = path.chars().take(80).collect();
+                        return CheckResult::Denied(format!(
+                            "Doom loop: repeated identical {} call ({}{})",
+                            tool,
+                            preview,
+                            if path.chars().count() > 80 { "…" } else { "" },
+                        ));
                     }
                     Action::Ask => return CheckResult::Ask,
                     Action::Allow => {}
@@ -258,7 +345,10 @@ impl PermissionChecker {
         match action {
             Action::Allow => CheckResult::Allowed,
             Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied("Blocked by permission rules".to_string()),
+            Action::Deny => CheckResult::Denied(match last_pat {
+                Some(pat) => format!("Blocked by rule: {tool} {pat:?} → deny"),
+                None => format!("Blocked: {tool} denied by default action"),
+            }),
         }
     }
 
@@ -322,6 +412,35 @@ impl PermissionChecker {
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
         self.mode = mode;
+    }
+
+    /// Resolve a possibly-relative, possibly-symlinked path to its
+    /// canonical form using the checker's own working_dir.
+    /// Exposes `resolve_absolute` to callers that need the same
+    /// canonical path the check ran against (audit H12 — pass this
+    /// to `File::open` instead of the raw `args.path` to close the
+    /// symlink-swap TOCTOU between check and open).
+    pub fn resolve_path_for_tool(&self, path: &str) -> String {
+        resolve_absolute(path, &self.working_dir)
+    }
+
+    /// Count of explicit `Deny` rules across all tools + the
+    /// external-directory ruleset. Used by the host to warn the user
+    /// when Yolo mode is active alongside non-empty deny rules —
+    /// Yolo unconditionally returns `Allowed` before any rule
+    /// lookup, so those deny rules are silently inert (audit H11).
+    pub fn deny_rule_count(&self) -> usize {
+        let in_tool_rules: usize = self
+            .rules
+            .values()
+            .map(|v| v.iter().filter(|(_, a)| *a == Action::Deny).count())
+            .sum();
+        let in_ext_dir = self
+            .ext_dir_rules
+            .iter()
+            .filter(|(_, a)| *a == Action::Deny)
+            .count();
+        in_tool_rules + in_ext_dir
     }
 
     pub fn mode(&self) -> SecurityMode {
@@ -438,16 +557,58 @@ fn resolve_absolute(path: &str, working_dir: &str) -> String {
             // `/safe/parent/../../etc/passwd` style attacks where
             // the parent exists but the leaf doesn't. If even the
             // parent doesn't canonicalize, fall back to the
-            // LEXICAL join (matches pre-F7 behavior so rules on
-            // not-yet-existing paths still match).
+            // LEXICALLY-NORMALIZED join. We do NOT return the raw
+            // lexical form: `Path::starts_with` matches by
+            // components, and a string like
+            // `/cwd/nonexistent/../../etc/passwd` whose first three
+            // components are `/cwd` would classify as internal even
+            // though the path actually escapes via `..`. Normalize
+            // `.` / `..` lexically first so the starts_with check
+            // sees the real prefix.
             if let (Some(parent), Some(name)) = (joined.parent(), joined.file_name())
                 && let Ok(canonical_parent) = std::fs::canonicalize(parent)
             {
                 return canonical_parent.join(name).to_string_lossy().to_string();
             }
-            joined.to_string_lossy().to_string()
+            lexical_normalize(&joined).to_string_lossy().to_string()
         }
     }
+}
+
+/// Resolve `.` and `..` components of `p` without touching the
+/// filesystem. `..` pops the previous `Normal` component; consecutive
+/// `..` at the start (i.e. attempting to climb above root) are
+/// retained as `..` so an attacker can't disguise an escape by
+/// chaining enough `..` to underflow a real-path prefix check.
+/// Doesn't follow symlinks — callers that need symlink resolution
+/// should use `std::fs::canonicalize`; this helper exists for the
+/// nonexistent-path fallback where canonicalize is impossible.
+fn lexical_normalize(p: &Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out: Vec<Component> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    // No Normal to pop (we're at root, or only
+                    // RootDir / Prefix / leading `..` so far) —
+                    // keep the `..` so the result reflects the
+                    // escape attempt rather than being silently
+                    // swallowed.
+                    out.push(c);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut buf = PathBuf::new();
+    for c in &out {
+        buf.push(c.as_os_str());
+    }
+    buf
 }
 
 #[cfg(test)]
@@ -517,6 +678,50 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(resolved, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for audit C3: when BOTH `canonicalize(joined)` AND
+    /// `canonicalize(parent)` fail, the previous fallback returned
+    /// the joined path with `..` components intact. Since
+    /// `Path::starts_with` operates on path *components*, a crafted
+    /// path like `/cwd/nonexistent_subdir/../../etc/passwd` would
+    /// classify as internal because the first three components match
+    /// `/cwd`. Attacker (LLM/agent) can synthesize such a path
+    /// trivially. After the fix, `..` components are lexically
+    /// resolved before the fallback returns, so the path escapes
+    /// the cwd subtree.
+    #[test]
+    fn resolve_absolute_normalizes_dotdot_in_full_lexical_fallback() {
+        // Working dir exists; subdirectory does NOT, ensuring both
+        // canonicalize(joined) and canonicalize(parent) fail and we
+        // hit the LEXICAL fallback path.
+        let dir = std::env::temp_dir().join(format!("dirge-c3-traversal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        // Build a path that, when joined to cwd, looks "inside" lexically
+        // but actually escapes via `..` after a nonexistent intermediate.
+        // joined = <cwd>/no_such_dir/no_such_subdir/../../../etc/passwd
+        let traversal = "no_such_dir/no_such_subdir/../../../etc/passwd";
+
+        let resolved = resolve_absolute(traversal, &cwd);
+
+        // The escape attempt should NOT result in a path whose
+        // components start with the cwd path. We don't insist on
+        // exactly `/etc/passwd` (canonicalization of the cwd parent
+        // can vary by host), but the resolved path must not be a
+        // child of the cwd as the starts_with check would see it.
+        let cwd_canonical = std::fs::canonicalize(&cwd).unwrap();
+        let resolved_path = std::path::PathBuf::from(&resolved);
+        assert!(
+            !resolved_path.starts_with(&cwd_canonical) && !resolved_path.starts_with(&cwd),
+            "lexical-fallback path-traversal should escape cwd subtree; got {:?}, cwd {:?}",
+            resolved_path,
+            cwd_canonical,
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,5 +1,6 @@
 mod adapter;
 pub mod adapters;
+pub(crate) mod common;
 mod index;
 pub mod types;
 
@@ -31,6 +32,31 @@ impl SemanticManager {
 
         #[cfg(feature = "semantic-python")]
         adapters.push(Box::new(adapters::PythonAdapter));
+
+        #[cfg(feature = "semantic-clojure")]
+        adapters.push(Box::new(adapters::ClojureAdapter));
+
+        #[cfg(feature = "semantic-go")]
+        adapters.push(Box::new(adapters::GoAdapter));
+
+        #[cfg(feature = "semantic-ruby")]
+        adapters.push(Box::new(adapters::RubyAdapter));
+
+        #[cfg(feature = "semantic-rust")]
+        adapters.push(Box::new(adapters::RustAdapter));
+
+        #[cfg(feature = "semantic-java")]
+        adapters.push(Box::new(adapters::JavaAdapter));
+
+        // C registered before C++ so the C adapter wins for `.h`
+        // (shared extension). C++ users with C++ headers should use
+        // `.hpp`/`.hh`/`.hxx` to route through CppAdapter — see the
+        // comment on `CppAdapter::extensions`.
+        #[cfg(feature = "semantic-c")]
+        adapters.push(Box::new(adapters::CAdapter));
+
+        #[cfg(feature = "semantic-cpp")]
+        adapters.push(Box::new(adapters::CppAdapter));
 
         let registry = Arc::new(adapters::AdapterRegistry::new(adapters));
         let index = Arc::new(RwLock::new(SymbolIndex::new(registry)));

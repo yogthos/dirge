@@ -37,6 +37,16 @@ impl ToolCache {
     }
 
     pub fn set(&self, key: &str, value: String) {
+        // Race note (audit H8): the generation is read with `Relaxed`
+        // then the entries mutex is taken to insert. A concurrent
+        // `clear` could increment the generation between the load
+        // and the insert, leaving the just-inserted entry tagged
+        // with a stale generation. That's benign — `get` re-checks
+        // `e.generation == current_gen` and returns `None` for any
+        // entry whose generation doesn't match the live counter, so
+        // a stale-generation entry is unreachable and will be
+        // overwritten on the next `set` for the same key. Not worth
+        // the cost of holding the mutex across the generation read.
         let current_gen = self.generation.load(Ordering::Relaxed);
         self.entries.lock().unwrap().insert(
             key.to_string(),

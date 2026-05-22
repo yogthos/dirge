@@ -93,10 +93,11 @@ impl Tool for ListDirTool {
 
         let cache_key = format!("list_dir:{}:hidden={}", path, args.include_hidden);
 
-        if let Some(ref cache) = self.cache
-            && let Some(cached) = cache.get(&cache_key) {
+        if let Some(ref cache) = self.cache {
+            if let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached);
             }
+        }
 
         let walker = WalkBuilder::new(path)
             .git_ignore(true)
@@ -116,7 +117,20 @@ impl Tool for ListDirTool {
             })
             .build();
 
+        // Cap on entries to keep the response from blowing context
+        // when an agent points list_dir at something like
+        // `~/node_modules` with `include_hidden=true`. Mirrors the
+        // caps used by `grep` (`MAX_GREP_RESULTS`) and `find_files`
+        // (`MAX_FIND_RESULTS`). Continue walking past the cap so the
+        // footer can report a useful "...and N more" count rather
+        // than truncating silently.
+        const MAX_LIST_DIR_RESULTS: usize = 200;
+        const COUNT_CEILING_MULTIPLIER: usize = 10;
+        let count_ceiling = MAX_LIST_DIR_RESULTS.saturating_mul(COUNT_CEILING_MULTIPLIER);
+
         let mut entries: Vec<(String, String, String)> = Vec::new();
+        let mut total_entries: usize = 0;
+        let mut truncated_count = false;
 
         for result in walker {
             let entry = match result {
@@ -135,22 +149,31 @@ impl Tool for ListDirTool {
                 Err(_) => continue,
             };
 
-            let kind = if meta.is_dir() {
-                let count = count_dir_entries(entry.path());
-                format!("dir({})", count)
-            } else if meta.is_symlink() {
-                "link".to_string()
-            } else {
-                "file".to_string()
-            };
+            total_entries += 1;
 
-            let size = if meta.is_file() {
-                format_size(meta.len())
-            } else {
-                String::new()
-            };
+            if entries.len() < MAX_LIST_DIR_RESULTS {
+                let kind = if meta.is_dir() {
+                    let count = count_dir_entries(entry.path());
+                    format!("dir({})", count)
+                } else if meta.is_symlink() {
+                    "link".to_string()
+                } else {
+                    "file".to_string()
+                };
 
-            entries.push((name, kind, size));
+                let size = if meta.is_file() {
+                    format_size(meta.len())
+                } else {
+                    String::new()
+                };
+
+                entries.push((name, kind, size));
+            }
+
+            if total_entries >= count_ceiling {
+                truncated_count = true;
+                break;
+            }
         }
 
         entries.sort_by(|a, b| {
@@ -181,6 +204,9 @@ impl Tool for ListDirTool {
         let file_count = entries.len() - dir_count - link_count;
 
         let max_name = entries.iter().map(|e| e.0.len()).max().unwrap_or(0);
+        // Summary counts reflect what's actually IN `entries`
+        // (the displayed slice). The total is reported separately
+        // when the cap fired.
         let mut summary = format!(
             "{} entries ({} dirs, {} files",
             entries.len(),
@@ -189,6 +215,25 @@ impl Tool for ListDirTool {
         );
         if link_count > 0 {
             summary.push_str(&format!(", {link_count} symlinks"));
+        }
+        if total_entries > entries.len() {
+            let total_label = if truncated_count {
+                format!("{}+", total_entries)
+            } else {
+                total_entries.to_string()
+            };
+            let hidden = total_entries.saturating_sub(entries.len());
+            let hidden_label = if truncated_count {
+                format!("{}+", hidden)
+            } else {
+                hidden.to_string()
+            };
+            summary.push_str(&format!(
+                "; showing {} of {}; {} more not shown",
+                entries.len(),
+                total_label,
+                hidden_label,
+            ));
         }
         summary.push_str("):\n");
         let mut result = summary;

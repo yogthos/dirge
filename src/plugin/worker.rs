@@ -438,8 +438,22 @@ impl Worker {
     }
 
     /// Send a Janet expression to the worker and block until it returns
-    /// the stringified result (or a Janet error message).
+    /// the stringified result (or a Janet error message). Uses the
+    /// generous default `EVAL_TIMEOUT` (10 min) — appropriate for
+    /// explicit `(harness/...)` long-running operations the plugin
+    /// might initiate from the REPL or top-level. For per-hook
+    /// dispatch, use [`eval_with_timeout`] with a tighter bound
+    /// (audit L6: a hung `on-tool-start` hook used to block every
+    /// subsequent tool for up to EVAL_TIMEOUT).
     pub fn eval(&mut self, code: &str) -> Result<String, String> {
+        self.eval_with_timeout(code, EVAL_TIMEOUT)
+    }
+
+    /// Variant of `eval` with a caller-provided timeout. Capped at
+    /// the global `EVAL_TIMEOUT` so callers can't accidentally
+    /// extend the wait.
+    pub fn eval_with_timeout(&mut self, code: &str, timeout: Duration) -> Result<String, String> {
+        let effective = timeout.min(EVAL_TIMEOUT);
         let (reply, rx) = mpsc::channel();
         self.cmd_tx
             .send(Cmd::Eval {
@@ -447,17 +461,11 @@ impl Worker {
                 reply,
             })
             .map_err(|_| "janet worker disconnected".to_string())?;
-        // Bounded wait. `recv_timeout` is functionally `recv()` for
-        // any well-behaved plugin since EVAL_TIMEOUT is 10 minutes;
-        // its purpose is to surface a clean error when a plugin
-        // is wedged in an infinite loop, rather than locking the
-        // host's event loop forever on a `recv()` that never
-        // resolves.
-        match rx.recv_timeout(EVAL_TIMEOUT) {
+        match rx.recv_timeout(effective) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
                 "janet worker did not reply within {}s — plugin may be stuck in an infinite loop",
-                EVAL_TIMEOUT.as_secs(),
+                effective.as_secs(),
             )),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err("janet worker dropped reply channel".to_string())

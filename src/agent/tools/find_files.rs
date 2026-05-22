@@ -5,7 +5,8 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, FindFilesArgs, MAX_FIND_RESULTS, PermCheck, ToolError, check_perm, is_skip_dir,
+    AskSender, FindFilesArgs, MAX_FIND_RESULTS, PermCheck, ToolError, check_perm, check_perm_path,
+    is_skip_dir,
 };
 
 pub struct FindFilesTool {
@@ -71,6 +72,11 @@ impl Tool for FindFilesTool {
 
     async fn call(&self, args: FindFilesArgs) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "find_files", &args.pattern).await?;
+        // Path-side check: external_directory rules + Accept-mode
+        // gating live in check_perm_path. Without this find_files
+        // over `/etc` skipped the rules entirely.
+        let perm_path = args.path.as_deref().unwrap_or(".");
+        check_perm_path(&self.permission, &self.ask_tx, "find_files", perm_path).await?;
 
         let cache_key = format!(
             "find_files:{}:{}:hidden={}",
@@ -111,6 +117,16 @@ impl Tool for FindFilesTool {
             .build();
 
         let mut results: Vec<String> = Vec::new();
+        // Keep counting matches past MAX_FIND_RESULTS so the footer
+        // can report a meaningful "...and N more" instead of the
+        // tautological "...and 0 more" that the old `total = results.len()`
+        // formula produced. Capped at 10× the result limit so a
+        // pattern matching the entire monorepo doesn't pin the
+        // walker indefinitely; if we hit the count ceiling we mark
+        // the footer with a `+`.
+        let mut total_matched: usize = 0;
+        const COUNT_CEILING_MULTIPLIER: usize = 10;
+        let count_ceiling = MAX_FIND_RESULTS.saturating_mul(COUNT_CEILING_MULTIPLIER);
 
         for entry in walker
             .flatten()
@@ -118,8 +134,11 @@ impl Tool for FindFilesTool {
         {
             let fname = entry.file_name().to_string_lossy();
             if re.is_match(&fname) {
-                results.push(entry.path().to_string_lossy().to_string());
-                if results.len() >= MAX_FIND_RESULTS {
+                total_matched += 1;
+                if results.len() < MAX_FIND_RESULTS {
+                    results.push(entry.path().to_string_lossy().to_string());
+                }
+                if total_matched >= count_ceiling {
                     break;
                 }
             }
@@ -129,17 +148,27 @@ impl Tool for FindFilesTool {
             "No files found matching the pattern.".to_string()
         } else {
             results.sort();
-            let total = results.len();
-            if total >= MAX_FIND_RESULTS {
+            if total_matched > MAX_FIND_RESULTS {
+                let suffix = if total_matched >= count_ceiling {
+                    format!("{}+", total_matched)
+                } else {
+                    total_matched.to_string()
+                };
+                let more = total_matched.saturating_sub(MAX_FIND_RESULTS);
+                let more_suffix = if total_matched >= count_ceiling {
+                    format!("{}+", more)
+                } else {
+                    more.to_string()
+                };
                 format!(
                     "{} files found (showing first {}):\n{}\n\n... and {} more",
-                    total,
+                    suffix,
                     MAX_FIND_RESULTS,
-                    results[..MAX_FIND_RESULTS].join("\n"),
-                    total - MAX_FIND_RESULTS
+                    results.join("\n"),
+                    more_suffix,
                 )
             } else {
-                format!("{} files found:\n{}", total, results.join("\n"))
+                format!("{} files found:\n{}", total_matched, results.join("\n"))
             }
         };
 

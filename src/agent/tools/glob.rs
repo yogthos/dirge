@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::agent::tools::MAX_FIND_RESULTS;
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm, check_perm_path};
 
 pub struct GlobTool {
     pub permission: Option<PermCheck>,
@@ -128,6 +128,11 @@ impl Tool for GlobTool {
             &format!("pattern:{}", args.pattern),
         )
         .await?;
+        // Path-side check: external_directory rules + Accept-mode
+        // working-dir gating live in check_perm_path. Without this
+        // a glob over `/etc` or `~/.ssh` skipped the rules entirely.
+        let perm_path = args.path.as_deref().unwrap_or(".");
+        check_perm_path(&self.permission, &self.ask_tx, "glob", perm_path).await?;
 
         let cache_key = format!(
             "glob:{}:{}:hidden={}",
@@ -141,7 +146,7 @@ impl Tool for GlobTool {
             return Ok(cached);
         }
 
-        let re = glob_to_regex(&args.pattern).map_err(ToolError::Msg)?;
+        let re = glob_to_regex(&args.pattern).map_err(|e| ToolError::Msg(e))?;
 
         let root = args
             .path
@@ -155,14 +160,18 @@ impl Tool for GlobTool {
         let walker = WalkBuilder::new(root)
             // Hide dotfiles by default. See `FindFilesArgs::include_hidden`.
             .hidden(!args.include_hidden)
-            .git_global(false)
+            // Honor the user's global `~/.gitignore` to match the
+            // behavior of grep / find_files / list_dir. Previously
+            // glob set this to `false`, silently surfacing files
+            // the user had globally excluded.
+            .git_global(true)
             .git_ignore(true)
             .git_exclude(true)
             .build();
 
         for entry in walker {
             let entry = entry.map_err(|e| ToolError::Msg(e.to_string()))?;
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
                 continue;
             }
 

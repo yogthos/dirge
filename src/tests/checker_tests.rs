@@ -80,6 +80,57 @@ fn deny_rule_not_blocked_by_yolo() {
     assert!(matches!(result, CheckResult::Allowed));
 }
 
+/// Regression: deny messages must name the rule pattern that matched
+/// so the user knows what to edit. Previously bare
+/// `"Blocked by permission rules"` left them with no path forward.
+#[test]
+fn deny_message_names_the_matching_rule() {
+    let mut checker = make_checker(SecurityMode::Standard);
+    let result = checker.check("bash", "rm -rf /home/user/project");
+    match result {
+        CheckResult::Denied(msg) => {
+            assert!(
+                msg.contains("rm") || msg.contains("rule"),
+                "deny message must reference the rule: {msg}",
+            );
+            assert!(
+                !msg.eq("Blocked by permission rules"),
+                "deny message must not be generic: {msg}",
+            );
+        }
+        other => panic!("expected Denied; got {other:?}"),
+    }
+}
+
+/// Doom-loop deny message must name the offending tool + call.
+#[test]
+fn doom_loop_deny_names_the_call() {
+    use crate::permission::{Action, PermissionConfig};
+    let config = PermissionConfig {
+        doom_loop: Some(Action::Deny),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &config,
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    // Three identical calls fires the doom-loop deny.
+    checker.check("bash", "echo hi");
+    checker.check("bash", "echo hi");
+    let result = checker.check("bash", "echo hi");
+    match result {
+        CheckResult::Denied(msg) => {
+            assert!(msg.contains("Doom loop"), "must say Doom loop: {msg}");
+            assert!(
+                msg.contains("bash") && msg.contains("echo hi"),
+                "must name tool + call preview: {msg}",
+            );
+        }
+        other => panic!("expected Denied; got {other:?}"),
+    }
+}
+
 // --- Doom loop detection ---
 
 #[test]

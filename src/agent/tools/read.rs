@@ -5,9 +5,91 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path};
+use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path_resolve};
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::{LspManager, TouchMode};
+
+/// Reject these extensions outright as binary — matches opencode's
+/// `read.ts` extension list. Sampling-based detection below catches
+/// anything not on this list (custom compiled artifacts, etc.).
+fn is_binary_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let ext = match lower.rsplit_once('.') {
+        Some((_, e)) => e,
+        None => return false,
+    };
+    matches!(
+        ext,
+        "zip"
+            | "tar"
+            | "gz"
+            | "tgz"
+            | "bz2"
+            | "xz"
+            | "7z"
+            | "rar"
+            | "exe"
+            | "dll"
+            | "so"
+            | "dylib"
+            | "class"
+            | "jar"
+            | "war"
+            | "wasm"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "odt"
+            | "ods"
+            | "odp"
+            | "pdf"
+            | "bin"
+            | "dat"
+            | "obj"
+            | "o"
+            | "a"
+            | "lib"
+            | "pyc"
+            | "pyo"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "ico"
+            | "mp3"
+            | "mp4"
+            | "mov"
+            | "avi"
+            | "ogg"
+            | "wav"
+            | "flac"
+    )
+}
+
+/// Sample-based binary detection — opencode `read.ts:187-198`.
+/// Any null byte → binary. Otherwise count "non-printable" bytes
+/// (outside `\t\n\r` and printable ASCII range); if more than 30%
+/// of the sample, treat as binary.
+fn is_binary_content(sample: &[u8]) -> bool {
+    if sample.is_empty() {
+        return false;
+    }
+    let mut non_printable = 0usize;
+    for &b in sample {
+        if b == 0 {
+            return true;
+        }
+        if b < 9 || (b > 13 && b < 32) {
+            non_printable += 1;
+        }
+    }
+    (non_printable * 100) / sample.len() > 30
+}
 
 pub struct ReadTool {
     pub permission: Option<PermCheck>,
@@ -72,7 +154,12 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
-        check_perm_path(&self.permission, &self.ask_tx, "read", &args.path).await?;
+        // Audit H12: pin the path we'll actually open to the same
+        // canonical form the permission check ran against, so a
+        // symlink swap between check and open can't land us on a
+        // different file than the user authorized.
+        let resolved_path =
+            check_perm_path_resolve(&self.permission, &self.ask_tx, "read", &args.path).await?;
 
         let cache_key = format!(
             "read:{}:{}:{}",
@@ -81,10 +168,11 @@ impl Tool for ReadTool {
             args.limit.unwrap_or(2000),
         );
 
-        if let Some(ref cache) = self.cache
-            && let Some(cached) = cache.get(&cache_key) {
+        if let Some(ref cache) = self.cache {
+            if let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached);
             }
+        }
 
         // F4: stream the file line-by-line via BufReader instead of
         // loading the whole thing into memory with `read_to_string`.
@@ -101,7 +189,7 @@ impl Tool for ReadTool {
         const MAX_LINE_BYTES: usize = 16 * 1024;
         const TRUNC_MARKER: &str = " …[line truncated]";
 
-        let metadata = tokio::fs::metadata(&args.path).await?;
+        let metadata = tokio::fs::metadata(&resolved_path).await?;
         let file_size = metadata.len();
         if file_size > MAX_FILE_BYTES {
             return Err(ToolError::Msg(format!(
@@ -113,8 +201,35 @@ impl Tool for ReadTool {
         let offset = args.offset.unwrap_or(1).max(1) - 1;
         let limit = args.limit.unwrap_or(2000);
 
-        use tokio::io::AsyncBufReadExt;
-        let file = tokio::fs::File::open(&args.path).await?;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+        // Binary file detection — refuse before streaming so we
+        // don't shovel multi-MB of corrupted UTF-8 into LLM
+        // context. Pattern matches opencode `read.ts:153-198`:
+        // reject by extension OR by sampling the first 4 KiB
+        // for null bytes / non-printable density. The agent gets
+        // a clear "Cannot read binary file" hint instead of
+        // garbled output.
+        if is_binary_extension(args.path.as_str()) {
+            return Err(ToolError::Msg(format!(
+                "Cannot read binary file: {} (use bash with a hex/xxd tool if you really need bytes)",
+                args.path,
+            )));
+        }
+        {
+            let mut sniffer = tokio::fs::File::open(&resolved_path).await?;
+            let mut sample = vec![0u8; 4096];
+            let n = sniffer.read(&mut sample).await?;
+            sample.truncate(n);
+            if is_binary_content(&sample) {
+                return Err(ToolError::Msg(format!(
+                    "Cannot read binary file: {} (null bytes / high non-printable density detected)",
+                    args.path,
+                )));
+            }
+        }
+
+        let file = tokio::fs::File::open(&resolved_path).await?;
         let reader = tokio::io::BufReader::new(file);
         let mut lines = reader.lines();
         let mut total_lines = 0usize;
@@ -200,7 +315,7 @@ impl Tool for ReadTool {
         // quickly). No diagnostic surfacing on read.
         #[cfg(feature = "lsp")]
         if let Some(manager) = self.lsp_manager.clone() {
-            let path = std::path::PathBuf::from(&args.path);
+            let path = std::path::PathBuf::from(&resolved_path);
             tokio::spawn(async move {
                 manager.touch_file(&path, TouchMode::Notify).await;
             });
@@ -214,6 +329,36 @@ impl Tool for ReadTool {
 mod tests {
     use super::*;
     use crate::agent::tools::ReadArgs;
+
+    /// Binary detection by extension — pdf/exe/o/zip/etc.
+    #[test]
+    fn test_is_binary_extension_known() {
+        assert!(is_binary_extension("foo.pdf"));
+        assert!(is_binary_extension("a.tar.gz"));
+        assert!(is_binary_extension("dir/lib.so"));
+        assert!(is_binary_extension("PHOTO.JPG"));
+        assert!(is_binary_extension("class.pyc"));
+        assert!(!is_binary_extension("source.rs"));
+        assert!(!is_binary_extension("script.py"));
+        assert!(!is_binary_extension("README.md"));
+        assert!(!is_binary_extension("noext"));
+    }
+
+    /// Sample-based binary detection — null byte triggers, plain
+    /// UTF-8 doesn't, 30%-non-printable triggers.
+    #[test]
+    fn test_is_binary_content_null_byte() {
+        assert!(is_binary_content(b"hello\x00world"));
+        assert!(!is_binary_content(b"hello world"));
+        assert!(!is_binary_content(b"")); // empty isn't binary
+        // Mostly non-printable → binary.
+        let blob: Vec<u8> = (0..100).map(|_| 0x01u8).collect();
+        assert!(is_binary_content(&blob));
+        // UTF-8 multi-byte (Japanese) — should NOT trip the
+        // non-printable heuristic since multi-byte UTF-8 bytes
+        // are all >= 128.
+        assert!(!is_binary_content("こんにちは世界".as_bytes()));
+    }
 
     /// Verifies the line-numbering format used in read output.
     /// The model sees this format and must strip "NNN: " prefixes when passing text to edit.

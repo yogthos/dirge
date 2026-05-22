@@ -5,7 +5,8 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, GrepArgs, MAX_GREP_RESULTS, PermCheck, ToolError, check_perm, is_skip_dir,
+    AskSender, GrepArgs, MAX_GREP_RESULTS, PermCheck, ToolError, check_perm, check_perm_path,
+    is_skip_dir,
 };
 
 pub struct GrepTool {
@@ -86,6 +87,10 @@ impl Tool for GrepTool {
                     "context_lines": {
                         "type": "integer",
                         "description": "Number of context lines to show before and after each match (like grep -C)"
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "description": "Include dotfiles (.env, .gitignore, etc.) in the search. Default false to avoid surfacing secrets and config files."
                     }
                 },
                 "required": ["pattern"]
@@ -95,13 +100,21 @@ impl Tool for GrepTool {
 
     async fn call(&self, args: GrepArgs) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "grep", &args.pattern).await?;
+        // Path-side check: previously grep accepted any path
+        // (`grep("x", "/etc")`) because only the pattern was
+        // permission-checked. external_directory rules + the
+        // working-dir Accept-mode logic live in check_perm_path,
+        // so an extra call here closes the bypass.
+        let perm_path = args.path.as_deref().unwrap_or(".");
+        check_perm_path(&self.permission, &self.ask_tx, "grep", perm_path).await?;
 
         let cache_key = format!(
-            "grep:{}:{}:{}:{}",
+            "grep:{}:{}:{}:{}:hidden={}",
             args.pattern,
             args.path.as_deref().unwrap_or("."),
             args.include.as_deref().unwrap_or(""),
             args.context_lines.unwrap_or(0),
+            args.include_hidden,
         );
 
         if let Some(ref cache) = self.cache
@@ -115,17 +128,32 @@ impl Tool for GrepTool {
         let search_path = args.path.as_deref().unwrap_or(".");
         let context = args.context_lines.unwrap_or(0);
 
-        let include_re = args.include.as_ref().map(|g| {
-            let pattern = format!("^(?:{})$", Self::glob_to_regex(g));
-            Regex::new(&pattern).unwrap_or_else(|_| Regex::new(".*").unwrap())
-        });
+        // Validate the include glob and surface compile errors
+        // instead of the previous silent fallback to `.*` (match
+        // everything). A user passing `include: "[a-z("` would have
+        // silently matched every file — the include filter would
+        // appear to do nothing and they'd never know why.
+        let include_re = match args.include.as_ref() {
+            Some(g) => {
+                let pattern = format!("^(?:{})$", Self::glob_to_regex(g));
+                Some(Regex::new(&pattern).map_err(|e| {
+                    ToolError::Msg(format!(
+                        "Invalid include glob {g:?}: {e}. Use forms like \"*.rs\" or \"*.{{ts,tsx}}\"."
+                    ))
+                })?)
+            }
+            None => None,
+        };
 
         let walker = WalkBuilder::new(search_path)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
             .require_git(false)
-            .hidden(false)
+            // F2 carryover: hide dotfiles by default so grep doesn't
+            // silently surface `.env` / `.git/` internals. Opt-in
+            // via `include_hidden: true`.
+            .hidden(!args.include_hidden)
             .filter_entry(|entry| {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     !is_skip_dir(entry.file_name().to_str().unwrap_or(""))
@@ -161,6 +189,18 @@ impl Tool for GrepTool {
             }
 
             let path_str = entry.path().to_string_lossy().to_string();
+
+            // Skip files larger than 10 MiB so a single huge file
+            // can't blow up the process memory. Anything bigger
+            // than this is realistically not source code the LLM
+            // would want grepped. `tokio::fs::read` previously
+            // pulled the whole file into RAM unconditionally.
+            const MAX_GREP_FILE_BYTES: u64 = 10 * 1024 * 1024;
+            if let Ok(meta) = tokio::fs::metadata(entry.path()).await
+                && meta.len() > MAX_GREP_FILE_BYTES
+            {
+                continue;
+            }
 
             match tokio::fs::read(entry.path()).await {
                 Ok(data) => {
@@ -237,13 +277,21 @@ impl Tool for GrepTool {
         } else {
             let output_lines = all_results.len();
             if output_lines >= MAX_GREP_RESULTS {
+                // `output_lines - MAX_GREP_RESULTS` is always 0 here
+                // because the walker breaks the moment `all_results`
+                // hits the cap — the old footer always read
+                // "...and 0 more". Use the actual match count vs.
+                // displayed lines, plus a hint that the walker may
+                // have stopped before finishing the corpus.
+                let hidden = match_count.saturating_sub(output_lines);
                 format!(
-                    "{} matches (showing first {} output lines, searched {} files):\n{}\n\n... and {} more",
+                    "{}+ matches (showing first {} output lines, searched {} files){}:\n{}\n\n... and {} more (output truncated; remaining files not scanned)",
                     match_count,
                     MAX_GREP_RESULTS,
                     file_count,
+                    "",
                     all_results.join("\n"),
-                    output_lines - MAX_GREP_RESULTS
+                    hidden,
                 )
             } else {
                 format!(

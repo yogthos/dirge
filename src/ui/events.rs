@@ -74,9 +74,9 @@ pub fn render_session(
         // Continuation lines are indented to that same width so the
         // handle isn't repeated on every wrap.
         let (handle, line_color) = match msg.role {
-            MessageRole::User => ("<you>   ", theme::user()),
+            MessageRole::User => ("<you> ", theme::user()),
             MessageRole::Assistant => ("<dirge> ", theme::agent()),
-            MessageRole::System => ("<sys>   ", theme::system()),
+            MessageRole::System => ("<sys> ", theme::system()),
         };
         let cont_indent = " ".repeat(handle.chars().count());
 
@@ -229,7 +229,15 @@ pub fn sanitize_output(text: &str) -> CompactString {
                 Some(_) => {}
                 None => break,
             }
-        } else if c.is_ascii_control() && c != '\n' && c != '\t' && c != '\r' {
+        } else if c.is_ascii_control() && c != '\n' && c != '\t' {
+            // Strip carriage returns too. \r moves the cursor to
+            // column 0 mid-line, which inside a tool chamber row
+            // overwrites the left border. Previously sanitize_output
+            // let \r through (originally allowed for CRLF
+            // preservation), so a bash tool printing progress with
+            // `\rstep N/M` could collapse the chamber rendering.
+            // The display path normalizes CRLF before reaching
+            // here when needed.
             continue;
         } else {
             result.push(c);

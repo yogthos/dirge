@@ -42,6 +42,42 @@ pub struct PermissionConfig {
     /// pattern rules let users restrict which kinds of questions
     /// the agent can ask.
     pub question: Option<ToolPerm>,
+    /// `webfetch` — HTTP(S) fetch tool. Pattern rules can be used to
+    /// restrict the URLs (e.g., \"https://docs.example.com/*\":
+    /// allow).
+    pub webfetch: Option<ToolPerm>,
+    /// `websearch` — Exa-backed web search. Pattern rules restrict
+    /// the query strings.
+    pub websearch: Option<ToolPerm>,
+    /// `task` — subagent runner. The pattern is the subagent prompt.
+    pub task: Option<ToolPerm>,
+    /// `task_status` — companion query tool for `task`. Read-only;
+    /// included for completeness so users can deny it independently
+    /// (e.g. to force background-only invocations).
+    pub task_status: Option<ToolPerm>,
+    /// `memory` — persistent project memory store. Pattern rules
+    /// restrict the memory keys / operations.
+    pub memory: Option<ToolPerm>,
+    /// `skill` — Claude-compatible skill loading. Pattern rules
+    /// restrict which skills can be loaded.
+    pub skill: Option<ToolPerm>,
+    /// Semantic code-graph tools (tree-sitter-backed): `list_symbols`,
+    /// `get_symbol_body`, `find_definition`, `find_callers`,
+    /// `find_callees`. One per tool — pattern matches against the
+    /// tool's primary argument (path for body/list, symbol name for
+    /// find_*).
+    pub list_symbols: Option<ToolPerm>,
+    pub get_symbol_body: Option<ToolPerm>,
+    pub find_definition: Option<ToolPerm>,
+    pub find_callers: Option<ToolPerm>,
+    pub find_callees: Option<ToolPerm>,
+    /// `mcp_tool` — generic catch-all for ALL MCP-provided tools.
+    /// Each MCP tool is permission-checked as
+    /// `mcp_tool:<server>:<tool>`; pattern rules here match against
+    /// that string. e.g.
+    /// `{ \"mcp_tool:filesystem:*\": \"deny\" }` blocks every tool
+    /// from the `filesystem` MCP server.
+    pub mcp_tool: Option<ToolPerm>,
     pub external_directory: Option<HashMap<String, Action>>,
     pub doom_loop: Option<Action>,
 }

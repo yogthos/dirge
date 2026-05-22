@@ -1,7 +1,8 @@
 use indexmap::IndexMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// Maximum chars retained per Completed/Failed payload. Prevents a single
 /// subagent answer from blowing the parent context.
@@ -12,6 +13,14 @@ const MAX_TASK_OUTPUT_CHARS: usize = 3000;
 /// (FIFO — `get` does not bump access order). Plenty of headroom for any
 /// reasonable session; agents only see ids they themselves spawned.
 const STORE_CAPACITY: usize = 32;
+
+/// Maximum number of *concurrently running* background subagent
+/// tasks (audit M2). Without this cap a misbehaving LLM could spawn
+/// dozens of background tasks in parallel and burn the user's API
+/// budget. Hit by tracking the in-flight JoinHandle count via
+/// `running_count()`; the `task` tool refuses new background spawns
+/// when at-cap with a clear error rather than queueing.
+const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
 /// Event surfaced on the UI lifecycle channel.
 ///
@@ -53,6 +62,14 @@ struct Inner {
     /// full TaskNotification (not just the id) so eviction between notify
     /// and drain can't lose the payload.
     pending: VecDeque<TaskNotification>,
+    /// JoinHandle per in-flight subagent task, keyed by task id. Populated
+    /// by `attach_handle` after the spawning code in `task.rs` has the
+    /// handle, removed on terminal notify, and aborted en-masse by
+    /// `cancel_all` when the parent session is swapped out (e.g. plugin
+    /// `harness/switch-session` or the `/sessions <id>` slash). Without
+    /// this, subagents continued to consume API budget after their parent
+    /// was gone, eventually notifying a dropped store.
+    handles: HashMap<String, JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +133,19 @@ impl BackgroundStore {
         self.lock().tasks.get(id).cloned()
     }
 
+    /// Count of subagent tasks currently in flight. Equal to the
+    /// number of live `JoinHandle`s the store is tracking. Used by
+    /// the `task` tool to refuse a new background spawn when at the
+    /// `MAX_CONCURRENT_SUBAGENTS` cap (audit M2).
+    pub fn running_count(&self) -> usize {
+        self.lock().handles.len()
+    }
+
+    /// Compile-time cap on concurrent subagent spawns.
+    pub fn max_concurrent() -> usize {
+        MAX_CONCURRENT_SUBAGENTS
+    }
+
     /// Record a terminal state (Completed or Failed) and queue a notification
     /// for delivery. Truncates the payload to MAX_TASK_OUTPUT_CHARS.
     ///
@@ -133,6 +163,10 @@ impl BackgroundStore {
             return;
         };
         task.state = truncated.clone();
+        // Task has reached a terminal state — drop its JoinHandle so
+        // we're not keeping a finished handle alive in the map. Handle
+        // drop is fine even if the task itself already exited.
+        inner.handles.remove(id);
         // Guard against double-notifies enqueuing the same id twice.
         if !inner.pending.iter().any(|n| n.id == id_owned) {
             inner.pending.push_back(TaskNotification {
@@ -150,6 +184,57 @@ impl BackgroundStore {
                 state: truncated,
             }));
         }
+    }
+
+    /// Attach the `JoinHandle` of a freshly-spawned background subagent
+    /// task to its id. Called immediately after the spawn in
+    /// `task.rs` so `cancel_all` has something to abort on session
+    /// switch. Re-attaching for an id whose task already completed
+    /// (handle removed by `notify`) is a no-op; re-attaching for a
+    /// still-running id replaces and drops the previous handle.
+    pub fn attach_handle(&self, id: &str, handle: JoinHandle<()>) {
+        let mut inner = self.lock();
+        // Only keep the handle if the task is still tracked.
+        if !inner.tasks.contains_key(id) {
+            return;
+        }
+        if let Some(prev) = inner.handles.insert(id.to_string(), handle) {
+            // Defensive: dropping the old handle without abort is OK
+            // (it would continue running) but a session-switch could
+            // then leak it. Abort the old one explicitly.
+            prev.abort();
+        }
+    }
+
+    /// Abort every in-flight background subagent task and mark any
+    /// still-Running task as Failed("cancelled — session switched").
+    /// Called from the UI's session-swap paths (plugin TreeOp
+    /// `NewSession` / `SwitchSession`, `/sessions <prefix>` slash)
+    /// so subagents stop burning API budget against a session their
+    /// parent agent no longer sees. Drained `pending` notifications
+    /// are also cleared — they belong to the previous session and
+    /// would otherwise surface in the new session's first turn.
+    pub fn cancel_all(&self) {
+        let mut inner = self.lock();
+        // Abort handles. `abort()` is best-effort: the awaiter inside
+        // the task (e.g. `model.btw_query`) gets dropped at the next
+        // suspension point, which collapses its reqwest connection.
+        for (_, h) in inner.handles.drain() {
+            h.abort();
+        }
+        // Mark any task still in Running state as cancelled so a
+        // later `task_status` lookup returns something useful instead
+        // of "Running forever".
+        let cancelled_label = "cancelled — session switched".to_string();
+        for task in inner.tasks.values_mut() {
+            if matches!(task.state, TaskState::Running) {
+                task.state = TaskState::Failed(cancelled_label.clone());
+            }
+        }
+        // Drop pending notifications. They belong to the previous
+        // session; surfacing them in the next session's prompt would
+        // be confusing ("you finished a task you didn't start").
+        inner.pending.clear();
     }
 
     /// Fire a Started lifecycle event for the UI. No effect on the LLM-side
@@ -269,6 +354,52 @@ mod tests {
     #[test]
     fn get_on_missing_returns_none() {
         assert!(BackgroundStore::new().get("nope").is_none());
+    }
+
+    /// Audit C6: `cancel_all` must abort in-flight handles, mark
+    /// Running tasks as Failed("cancelled"), and clear pending
+    /// notifications so the next session doesn't inherit them.
+    /// Single-thread runtime is enough — `JoinHandle::abort()`
+    /// only requires that the task be polled again to drop, which
+    /// `yield_now().await` triggers below.
+    #[tokio::test]
+    async fn cancel_all_aborts_in_flight_tasks() {
+        let store = BackgroundStore::new();
+        store.insert("t1".into());
+
+        // Spawn a long-running task and register its handle.
+        let store_for_task = store.clone();
+        let handle = tokio::spawn(async move {
+            // Never completes naturally within the test window.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            store_for_task.notify("t1", TaskState::Completed("should not run".into()));
+        });
+        store.attach_handle("t1", handle);
+
+        // Also enqueue a stale pending notification to verify
+        // cancel_all clears the queue.
+        store.insert("t_stale".into());
+        store.notify("t_stale", TaskState::Completed("prev session".into()));
+        assert_eq!(store.pending_len(), 1);
+
+        store.cancel_all();
+
+        // Pending notifications gone.
+        assert_eq!(store.pending_len(), 0, "cancel_all must clear pending");
+
+        // The still-Running task now reads as Failed("cancelled — ...").
+        let t1 = store.get("t1").expect("t1 retained");
+        match &t1.state {
+            TaskState::Failed(reason) => assert!(
+                reason.contains("cancelled"),
+                "expected cancellation reason; got {:?}",
+                reason
+            ),
+            other => panic!("expected Failed cancelled, got {:?}", other),
+        }
+
+        // Give the runtime a tick so the abort lands.
+        tokio::task::yield_now().await;
     }
 
     // Regression: previously get() evicted completed/failed tasks. The new

@@ -1,4 +1,10 @@
-#[cfg(test)]
+// Tests exercise plugin-feature internals (Janet worker, harness
+// API, hook dispatch). Without the feature, the JanetClient and
+// related symbols don't exist, so the tests can't compile. Gate
+// the whole test module on the feature to keep `cargo test` (no
+// args) green for users who don't have the plugin toolchain set
+// up.
+#[cfg(all(test, feature = "plugin"))]
 mod tests {
     use super::*;
 
@@ -1764,7 +1770,7 @@ pub fn load_plugin(
         let mut janet_files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
             .map_err(|e| format!("cannot read plugin dir {}: {}", path.display(), e))?
             .filter_map(|e| e.ok().map(|x| x.path()))
-            .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "janet"))
+            .filter(|p| p.is_file() && p.extension().map_or(false, |ext| ext == "janet"))
             .collect();
         janet_files.sort();
         if janet_files.is_empty() {
@@ -2067,16 +2073,35 @@ impl PluginManager {
                 hook_lit = format!("\"{}\"", escape_janet_string(hook)),
                 fname_lit = format!("\"{}\"", escape_janet_string(name)),
             );
-            if let Ok(s) = self.worker.eval(&code)
-                && let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:")
-            {
-                tracing::warn!(
-                    target: "dirge::plugin",
-                    hook = %hook,
-                    function = %name,
-                    error = %msg,
-                    "plugin hook errored — continuing dispatch",
-                );
+            // Audit L6: tighter per-hook timeout than the default
+            // EVAL_TIMEOUT (10 min). A hung `on-tool-start` used to
+            // freeze every subsequent tool call for the full 10 min;
+            // 5s is enough headroom for any reasonable hook (most
+            // execute in < 100 ms) while still recovering quickly
+            // from a plugin stuck in `(while true)` or a blocking
+            // syscall.
+            const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            match self.worker.eval_with_timeout(&code, HOOK_TIMEOUT) {
+                Ok(s) => {
+                    if let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:") {
+                        tracing::warn!(
+                            target: "dirge::plugin",
+                            hook = %hook,
+                            function = %name,
+                            error = %msg,
+                            "plugin hook errored — continuing dispatch",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        hook = %hook,
+                        function = %name,
+                        error = %e,
+                        "plugin hook timed out or worker disconnected — continuing dispatch without its result",
+                    );
+                }
             }
 
             // First-wins block check. Peek the slot WITHOUT clearing —

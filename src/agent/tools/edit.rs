@@ -7,7 +7,7 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, EditArgs, PermCheck, ToolError, check_perm_path, is_plan_file,
+    AskSender, EditArgs, PermCheck, ToolError, check_perm_path_resolve, is_plan_file,
 };
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
@@ -139,7 +139,10 @@ impl Tool for EditTool {
             ));
         }
 
-        check_perm_path(&self.permission, &self.ask_tx, "edit", &args.path).await?;
+        // Audit H12: pin file operations to the canonical path the
+        // permission check resolved.
+        let resolved_path =
+            check_perm_path_resolve(&self.permission, &self.ask_tx, "edit", &args.path).await?;
 
         if let Some(plan) = &self.plan_file
             && !is_plan_file(plan, &args.path) {
@@ -149,7 +152,21 @@ impl Tool for EditTool {
                 ));
             }
 
-        let bytes = tokio::fs::read(&args.path).await?;
+        // Pre-check size before reading. The edit tool isn't meant
+        // for huge generated artifacts; cap at 100 MiB so an LLM
+        // pointing it at a gigabyte log file fails fast rather
+        // than OOM-ing the process. Matches the apply_patch cap.
+        const MAX_EDIT_BYTES: u64 = 100 * 1024 * 1024;
+        if let Ok(meta) = tokio::fs::metadata(&resolved_path).await
+            && meta.len() > MAX_EDIT_BYTES
+        {
+            return Err(ToolError::Msg(format!(
+                "file too large for edit: {} bytes (cap {} bytes); use bash with sed/awk for huge files",
+                meta.len(),
+                MAX_EDIT_BYTES,
+            )));
+        }
+        let bytes = tokio::fs::read(&resolved_path).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
         let content = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
         let normalized_old = args.old_text.replace("\r\n", "\n");
@@ -173,8 +190,21 @@ impl Tool for EditTool {
                 .chain(content.match_indices('\n').map(|(i, _)| i + 1))
                 .collect();
 
-            let mut match_info = Vec::new();
-            for &byte_idx in &match_positions {
+            // Cap the per-match preview list so a pattern matching
+            // thousands of lines doesn't return a thousand-line error
+            // blob to the LLM — which would blow the agent's context
+            // and crowd out the actual narrative. Show the first
+            // MAX_AMBIGUOUS_MATCHES, then a single "...and N more"
+            // line. 20 is enough to disambiguate any realistic case
+            // (functions named identically, repeated string lits) while
+            // keeping the error under a few KB.
+            const MAX_AMBIGUOUS_MATCHES: usize = 20;
+            let total_matches = match_positions.len();
+            let preview_positions: &[usize] =
+                &match_positions[..total_matches.min(MAX_AMBIGUOUS_MATCHES)];
+
+            let mut match_info = Vec::with_capacity(preview_positions.len() + 1);
+            for &byte_idx in preview_positions {
                 let line_num = match line_starts.binary_search(&byte_idx) {
                     Ok(i) => i + 1,
                     Err(i) => i,
@@ -188,10 +218,18 @@ impl Tool for EditTool {
                 let truncated: String = line_text.chars().take(100).collect();
                 match_info.push(format!("  Line {}: {}", line_num, truncated));
             }
+            if total_matches > MAX_AMBIGUOUS_MATCHES {
+                let remaining = total_matches - MAX_AMBIGUOUS_MATCHES;
+                match_info.push(format!(
+                    "  ... and {} more match{}",
+                    remaining,
+                    if remaining == 1 { "" } else { "es" },
+                ));
+            }
 
             return Err(ToolError::Msg(format!(
                 "old_text matched {} times in {}:\n{}\n\nUse replace_all: true to replace all occurrences, or provide more surrounding context in old_text to narrow the match.",
-                match_positions.len(),
+                total_matches,
                 args.path,
                 match_info.join("\n"),
             )));
@@ -212,8 +250,8 @@ impl Tool for EditTool {
 
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
-        tokio::fs::write(&args.path, &output).await?;
-        crate::agent::tools::modified::mark_modified(std::path::Path::new(&args.path));
+        tokio::fs::write(&resolved_path, &output).await?;
+        crate::agent::tools::modified::mark_modified(std::path::Path::new(&resolved_path));
         // File mutated → invalidate cached reads/greps/listings for this turn.
         if let Some(ref cache) = self.cache {
             cache.clear();
@@ -264,7 +302,7 @@ impl Tool for EditTool {
 
         #[cfg(feature = "lsp")]
         {
-            let path = std::path::Path::new(&args.path);
+            let path = std::path::Path::new(&resolved_path);
             result.push_str(
                 &crate::agent::tools::write::append_lsp_block(
                     self.lsp_manager.as_ref(),

@@ -112,6 +112,12 @@ pub struct GrepArgs {
     pub path: Option<String>,
     pub include: Option<String>,
     pub context_lines: Option<usize>,
+    /// Include dotfiles / hidden files in the search. Default
+    /// `false` — F2 carryover from find_files/glob/list_dir: grep
+    /// also walks the filesystem and should not silently surface
+    /// `.env`, `.git/` internals, etc. by default.
+    #[serde(default)]
+    pub include_hidden: bool,
 }
 
 #[derive(Deserialize)]
@@ -218,6 +224,50 @@ pub async fn check_perm_path(
                 ));
             };
             handle_ask_inner(tx, perm, tool, path).await
+        }
+    }
+}
+
+/// Same as `check_perm_path` but additionally returns the canonical
+/// path the check resolved to (symlinks followed, `..` normalized).
+/// Tools that perform a follow-up file operation (read/edit/write/
+/// apply_patch) should pass this canonical path to the file API
+/// instead of re-using the original `args.path`. Without this, the
+/// OS dereferences the symlink a SECOND time at open, and a swap
+/// between check-time and open-time lands the operation on a
+/// different file than the one the user authorized (audit H12).
+pub async fn check_perm_path_resolve(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    path: &str,
+) -> Result<String, ToolError> {
+    let Some(perm) = permission else {
+        // No permission checker (e.g. ACP path) — pass the path
+        // through unchanged. We still want callers to operate on
+        // SOME resolved form, but without a checker we can't pin
+        // an authoritative canonical path.
+        return Ok(path.to_string());
+    };
+    let (result, resolved) = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        let resolved = guard.resolve_path_for_tool(path);
+        let r = guard.check_path(tool, path);
+        (r, resolved)
+    };
+    match result {
+        CheckResult::Allowed => Ok(resolved),
+        CheckResult::Denied(reason) => {
+            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
+        }
+        CheckResult::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(
+                    "Permission denied (non-interactive mode)".to_string(),
+                ));
+            };
+            handle_ask_inner(tx, perm, tool, path).await?;
+            Ok(resolved)
         }
     }
 }

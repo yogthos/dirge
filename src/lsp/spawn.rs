@@ -104,6 +104,56 @@ impl ProcessSpawner {
                 init_options: Value::Null,
             },
         );
+        // Audit M5 additions. Defaults assume the canonical binary on
+        // PATH; users override via config `lsp.servers.<id>.command`.
+        m.insert(
+            "gopls".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("gopls"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
+        m.insert(
+            "jdtls".to_string(),
+            ProcessCommand {
+                // jdtls' launch script wraps a complex java invocation;
+                // most distros ship a `jdtls` wrapper. Users with the
+                // raw `eclipse.jdt.ls` jar must override via config.
+                program: PathBuf::from("jdtls"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
+        m.insert(
+            "clangd".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("clangd"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
+        m.insert(
+            "ruby-lsp".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("ruby-lsp"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
+        m.insert(
+            "bash-language-server".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("bash-language-server"),
+                args: vec!["start".to_string()],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
         m
     }
 }

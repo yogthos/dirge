@@ -76,6 +76,18 @@ impl Tool for TaskTool {
         let background = args.background.unwrap_or(false);
 
         if background {
+            // Audit M2: refuse new background spawns past the
+            // concurrency cap. The agent gets a clear refusal it
+            // can act on (wait for an existing task to finish, then
+            // retry) rather than fanning out unbounded.
+            let running = self.bg_store.running_count();
+            let cap = BackgroundStore::max_concurrent();
+            if running >= cap {
+                return Err(ToolError::Msg(format!(
+                    "background subagent cap reached ({}/{} in flight). Wait for one to finish (use task_status) or run inline (background=false). Capping prevents fan-out from burning the API budget.",
+                    running, cap,
+                )));
+            }
             let task_id = Uuid::new_v4().to_string();
             self.bg_store.insert(task_id.clone());
             self.bg_store.notify_started(&task_id);
@@ -85,21 +97,38 @@ impl Tool for TaskTool {
             let store = self.bg_store.clone();
             let tid = task_id.clone();
 
-            tokio::spawn(async move {
-                let result = model
-                    .btw_query(format!(
-                        "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
-                        prompt
-                    ))
-                    .await;
-                store.notify(
-                    &tid,
-                    match result {
-                        Ok(text) => TaskState::Completed(text),
-                        Err(e) => TaskState::Failed(e.to_string()),
-                    },
-                );
+            // Cap the background subagent at 10 minutes. Without a
+            // timeout, a stuck subagent (provider hang, runaway
+            // multi-turn) would keep the task in `Running` state
+            // forever, hold its model/network handle open, and
+            // never deliver a system-reminder to the next turn.
+            // 10 min matches the rough upper bound for a coherent
+            // single-prompt LLM task; anything longer is the
+            // subagent loop misbehaving.
+            const SUBAGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+            let store_for_task = store.clone();
+            let tid_for_task = tid.clone();
+            let handle = tokio::spawn(async move {
+                let fut = model.btw_query(format!(
+                    "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
+                    prompt
+                ));
+                let result = tokio::time::timeout(SUBAGENT_TIMEOUT, fut).await;
+                let state = match result {
+                    Ok(Ok(text)) => TaskState::Completed(text),
+                    Ok(Err(e)) => TaskState::Failed(e.to_string()),
+                    Err(_) => TaskState::Failed(format!(
+                        "subagent timed out after {}s",
+                        SUBAGENT_TIMEOUT.as_secs(),
+                    )),
+                };
+                store_for_task.notify(&tid_for_task, state);
             });
+            // Register the handle so `BackgroundStore::cancel_all` (called
+            // on session swap) can abort the subagent and free its
+            // provider connection. Without this the task survived the
+            // parent's session change and kept consuming API budget.
+            store.attach_handle(&tid, handle);
 
             Ok(format!(
                 "background task started — task_id: {}\n\nThe subagent runs in the background. Completion will be delivered automatically as a <system-reminder> at the start of your next turn. Do NOT poll task_status or sleep waiting — continue with other work.",

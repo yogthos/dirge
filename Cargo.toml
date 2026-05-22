@@ -25,6 +25,13 @@ semantic = ["dep:tree-sitter", "dep:streaming-iterator"]
 semantic-ts = ["semantic", "dep:tree-sitter-typescript"]
 semantic-python = ["semantic", "dep:tree-sitter-python"]
 semantic-bash = ["semantic", "dep:tree-sitter-bash"]
+semantic-clojure = ["semantic", "dep:tree-sitter-clojure"]
+semantic-go = ["semantic", "dep:tree-sitter-go"]
+semantic-ruby = ["semantic", "dep:tree-sitter-ruby"]
+semantic-rust = ["semantic", "dep:tree-sitter-rust"]
+semantic-java = ["semantic", "dep:tree-sitter-java"]
+semantic-c = ["semantic", "dep:tree-sitter-c"]
+semantic-cpp = ["semantic", "dep:tree-sitter-cpp"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 
@@ -67,12 +74,17 @@ pulldown-cmark = "0.13"
 include_dir = "0.7"
 http = "1"
 agent-client-protocol = { version = "0.12.0", optional = true }
-tree-sitter = { version = "0.24", optional = true }
+tree-sitter = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
-tree-sitter-python = { version = "0.23", optional = true }
-tree-sitter-bash = { version = "0.23", optional = true }
-image = "0.25"
-base64 = "0.22"
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-bash = { version = "0.25", optional = true }
+tree-sitter-clojure = { version = "0.1", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
 streaming-iterator = { version = "0.1", optional = true }
 janetrs = { version = "0.8", optional = true }
 html2text = "0.17"

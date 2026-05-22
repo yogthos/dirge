@@ -194,10 +194,11 @@ fn resolve_api_key(
     cli_key: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(key) = cli_key.filter(|k| !k.is_empty()) {
-        tracing::warn!(
-            "API key provided via --api-key is visible in process listings (/proc/*/cmdline). Use the {} environment variable instead.",
-            provider_env_var(kind)
-        );
+        // Audit C2: the `/proc/*/cmdline` warning now fires at the
+        // call site in main.rs where we know which CLI source the
+        // key came from. File-sourced and stdin-sourced keys end up
+        // here too but those paths don't appear in argv, so no
+        // warning is wanted.
         return Ok(key.to_string());
     }
 
@@ -293,39 +294,74 @@ async fn summarize_with_model(model: AnyModel, prompt: String) -> anyhow::Result
 
 async fn run_summarizer<M>(model: M, prompt: String) -> anyhow::Result<String>
 where
-    M: CompletionModel + 'static,
+    M: CompletionModel + Clone + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
-    let agent = rig::agent::AgentBuilder::new(model)
-        .preamble("You are a conversation summarizer.")
-        .build();
+    // Retry loop. The summarizer is invoked by `/compress`, often
+    // exactly when the user's context is about to overflow — a single
+    // transient 503 or rate-limit would otherwise permanently fail
+    // the compaction. Use the same `RecoveryPolicy` shape as the main
+    // agent so the user sees consistent retry semantics. No partial
+    // output is streamed to the UI for the summarizer, so retry is
+    // safe and the response is replaced wholesale on each attempt.
+    use crate::agent::recovery::{self, RecoveryPolicy};
+    let policy = RecoveryPolicy::default();
+    let mut attempts: usize = 0;
+    loop {
+        let agent = rig::agent::AgentBuilder::new(model.clone())
+            .preamble("You are a conversation summarizer.")
+            .build();
 
-    let mut stream = agent
-        .stream_chat(prompt, Vec::<Message>::new())
-        .multi_turn(1)
-        .await;
+        let mut stream = agent
+            .stream_chat(prompt.clone(), Vec::<Message>::new())
+            .multi_turn(1)
+            .await;
 
-    let mut response = String::new();
-    use futures::StreamExt;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                rig::streaming::StreamedAssistantContent::Text(text),
-            )) => response.push_str(&text.text),
-            Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
-                response = res.response().to_string();
-                break;
+        let mut response = String::new();
+        let mut error: Option<String> = None;
+        use futures::StreamExt;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
+                    rig::streaming::StreamedAssistantContent::Text(text),
+                )) => response.push_str(&text.text),
+                Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
+                    response = res.response().to_string();
+                    break;
+                }
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+                _ => {}
             }
-            Err(e) => return Err(anyhow::anyhow!("Compression failed: {}", e)),
-            _ => {}
         }
-    }
 
-    if response.is_empty() {
-        anyhow::bail!("Compression returned empty response");
-    }
+        if let Some(msg) = error {
+            let kind = recovery::classify_error(&msg);
+            if policy.should_retry(attempts, kind) {
+                let delay = policy.backoff_duration_for_msg(attempts, &msg);
+                tracing::info!(
+                    "summarizer retry {}/{} after {:?} ({:?}): {}",
+                    attempts + 1,
+                    policy.max_retries(),
+                    delay,
+                    kind,
+                    msg
+                );
+                tokio::time::sleep(delay).await;
+                attempts += 1;
+                continue;
+            }
+            return Err(anyhow::anyhow!("Compression failed: {}", msg));
+        }
 
-    Ok(response)
+        if response.is_empty() {
+            anyhow::bail!("Compression returned empty response");
+        }
+
+        return Ok(response);
+    }
 }
 
 fn serialize_conversation(messages: &[SessionMessage]) -> String {

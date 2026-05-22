@@ -23,7 +23,7 @@
 //! On `Drop`, every spawned client's `_guard` drops (which kills the child
 //! process via `kill_on_drop(true)` on the real spawner).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -89,16 +89,79 @@ pub struct ClientEntry {
     guard: Box<dyn std::any::Any + Send + Sync>,
 }
 
+/// Tracks a server that's failed (spawn refusal or runtime crash)
+/// and how aggressively we should back off before retrying. Without
+/// this state, an LSP that crashed once stayed marked-broken for
+/// the entire dirge session — the agent kept editing without
+/// diagnostics. Exponential backoff with a cap caps the
+/// thrash if a server is genuinely uninstallable while still
+/// recovering automatically from transient crashes.
+#[derive(Debug)]
+struct BrokenState {
+    last_failure: std::time::Instant,
+    attempts: u32,
+}
+
+impl BrokenState {
+    /// Backoff window for the current attempt count.
+    /// 1st failure → 1s, 2nd → 2s, 3rd → 4s … capped at 10 min.
+    /// Reads "have we waited long enough to retry yet?"
+    ///
+    /// Audit C4: was 10s initial which felt sluggish for transient
+    /// crashes (LSP server segfault on a malformed parse, OOM
+    /// while loading a fresh worktree) — the user expected
+    /// diagnostics back within seconds, not tens of seconds. 1s
+    /// initial recovers fast; if the server is genuinely broken
+    /// (uninstalled binary, persistent config error) the
+    /// exponential growth still hits the 10-min cap within ~10
+    /// failures and stops thrashing.
+    fn backoff(&self) -> std::time::Duration {
+        let exp = self.attempts.saturating_sub(1).min(10);
+        std::time::Duration::from_secs(1u64 << exp).min(std::time::Duration::from_secs(600))
+    }
+
+    /// True while we're still inside the backoff window.
+    fn still_cooling(&self) -> bool {
+        self.last_failure.elapsed() < self.backoff()
+    }
+}
+
 #[derive(Default)]
 struct ManagerState {
     clients: HashMap<(PathBuf, String), Arc<ClientEntry>>,
-    /// (root, server_id) pairs we've given up on. Avoids hammering a broken
-    /// server every time the agent touches a file.
-    broken: HashSet<(PathBuf, String)>,
+    /// (root, server_id) pairs that have failed. Each entry tracks
+    /// the last failure timestamp + attempt count so we back off
+    /// exponentially on repeat failures and clear the entry once
+    /// a fresh spawn or request succeeds. Previously a std::collections::HashSet
+    /// with no expiration; once a server failed, it was dead for
+    /// the rest of the session.
+    broken: HashMap<(PathBuf, String), BrokenState>,
     /// In-flight spawns. The `Notify` is shared with every caller waiting
     /// on the same (root, server_id) so we never spawn two of the same
     /// server in parallel.
     spawning: HashMap<(PathBuf, String), Arc<Notify>>,
+}
+
+impl ManagerState {
+    /// True if the (root, server_id) is broken AND still inside its
+    /// backoff window. Entries past their backoff fall through and
+    /// are treated as eligible for retry; the caller is responsible
+    /// for calling `mark_broken` again if the retry also fails.
+    fn is_broken_now(&self, key: &(PathBuf, String)) -> bool {
+        self.broken.get(key).is_some_and(|s| s.still_cooling())
+    }
+
+    /// Record a failure. Increments the attempt count if the entry
+    /// already exists (so backoff escalates), or seeds a fresh
+    /// entry on first failure.
+    fn mark_broken(&mut self, key: &(PathBuf, String)) {
+        let entry = self.broken.entry(key.clone()).or_insert(BrokenState {
+            last_failure: std::time::Instant::now(),
+            attempts: 0,
+        });
+        entry.last_failure = std::time::Instant::now();
+        entry.attempts = entry.attempts.saturating_add(1);
+    }
 }
 
 /// One manager per agent session. Cheap to clone.
@@ -114,11 +177,23 @@ pub struct LspManager {
 
 impl LspManager {
     pub fn new(spawner: Arc<dyn Spawner>, worktree: impl Into<PathBuf>) -> Self {
+        Self::with_servers(spawner, worktree, server::builtin_servers())
+    }
+
+    /// Construct an `LspManager` with an explicit server set —
+    /// the host calls this when the user has per-server config
+    /// overrides (extensions, disabled, etc.). The default `new`
+    /// just delegates here with the unmodified builtin list.
+    pub fn with_servers(
+        spawner: Arc<dyn Spawner>,
+        worktree: impl Into<PathBuf>,
+        servers: Vec<ServerInfo>,
+    ) -> Self {
         Self {
             spawner,
             worktree: worktree.into(),
             state: Arc::new(Mutex::new(ManagerState::default())),
-            servers: Arc::new(server::builtin_servers()),
+            servers: Arc::new(servers),
         }
     }
 
@@ -151,7 +226,12 @@ impl LspManager {
             // Fast-path cache check.
             {
                 let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if state.broken.contains(&key) {
+                // Broken servers stay skipped only while inside
+                // their backoff window. Once the window elapses we
+                // fall through to spawn fresh — `mark_broken`
+                // already evicted the dead `clients` entry, so the
+                // clients-get below misses and we spawn.
+                if state.is_broken_now(&key) {
                     continue;
                 }
                 if let Some(entry) = state.clients.get(&key) {
@@ -187,7 +267,7 @@ impl LspManager {
             if let Some(entry) = state.clients.get(key) {
                 return Some(Arc::clone(entry));
             }
-            if state.broken.contains(key) {
+            if state.is_broken_now(key) {
                 return None;
             }
             if let Some(notify) = state.spawning.get(key) {
@@ -227,6 +307,11 @@ impl LspManager {
                 Ok(entry) => {
                     let arc = Arc::new(entry);
                     state.clients.insert(key.clone(), Arc::clone(&arc));
+                    // Clear any prior failure record — a successful
+                    // respawn means the user fixed whatever was
+                    // wrong (server installed, path repaired). The
+                    // attempt counter should not survive recovery.
+                    state.broken.remove(key);
                     SpawnOutcome::Inserted {
                         arc,
                         notify,
@@ -234,7 +319,7 @@ impl LspManager {
                     }
                 }
                 Err(e) => {
-                    state.broken.insert(key.clone());
+                    state.mark_broken(key);
                     SpawnOutcome::Failed {
                         err: e,
                         notify,
@@ -363,11 +448,37 @@ impl LspManager {
     /// healthy ones.
     pub fn broken_servers(&self) -> Vec<(String, PathBuf)> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Only surface entries that are STILL inside their backoff
+        // window. Entries past their backoff are conceptually
+        // "eligible to retry" — the panel would mislead the user
+        // by showing them as broken when the next file touch will
+        // re-spawn.
         state
             .broken
             .iter()
-            .map(|(root, id)| (id.clone(), root.clone()))
+            .filter(|(_, s)| s.still_cooling())
+            .map(|((root, id), _)| (id.clone(), root.clone()))
             .collect()
+    }
+
+    /// Fan-out `textDocument/didClose` across every attached
+    /// client for every file each one has open. Called once at
+    /// session shutdown so LSP servers can release per-file
+    /// state — without this, a long session that touches dozens
+    /// of files leaks server-side parse trees / diagnostic caches
+    /// for the lifetime of the server process.
+    ///
+    /// Best-effort: a server that's already gone won't be
+    /// re-contacted, and individual `notify_close` failures are
+    /// swallowed inside the client.
+    pub async fn close_all_files(&self) {
+        let entries: Vec<_> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.clients.values().cloned().collect()
+        };
+        for entry in entries {
+            entry.client.close_all().await;
+        }
     }
 
     /// Aggregated diagnostics across all attached clients. Same key/dedupe
@@ -543,7 +654,43 @@ impl LspManager {
             {
                 Ok(v) => out.push(v),
                 Err(e) => {
-                    tracing::debug!(server = %entry.server_id, method = %method, "request failed: {e}");
+                    // Distinguish transport-level death (server
+                    // crashed) from LSP-level errors (e.g. unknown
+                    // symbol). Only the former should evict the
+                    // client + flag as broken; the latter just
+                    // means this specific request failed but the
+                    // server's still alive and we should keep
+                    // talking to it.
+                    let is_dead = matches!(
+                        e,
+                        crate::lsp::rpc::RpcError::ConnectionClosed
+                            | crate::lsp::rpc::RpcError::Io(_)
+                    );
+                    if is_dead {
+                        let key = (entry.root.clone(), entry.server_id.clone());
+                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        // Only evict if the still-cached entry is
+                        // the same instance — concurrent calls
+                        // might have already replaced it with a
+                        // fresh spawn.
+                        if let Some(cached) = state.clients.get(&key)
+                            && Arc::ptr_eq(cached, &entry)
+                        {
+                            state.clients.remove(&key);
+                        }
+                        state.mark_broken(&key);
+                        tracing::warn!(
+                            server = %entry.server_id,
+                            method = %method,
+                            "LSP server died ({e}); will retry after backoff",
+                        );
+                    } else {
+                        tracing::debug!(
+                            server = %entry.server_id,
+                            method = %method,
+                            "request failed: {e}",
+                        );
+                    }
                 }
             }
         }
@@ -594,7 +741,7 @@ mod tests {
     /// Fixture: spawn counter + the actual mock from `spawn::tests`.
     struct CountingSpawner {
         spawn_calls: StdArc<AtomicUsize>,
-        fail_keys: std::sync::Mutex<HashSet<(String, PathBuf)>>,
+        fail_keys: std::sync::Mutex<std::collections::HashSet<(String, PathBuf)>>,
         /// Delay each spawn by this much so concurrent calls have a chance
         /// to collide on the dedupe path.
         delay_ms: u64,
@@ -604,7 +751,7 @@ mod tests {
         fn new(delay_ms: u64) -> Self {
             Self {
                 spawn_calls: StdArc::new(AtomicUsize::new(0)),
-                fail_keys: std::sync::Mutex::new(HashSet::new()),
+                fail_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
                 delay_ms,
             }
         }
@@ -616,6 +763,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert((server_id.to_string(), root.to_path_buf()));
+        }
+        fn clear_failures(&self) {
+            self.fail_keys.lock().unwrap().clear();
         }
     }
 
@@ -786,6 +936,97 @@ mod tests {
         let second = manager.get_clients(&file).await;
         assert!(second.is_empty());
         assert_eq!(spawner.count(), 1, "must not retry broken servers");
+
+        std::fs::remove_dir_all(&tree).ok();
+    }
+
+    /// A failed spawn STILL blocks retries within the backoff
+    /// window — but after the backoff elapses, a subsequent call
+    /// retries. Pin this by directly poking the `last_failure`
+    /// timestamp backwards so the test doesn't need to sleep.
+    #[tokio::test]
+    async fn failed_spawn_retries_after_backoff_elapses() {
+        let tree = cargo_tree("broken-retry");
+        let spawner = StdArc::new(CountingSpawner::new(0));
+        let root_canon = tree.canonicalize().unwrap();
+        spawner.fail_for("rust", &root_canon);
+        let manager = LspManager::new(spawner.clone(), tree.clone());
+        let file = tree.join("src/lib.rs");
+
+        // First failure marks broken with a 10s backoff.
+        let _ = manager.get_clients(&file).await;
+        assert_eq!(spawner.count(), 1);
+
+        // Manually expire the backoff window — pretend last failure
+        // was 30s ago so the 10s backoff has elapsed.
+        {
+            let mut state = manager.state.lock().unwrap();
+            let key = (root_canon.clone(), "rust".to_string());
+            if let Some(s) = state.broken.get_mut(&key) {
+                s.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(30))
+                    .expect("clock supports 30s backwards");
+            }
+        }
+
+        // Second call (still failing) should retry now.
+        let _ = manager.get_clients(&file).await;
+        assert_eq!(
+            spawner.count(),
+            2,
+            "backoff expired — should attempt respawn",
+        );
+        // Attempt count should now be 2, so backoff doubles to 2s
+        // (audit C4 retuned initial from 10s → 1s; 2nd attempt = 2s).
+        {
+            let state = manager.state.lock().unwrap();
+            let key = (root_canon, "rust".to_string());
+            let entry = state.broken.get(&key).expect("still broken");
+            assert_eq!(entry.attempts, 2, "attempts must escalate");
+            assert_eq!(
+                entry.backoff(),
+                std::time::Duration::from_secs(2),
+                "backoff escalates exponentially",
+            );
+        }
+
+        std::fs::remove_dir_all(&tree).ok();
+    }
+
+    /// Successful respawn clears the broken record so the next
+    /// failure starts fresh at attempt=1 (not continuing escalation).
+    #[tokio::test]
+    async fn successful_respawn_clears_broken_record() {
+        let tree = cargo_tree("broken-recover");
+        let spawner = StdArc::new(CountingSpawner::new(0));
+        let root_canon = tree.canonicalize().unwrap();
+        spawner.fail_for("rust", &root_canon);
+        let manager = LspManager::new(spawner.clone(), tree.clone());
+        let file = tree.join("src/lib.rs");
+
+        // Fail once.
+        let _ = manager.get_clients(&file).await;
+
+        // Stop forcing failures, manually expire backoff, retry.
+        spawner.clear_failures();
+        {
+            let mut state = manager.state.lock().unwrap();
+            let key = (root_canon.clone(), "rust".to_string());
+            if let Some(s) = state.broken.get_mut(&key) {
+                s.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(30))
+                    .expect("clock supports 30s backwards");
+            }
+        }
+        let _ = manager.get_clients(&file).await;
+
+        // Broken record must be cleared after success.
+        let state = manager.state.lock().unwrap();
+        let key = (root_canon, "rust".to_string());
+        assert!(
+            !state.broken.contains_key(&key),
+            "successful respawn must clear broken record",
+        );
 
         std::fs::remove_dir_all(&tree).ok();
     }

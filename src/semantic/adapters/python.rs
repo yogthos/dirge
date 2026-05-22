@@ -4,22 +4,17 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query};
 
 use crate::semantic::adapter::LanguageAdapter;
-use crate::semantic::types::{ByteRange, ExtractedFile, Import, Symbol, SymbolKind};
+use crate::semantic::common::{find_node_at_range, node_text};
+use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbol, SymbolKind};
 
 pub struct PythonAdapter;
 
 impl PythonAdapter {
-    fn node_text<'a>(&self, node: Node<'a>, source: &'a [u8]) -> &'a str {
-        node.utf8_text(source).unwrap_or("")
+    fn node_text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
+        node_text(n, s)
     }
-
-    fn make_range(&self, node: Node) -> ByteRange {
-        ByteRange {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            start_line: node.start_position().row + 1,
-            end_line: node.end_position().row + 1,
-        }
+    fn make_range(&self, n: Node) -> ByteRange {
+        ByteRange::from(n)
     }
 
     fn signature_from_node(&self, node: Node, source: &[u8]) -> String {
@@ -43,13 +38,14 @@ impl PythonAdapter {
                         self.push_method(child, source, symbols, class_name);
                     }
                     "decorated_definition" => {
-                        if let Some(inner) = child.child_by_field_name("definition")
-                            && inner.kind() == "function_definition" {
+                        if let Some(inner) = child.child_by_field_name("definition") {
+                            if inner.kind() == "function_definition" {
                                 let range = self.make_range(child);
                                 self.push_method_with_range(
                                     inner, range, source, symbols, class_name,
                                 );
                             }
+                        }
                     }
                     _ => {}
                 }
@@ -117,17 +113,20 @@ impl PythonAdapter {
                             }
                         }
                     }
-                    if names.is_empty()
-                        && let Some(name_node) = child.child_by_field_name("name") {
+                    if names.is_empty() {
+                        if let Some(name_node) = child.child_by_field_name("name") {
                             names.push(self.node_text(name_node, source).to_string());
                         }
-                    if module.is_empty()
-                        && let Some(name_node) = child.child_by_field_name("name") {
+                    }
+                    if module.is_empty() {
+                        if let Some(name_node) = child.child_by_field_name("name") {
                             module = self.node_text(name_node, source).to_string();
                         }
+                    }
                     imports.push(Import {
                         names,
                         source: module,
+                        kind: ImportKind::Module,
                     });
                 }
                 "import_from_statement" => {
@@ -152,6 +151,7 @@ impl PythonAdapter {
                     imports.push(Import {
                         names,
                         source: module,
+                        kind: ImportKind::Module,
                     });
                 }
                 "function_definition" | "decorated_definition" => {
@@ -160,10 +160,17 @@ impl PythonAdapter {
                     } else {
                         Some(child)
                     };
-                    if let Some(node) = func_node
-                        && let Some(name_node) = node.child_by_field_name("name") {
+                    if let Some(node) = func_node {
+                        if let Some(name_node) = node.child_by_field_name("name") {
                             let name = self.node_text(name_node, source).to_string();
-                            let is_exported = !name.starts_with('_');
+                            // Dunder methods (`__init__`, `__call__`, `__repr__`, …)
+                            // are part of Python's public protocol; they look
+                            // "private" by the leading-underscore heuristic but
+                            // are externally callable. Treat them as exported.
+                            // Single-underscore names (`_helper`, `_internal`)
+                            // stay non-exported.
+                            let is_dunder = name.starts_with("__") && name.ends_with("__");
+                            let is_exported = is_dunder || !name.starts_with('_');
                             let range = self.make_range(child);
                             let signature = self.signature_from_node(node, source);
                             symbols.push(Symbol {
@@ -175,6 +182,7 @@ impl PythonAdapter {
                                 parent_class: None,
                             });
                         }
+                    }
                 }
                 "class_definition" => {
                     if let Some(name_node) = child.child_by_field_name("name") {
@@ -198,20 +206,6 @@ impl PythonAdapter {
                 _ => {}
             }
         }
-    }
-
-    fn find_node_at_range<'a>(&self, node: Node<'a>, start: usize, end: usize) -> Option<Node<'a>> {
-        if node.start_byte() == start && node.end_byte() == end {
-            return Some(node);
-        }
-        for i in 0..node.named_child_count() {
-            if let Some(child) = node.named_child(i)
-                && child.start_byte() <= start && child.end_byte() >= end
-                    && let Some(found) = self.find_node_at_range(child, start, end) {
-                        return Some(found);
-                    }
-        }
-        None
     }
 }
 
@@ -243,6 +237,15 @@ impl LanguageAdapter for PythonAdapter {
 
         self.walk_top_level(root, source_bytes, &mut symbols, &mut imports, &mut exports);
 
+        if exports.is_empty() {
+            exports.extend(
+                symbols
+                    .iter()
+                    .filter(|s| s.is_exported)
+                    .map(|s| s.name.clone()),
+            );
+        }
+
         Ok(ExtractedFile {
             file_path: file_path.to_path_buf(),
             symbols,
@@ -250,6 +253,7 @@ impl LanguageAdapter for PythonAdapter {
             exports,
             warnings,
             mtime: std::time::SystemTime::now(),
+            size: 0,
         })
     }
 
@@ -270,8 +274,7 @@ impl LanguageAdapter for PythonAdapter {
         let root = tree.root_node();
         let source_bytes = source.as_bytes();
 
-        let target = self
-            .find_node_at_range(root, range.start_byte, range.end_byte)
+        let target = find_node_at_range(root, range.start_byte, range.end_byte)
             .ok_or("Could not find node at given range")?;
 
         let query_str = "(call function: (identifier) @callee)";

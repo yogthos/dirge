@@ -43,6 +43,16 @@ pub struct LspServerConfig {
     pub disabled: Option<bool>,
 }
 
+#[cfg(feature = "lsp")]
+impl crate::lsp::server::AsExtensionOverride for LspServerConfig {
+    fn extensions(&self) -> Option<&[String]> {
+        self.extensions.as_deref()
+    }
+    fn disabled(&self) -> bool {
+        self.disabled.unwrap_or(false)
+    }
+}
+
 /// `lsp = true`  → enable built-in servers with default commands.
 /// `lsp = false` → disable LSP entirely.
 /// `lsp = { server-id = { … } }` → enable defaults, overriding the named
@@ -104,9 +114,18 @@ pub struct Config {
     pub show_edit_diff: Option<bool>,
     pub tool_result_max_chars: Option<usize>,
     pub default_prompt: Option<String>,
-    /// UI color theme. Known values: `phosphor` (default, 80s CRT
-    /// green) and `plain` (the pre-theme white/cyan look). Unknown
-    /// values fall back to `phosphor` with a warning.
+    /// UI color theme. Known built-in values: `phosphor` (default,
+    /// 80s CRT green) and `plain` (white/cyan).
+    ///
+    /// Any other value looks for a custom theme file at
+    /// `~/.config/dirge/<theme>.theme.json` — see the
+    /// `ui::theme` module for the JSON format. Fields not in the
+    /// file inherit from the phosphor preset so minimal overrides
+    /// work (e.g. just `{"accent": "magenta"}`).
+    ///
+    /// If neither the built-in name nor the file matches, dirge
+    /// falls back to phosphor with a warning rather than refusing
+    /// to start.
     pub theme: Option<String>,
     pub tools: Option<ToolsConfig>,
     #[cfg(feature = "lsp")]
@@ -114,12 +133,12 @@ pub struct Config {
     #[cfg(feature = "mcp")]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
+    /// ACP server config map when compiled with the `acp` feature.
+    /// Used by the editor-integration server; dirge's ACP transport
+    /// is stdio-only — the TCP / Unix-socket forms live here for
+    /// future expansion but are not honored today.
     #[cfg(feature = "acp")]
     pub acp_servers: Option<HashMap<String, AcpServerConfig>>,
-    #[cfg(feature = "acp")]
-    pub acp_host: Option<String>,
-    #[cfg(feature = "acp")]
-    pub acp_port: Option<u16>,
 }
 
 impl Config {

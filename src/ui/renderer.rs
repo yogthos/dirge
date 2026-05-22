@@ -169,12 +169,24 @@ impl Renderer {
         crossterm::terminal::size().unwrap_or((80, 24))
     }
 
+    /// Width chat text wraps to before pushing into the buffer. Uses
+    /// the *capped* `content_width()` (120 cols max) so wide terminals
+    /// don't grow scrollback past the centered band into the
+    /// divider/panel margin. Previously aliased `line_width()` which
+    /// returns the raw band width and ignored the 120-col cap —
+    /// chat overflowed the documented content area on wide terminals.
     fn max_line_width(&self) -> usize {
-        self.content_cols().saturating_sub(1) as usize
+        self.content_width()
     }
 
+    /// Raw width of the chat band (terminal minus panel reserve,
+    /// minus 1 col for the rightmost gutter). Used for *positioning*
+    /// math (`content_indent`, panel divider layout) where the actual
+    /// available column count matters; chat text wrapping should go
+    /// through `max_line_width` / `content_width` instead so it
+    /// honors the 120-col cap.
     pub fn line_width(&self) -> usize {
-        self.max_line_width()
+        self.content_cols().saturating_sub(1) as usize
     }
 
     /// Target width for chat content. Caps at 120 cols so wide
@@ -370,6 +382,44 @@ impl Renderer {
     /// indices) is unaffected.
     fn push_buffer_line(&mut self, entry: LineEntry) {
         self.buffer.push(entry);
+        // Audit M10: scrollback was unbounded. A long session with
+        // verbose tool output (large `grep`, repeated test runs,
+        // streaming logs) could grow `buffer` until it OOM'd the
+        // process. Cap at MAX_SCROLLBACK lines; when exceeded, drop
+        // the oldest in a single drain (cheap relative to the
+        // per-line push cost, and only fires once per overflow
+        // batch). Drain in chunks of MAX/8 so we don't shift on
+        // every push once at-cap. Selection indices use absolute
+        // line positions; adjust selection_start / selection_end /
+        // scroll_offset by the eviction count so the user's
+        // visible state remains anchored to the same content.
+        const MAX_SCROLLBACK: usize = 20_000;
+        const DRAIN_CHUNK: usize = MAX_SCROLLBACK / 8;
+        if self.buffer.len() > MAX_SCROLLBACK {
+            let drop_n = DRAIN_CHUNK;
+            self.buffer.drain(..drop_n);
+            // Adjust absolute line indices used by selection +
+            // scrolling. `lines` field tracks the same counter
+            // used by selection_indices_stay_absolute_under_streaming_appends
+            // — leave it as a count rather than rebasing, but DO
+            // rebase selection so it points at the same surviving
+            // content.
+            let shift = drop_n;
+            if let Some(s) = self.selection_start.as_mut() {
+                s.0 = s.0.saturating_sub(shift);
+            }
+            if let Some(e) = self.selection_end.as_mut() {
+                e.0 = e.0.saturating_sub(shift);
+            }
+            // scroll_offset is measured from the BOTTOM, so eviction
+            // from the front doesn't change it. But if the user was
+            // scrolled into the now-evicted region, clamp.
+            let visible = self.visible_lines();
+            let max_offset = self.buffer.len().saturating_sub(visible);
+            if self.scroll_offset > max_offset {
+                self.scroll_offset = max_offset;
+            }
+        }
         if self.scroll_offset > 0 {
             let visible = self.visible_lines();
             let max_offset = self.buffer.len().saturating_sub(visible);
@@ -845,11 +895,19 @@ impl Renderer {
         let cursor_line_idx = full_input[..cursor_line_start].matches('\n').count();
         let cursor_col_in_line = full_cursor - cursor_line_start;
 
-        // Wrap width: content width minus the 3-char prompt prefix
+        // Wrap width: chat-content width minus the 3-char prompt prefix
         // (`▌▌ ` idle, `░▌ `/`▒▌ ` spinner, `▏  ` continuation — all 3
-        // columns) that sits in front of every visible row. Min 1 to
-        // avoid div-by-zero in wrap math on ridiculous terminal sizes.
-        let wrap_width = (cols.saturating_sub(3) as usize).max(1);
+        // columns) that sits in front of every visible row.
+        //
+        // Must use `content_width()` (the capped, centered band the chat
+        // uses) and NOT raw `cols`. On wide terminals where content is
+        // capped at 120 cols, `bottom_indent` is non-zero — wrapping at
+        // `cols - 3` would let input text spill past the centered band's
+        // right edge into the divider/panel/blank margin, and the
+        // terminal's own hard-wrap would kick in instead of ours. The
+        // user sees that as "soft-wrap is broken." Min 1 to avoid
+        // div-by-zero in wrap math on ridiculous terminal sizes.
+        let wrap_width = (self.content_width().saturating_sub(3)).max(1);
 
         // Pre-render each logical line (placeholder expansion etc.) into the
         // displayable form, alongside the cursor's display column on its line.
@@ -1152,17 +1210,35 @@ impl Renderer {
         let d = &self.panel_data;
         let mut out: Vec<(String, Color)> = Vec::new();
 
+        // Display-width-aware truncation: `chars().count()` mis-
+        // sizes wide emoji and CJK by half. The panel previously
+        // miscounted, so a status line like `cwd: 📦 /path` ended
+        // up overflowing the right border by one cell.
+        use unicode_width::UnicodeWidthStr;
         let truncate = |s: &str, w: usize| -> String {
-            let cc = s.chars().count();
-            if cc <= w {
-                s.to_string()
-            } else if w <= 1 {
-                "…".to_string()
-            } else {
-                let mut t: String = s.chars().take(w - 1).collect();
-                t.push('…');
-                t
+            let dw = UnicodeWidthStr::width(s);
+            if dw <= w {
+                return s.to_string();
             }
+            if w <= 1 {
+                return "…".to_string();
+            }
+            // Walk chars accumulating display width until adding
+            // the next one would exceed `w-1` (reserving 1 cell
+            // for the ellipsis).
+            use unicode_width::UnicodeWidthChar;
+            let mut out = String::new();
+            let mut used = 0usize;
+            for ch in s.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if used + cw > w - 1 {
+                    break;
+                }
+                out.push(ch);
+                used += cw;
+            }
+            out.push('…');
+            out
         };
 
         // Top padding rows. Same reasoning as the chat banner — without
@@ -1181,7 +1257,9 @@ impl Renderer {
         // that overflows so the pill stays a perfect rectangle.
         let row = |text: &str| -> String {
             let trimmed = truncate(text, inner);
-            let len = trimmed.chars().count();
+            // Pad by display width too, otherwise an emoji-bearing
+            // row left a 1-cell gap before the right border.
+            let len = UnicodeWidthStr::width(trimmed.as_str());
             let pad = inner.saturating_sub(len);
             format!("│{}{}│", trimmed, " ".repeat(pad))
         };
@@ -1380,7 +1458,34 @@ pub fn copy_to_clipboard(text: &str) {
                 let _ = stdin.write_all(text.as_bytes());
                 let _ = stdin.flush();
             }
-            let _ = child.wait();
+            // Bounded wait so a wedged helper (broken XWayland,
+            // frozen compositor, missing $DISPLAY for xclip) can't
+            // freeze the TUI on a copy keystroke. ~2s is generous —
+            // a healthy `pbcopy`/`wl-copy`/`xclip` returns in ms.
+            // On expiry we SIGKILL the child and move on; the user
+            // sees no immediate feedback but the editor stays
+            // responsive.
+            const CLIP_WAIT_LIMIT: std::time::Duration =
+                std::time::Duration::from_millis(2000);
+            let poll_interval = std::time::Duration::from_millis(25);
+            let deadline = std::time::Instant::now() + CLIP_WAIT_LIMIT;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            // Reap the now-killed child so we don't
+                            // leave a zombie behind. Ignore errors —
+                            // best-effort cleanup.
+                            let _ = child.wait();
+                            break;
+                        }
+                        std::thread::sleep(poll_interval);
+                    }
+                    Err(_) => break,
+                }
+            }
             return;
         }
     }

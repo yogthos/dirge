@@ -140,7 +140,57 @@ pub(crate) fn retry_after_from_error_msg(msg: &str) -> Option<Duration> {
     if let Some(secs) = parse_after_label(msg, "retry_after") {
         return Some(Duration::from_secs(secs));
     }
+    // RFC 7231 HTTP-date form: `Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`.
+    // Tried last so the numeric forms above (which are far more common)
+    // hit their fast path before we incur a chrono parse. Past dates
+    // clamp to zero so a misconfigured server doesn't suppress retries
+    // by emitting a stale or epoch-zero header.
+    if let Some(d) = parse_http_date_retry_after(msg) {
+        return Some(d);
+    }
     None
+}
+
+/// Scan `msg` for a `Retry-After:` header whose value parses as an
+/// RFC 7231 HTTP-date (IMF-fixdate, RFC 850, or asctime form). Returns
+/// the time from now until that date, clamped to 0 if in the past.
+/// Returns `None` if no `Retry-After:` is present or the value isn't a
+/// recognized date form (the numeric forms are handled by
+/// `parse_after_label` above).
+fn parse_http_date_retry_after(msg: &str) -> Option<Duration> {
+    // Locate `retry-after` (case-insensitive) the same way
+    // `parse_after_label` does, then read the value after the colon
+    // up to the next newline.
+    let label = "retry-after";
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find(label)?;
+    let after = idx + label.len();
+    if !msg.is_char_boundary(after) {
+        return None;
+    }
+    let tail = &msg[after..];
+    let tail = tail.trim_start_matches([':', ' ', '\t', '"']);
+    let value: String = tail
+        .chars()
+        .take_while(|&c| c != '\n' && c != '\r' && c != '"')
+        .collect();
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // chrono accepts the three RFC 7231 date forms via DateTime::parse_from_rfc2822
+    // (IMF-fixdate is rfc2822-compatible) and DateTime::parse_from_str for
+    // asctime. Try both; ignore Err.
+    let parsed = chrono::DateTime::parse_from_rfc2822(value)
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+                .ok()
+                .map(|n| n.and_utc().fixed_offset())
+        })?;
+    let now = chrono::Utc::now().fixed_offset();
+    let delta = parsed - now;
+    Some(Duration::from_secs(delta.num_seconds().max(0) as u64))
 }
 
 fn pseudo_random(salt: u64) -> u64 {
@@ -205,13 +255,42 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         return ErrorKind::Network;
     }
 
-    // Context-length indicators
+    // Context-length indicators. Patterns collected from real
+    // provider responses — each entry is a substring observed in
+    // production from at least one provider (Anthropic, OpenAI,
+    // Google, GLM, DeepSeek, Mistral, OpenRouter passthroughs).
+    // Keep these substrings narrow enough to avoid colliding with
+    // legitimate non-context-length errors that happen to mention
+    // "tokens" or "long".
     if lower.contains("context_length_exceeded")
         || lower.contains("maximum context length")
         || lower.contains("reduce the length of the messages")
         || lower.contains("request too large")
+        || lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || lower.contains("input token count exceeds")
+        || lower.contains("tokens exceed")
+        || lower.contains("exceeds the model's context")
     {
         return ErrorKind::ContextLength;
+    }
+
+    // HTML responses from intermediaries (Cloudflare 502/503,
+    // nginx error pages, captive-portal interception). These never
+    // parse as the JSON envelope rig/reqwest expect — without
+    // detection they fell through to `Other` and the user saw a
+    // one-shot opaque failure. Detect by leading HTML markers; the
+    // status-text strings ("Bad Gateway", "Service Unavailable")
+    // also appear in genuine JSON error bodies so we don't rely on
+    // them alone.
+    if lower.contains("<!doctype html")
+        || lower.contains("<html")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("gateway timeout")
+        || lower.contains("cloudflare")
+    {
+        return ErrorKind::Network;
     }
 
     // Network errors — check for specific phrases (avoid "connection" false positive)
@@ -309,6 +388,96 @@ mod tests {
             classify_error("request too large for model"),
             ErrorKind::ContextLength
         );
+    }
+
+    /// Audit H1: the original `classify_error` recognized only 4
+    /// substrings and missed common provider phrasings. Each entry
+    /// below corresponds to a real error string a provider can emit.
+    #[test]
+    fn test_classify_context_length_provider_variants() {
+        // Anthropic: hits when input + max_tokens > context window.
+        assert_eq!(
+            classify_error("prompt is too long: 250000 tokens > 200000 maximum"),
+            ErrorKind::ContextLength
+        );
+        // OpenAI o-series + gpt-4o family.
+        assert_eq!(
+            classify_error("This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."),
+            ErrorKind::ContextLength
+        );
+        // Generic "input too long" wording used by several providers.
+        assert_eq!(
+            classify_error("input is too long for the requested model"),
+            ErrorKind::ContextLength
+        );
+        // Google Gemini 1.x token-limit message.
+        assert_eq!(
+            classify_error("The input token count exceeds the maximum number of tokens allowed"),
+            ErrorKind::ContextLength
+        );
+        // GLM / DeepSeek / Mistral all surface variants of "tokens exceed".
+        assert_eq!(
+            classify_error("Total tokens exceed model's context window"),
+            ErrorKind::ContextLength
+        );
+        // OpenAI returns this when chat history exceeds context.
+        assert_eq!(
+            classify_error("the messages array exceeds the model's context length"),
+            ErrorKind::ContextLength
+        );
+    }
+
+    /// Audit H5: Cloudflare / nginx 502/503 pages and captive-portal
+    /// interceptions arrive as HTML, not JSON. Without HTML-aware
+    /// detection these fell through to `Other` (no retry); reclassify
+    /// as `Network`.
+    #[test]
+    fn test_classify_html_proxy_response_as_network() {
+        // Cloudflare 502 page snippet.
+        assert_eq!(
+            classify_error("<!DOCTYPE html><html><head><title>502 Bad Gateway</title>"),
+            ErrorKind::Network
+        );
+        // nginx error page.
+        assert_eq!(
+            classify_error("<html><body><h1>503 Service Unavailable</h1></body></html>"),
+            ErrorKind::Network
+        );
+        // Captive-portal interception (login page returned for the API URL).
+        assert_eq!(
+            classify_error("ProviderError: <html><head><meta http-equiv=\"refresh\""),
+            ErrorKind::Network
+        );
+    }
+
+    /// Audit H2: `Retry-After` may arrive as an HTTP-date per RFC 7231.
+    /// Parser must accept this form and return a Duration in seconds
+    /// from now (clamped to 0 if the date is in the past).
+    #[test]
+    fn retry_after_http_date_parses() {
+        // Build a date ~30s in the future, then check we recover ~30s.
+        let future = chrono::Utc::now() + chrono::Duration::seconds(30);
+        // RFC 7231 IMF-fixdate format.
+        let header = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let msg = format!("429 Too Many Requests\nRetry-After: {}", header);
+        let parsed = retry_after_from_error_msg(&msg).expect("HTTP-date should parse");
+        let secs = parsed.as_secs();
+        assert!(
+            (25..=35).contains(&secs),
+            "expected ~30s, got {}s (header={})",
+            secs,
+            header
+        );
+    }
+
+    /// Past dates must clamp to 0 rather than wrapping. A misconfigured
+    /// server occasionally returns `Retry-After: Thu, 01 Jan 1970 00:00:00 GMT`
+    /// — we want to retry immediately, not panic or skip retries.
+    #[test]
+    fn retry_after_http_date_in_past_clamps_to_zero() {
+        let msg = "Retry-After: Thu, 01 Jan 1970 00:00:00 GMT";
+        let parsed = retry_after_from_error_msg(msg).expect("past HTTP-date should parse");
+        assert_eq!(parsed, Duration::from_secs(0));
     }
 
     #[test]

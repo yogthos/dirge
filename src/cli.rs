@@ -29,9 +29,28 @@ pub struct Cli {
 
     #[arg(
         long = "api-key",
-        help = "API key for the provider (WARNING: visible to other users via ps/htop; prefer env vars)"
+        help = "API key for the provider (WARNING: visible to other users via ps/htop; prefer env vars or --api-key-file)"
     )]
     pub api_key: Option<String>,
+
+    /// Read the API key from a file at startup. Preferred over
+    /// `--api-key` because the value never reaches argv / proc
+    /// listings. Audit C2.
+    #[arg(
+        long = "api-key-file",
+        value_name = "PATH",
+        help = "Read API key from a file (preferred over --api-key; file contents must be the raw key, with trailing whitespace stripped)"
+    )]
+    pub api_key_file: Option<std::path::PathBuf>,
+
+    /// Read the API key from stdin at startup. Useful for piping
+    /// from a secrets manager (`pass | dirge --api-key-stdin …`).
+    /// Mutually exclusive with `--api-key-file`.
+    #[arg(
+        long = "api-key-stdin",
+        help = "Read API key from stdin at startup (single line; mutually exclusive with --api-key-file)"
+    )]
+    pub api_key_stdin: bool,
 
     #[arg(long = "max-tokens", help = "Maximum tokens in response")]
     pub max_tokens: Option<u64>,
@@ -41,9 +60,6 @@ pub struct Cli {
 
     #[arg(long = "temperature", help = "Model temperature (0.0 to 2.0)")]
     pub temperature: Option<f64>,
-
-    #[arg(short = 't', long = "tools", help = "Allowlist specific tools")]
-    pub tools: Vec<String>,
 
     #[arg(long = "no-tools", help = "Disable all tools")]
     pub no_tools: bool,

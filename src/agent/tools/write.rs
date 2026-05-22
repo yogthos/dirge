@@ -9,7 +9,7 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, PermCheck, ToolError, WriteArgs, check_perm_path, is_plan_file,
+    AskSender, PermCheck, ToolError, WriteArgs, check_perm_path_resolve, is_plan_file,
 };
 #[cfg(feature = "lsp")]
 use crate::lsp::diagnostic;
@@ -92,7 +92,11 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
-        check_perm_path(&self.permission, &self.ask_tx, "write", &args.path).await?;
+        // Audit H12: pin file operations to the canonical path the
+        // permission check ran against, so a symlink swap can't
+        // redirect the write to an unauthorized target.
+        let resolved_path =
+            check_perm_path_resolve(&self.permission, &self.ask_tx, "write", &args.path).await?;
 
         if let Some(plan) = &self.plan_file
             && !is_plan_file(plan, &args.path) {
@@ -102,7 +106,7 @@ impl Tool for WriteTool {
                 ));
             }
 
-        let path = Path::new(&args.path);
+        let path = Path::new(&resolved_path);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

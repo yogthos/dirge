@@ -13,19 +13,27 @@
 #   /fresh            — persist the current session and start a new
 #                        one in place. Keeps the model/provider.
 
-(def hooks [])
+# Register the hook so dirge actually dispatches it. Bare names in
+# this vector get auto-aliased to `<stem>-<hook>` (so this resolves
+# to `session_tree-on-message-update`) — dirge's hook surface uses
+# `on-message-update`, not `on-message`. The earlier version of this
+# plugin declared `(def hooks [])` and defined `on-message`, so the
+# function was loaded but never fired, leaving /label permanently
+# stuck on "no entry yet".
+(def hooks ["on-message-update"])
 
-# Track the most-recent entry-id we've seen across on-message hooks
-# so /label can attach to it without the user having to type a uuid.
+# Track the most-recent entry-id we've seen across on-message-update
+# hooks so /label can attach to it without the user typing a uuid.
 (var last-entry-id nil)
 
-(defn on-message [ctx]
-  # Plugin receives the just-recorded entry id via ctx — we stash it
-  # so the label command has something to target. (If your harness
-  # passes ids differently, adapt this getter.)
-  (when-let [id (get ctx :id)]
-    (when (string? id)
-      (set last-entry-id id))))
+(defn on-message-update [ctx]
+  # Plugin receives the in-progress turn id via ctx; we stash it
+  # so the label command has something to target. The dirge hook
+  # surface ships `:index` (turn ordinal) and `:partial`; if a
+  # future host bumps the context to include `:id`, this picks it
+  # up automatically.
+  (when-let [id (or (get ctx :id) (get ctx :index))]
+    (set last-entry-id (string id))))
 
 (defn label-handler [args]
   (cond

@@ -9,6 +9,20 @@ pub fn global_prompts_dir() -> PathBuf {
     crate::session::storage::config_path().join("prompts")
 }
 
+/// Load all prompts available to the session, with merge order:
+///
+///   embedded  (lowest precedence — only fills gaps)
+///     ↓
+///   global    (`~/.config/dirge/prompts/`)
+///     ↓
+///   local     (`./prompts/`, highest precedence)
+///
+/// Implementation contract (audit H14): embedded uses `or_insert_with`
+/// (soft) so a global / local prompt of the same name overrides it;
+/// global and local use `insert` (hard, last-write-wins). The three
+/// blocks below MUST stay in this order — swapping them would
+/// silently invert precedence. New tiers (e.g. workspace-scoped)
+/// should slot in by precedence with the same soft-then-hard pattern.
 pub fn load() -> HashMap<String, String> {
     let mut prompts: HashMap<String, String> = HashMap::new();
 

@@ -63,7 +63,7 @@ Accepted top-level keys:
 | `model`                   | string  | Model name. Default: `deepseek/deepseek-v4-flash`.                                                                                                                          |
 | `max_tokens`              | integer | Maximum response tokens. Default: `8192`.                                                                                                                                   |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `100`.                                                                                                                           |
-| `temperature`             | number  | Model temperature value. Only configurable via the `--temperature` CLI flag (`0.0` to `2.0`). Config-file value is parsed but not currently applied.                        |
+| `temperature`             | number  | Model sampling temperature in `0.0`–`2.0`. `--temperature` CLI flag overrides this. Values outside the range are clamped with a stderr warning.                            |
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
 | `no_context_files`        | boolean | Disable loading global/project `AGENTS.md` and `CLAUDE.md` context files. Default: `false`.                                                                                 |
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. Default: `128000`.                                                                                         |
@@ -81,21 +81,30 @@ Accepted top-level keys:
 | `show_edit_diff`          | boolean | Show colorized diff output for `edit` tool results (`-` red, `+` green, `@@` cyan). Default: `true`.                                                                        |
 | `tool_result_max_chars`   | integer | Maximum characters to show before truncating tool output with `[N more chars]`. Default: `500`.                                                                              |
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`.                                                                                                                        |
-| `theme`                   | string  | UI color theme. `phosphor` (default — 80s CRT green-on-black) or `plain` (pre-theme white/cyan). Unknown values fall back to `phosphor` with a warning.                       |
+| `theme`                   | string  | UI color theme. `phosphor` (default — 80s CRT green-on-black), `plain` (pre-theme white/cyan), or any `<name>.theme.json` file in the config dir. See [docs/THEMES.md](docs/THEMES.md). |
+| `tools`                   | object  | Optional per-tool enable map. Currently honors `tools.websearch` and `tools.webfetch` (both `bool`, default `true`); set either to `false` to drop the tool from the registered set even when its env vars are present. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, defaults to a single Exa Web Search server; see below.                                                   |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
-| `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
-| `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
 
 Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping glob-like patterns to actions.
-Supported permission tool keys are `bash`, `read`, `write`, `edit`, `grep`,
-`find_files`, `list_dir`, `write_todo_list`, `apply_patch`, `lsp`, and
-`question`. MCP-backed tools are checked under
-`mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the default action,
-`external_directory` for absolute-path rules outside the working directory,
-and `doom_loop` for repeated identical tool calls (default: `ask`). If
-`bash` is omitted, dirge installs its built-in safe bash allow/deny rules.
+Supported permission tool keys are:
+
+- File / shell: `bash`, `read`, `write`, `edit`, `grep`, `find_files`,
+  `list_dir`, `apply_patch`, `write_todo_list`
+- LSP / question: `lsp`, `question`
+- Web: `webfetch`, `websearch`
+- Subagent / state: `task`, `task_status`, `memory`, `skill`
+- Semantic (tree-sitter): `list_symbols`, `get_symbol_body`,
+  `find_definition`, `find_callers`, `find_callees`
+- MCP umbrella: `mcp_tool` — patterns match the full key
+  `mcp_tool:{server}:{tool}` so `{"mcp_tool:fs:*": "deny"}` blocks
+  every tool from a `fs` MCP server.
+
+Use `"*"` for the default action, `external_directory` for
+absolute-path rules outside the working directory, and `doom_loop`
+for repeated identical tool calls (default: `ask`). If `bash` is
+omitted, dirge installs its built-in safe bash allow/deny rules.
 
 ### Mode semantics
 
@@ -202,8 +211,10 @@ The following config keys are available:
 | Key           | Type    | Description                                            |
 | ------------- | ------- | ------------------------------------------------------ |
 | `acp_servers` | object  | Named ACP server configurations (see below)            |
-| `acp_host`    | string  | TCP bind host for ACP server (default: stdio mode)     |
-| `acp_port`    | integer | TCP bind port for ACP server (default: 7243)           |
+
+dirge's ACP runs over stdio only; the `acp_host` / `acp_port`
+keys that earlier docs mentioned have been removed from the CLI
+and config in favor of editors driving the agent via stdio.
 
 ACP server configs (in `acp_servers`) support two transport types:
 

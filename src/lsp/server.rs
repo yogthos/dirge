@@ -11,7 +11,11 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     pub id: &'static str,
-    pub extensions: &'static [&'static str],
+    /// Extensions claimed by this server. Owned `Vec<String>` (not
+    /// `&'static [&'static str]`) so user config can extend or
+    /// override the builtin list — see
+    /// `apply_extension_overrides`.
+    pub extensions: Vec<String>,
     /// Walks up from `file` (bounded by `stop_at`) to locate the workspace
     /// root. Returns `None` when no plausible root exists (signals "don't
     /// attach this server to this file").
@@ -144,32 +148,256 @@ fn clojure_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
     )
 }
 
+fn go_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    nearest_root(file, stop_at, &["go.mod", "go.work"], &[])
+}
+
+fn java_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    nearest_root(
+        file,
+        stop_at,
+        &[
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        ],
+        &[],
+    )
+}
+
+fn cfamily_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    // clangd: compile_commands.json is the canonical marker, with
+    // CMakeLists.txt / Makefile as fallbacks. .clangd config file
+    // also pins a root if present.
+    nearest_root(
+        file,
+        stop_at,
+        &[
+            "compile_commands.json",
+            ".clangd",
+            "CMakeLists.txt",
+            "Makefile",
+            "meson.build",
+        ],
+        &[],
+    )
+}
+
+fn ruby_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    nearest_root(
+        file,
+        stop_at,
+        &["Gemfile", "Rakefile", ".rubocop.yml", "config.ru"],
+        &[],
+    )
+}
+
+fn bash_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    // bash-language-server doesn't have a project concept; use the
+    // file's parent dir (or `stop_at` if at the boundary). Falling
+    // through to `stop_at` matches what other rootless tools do.
+    file.parent()
+        .map(|p| p.to_path_buf())
+        .or_else(|| Some(stop_at.to_path_buf()))
+}
+
 /// All built-in LSP server descriptors. Order is significant only for tie-
 /// breaking when an extension is claimed by more than one server — earlier
 /// entries are tried first.
 pub fn builtin_servers() -> Vec<ServerInfo> {
+    let owned = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     vec![
         ServerInfo {
             id: "rust",
-            extensions: &["rs"],
+            extensions: owned(&["rs"]),
             root: rust_workspace_root,
         },
         ServerInfo {
             id: "typescript",
-            extensions: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
+            extensions: owned(&["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]),
             root: typescript_root,
         },
         ServerInfo {
             id: "pyright",
-            extensions: &["py", "pyi"],
+            extensions: owned(&["py", "pyi"]),
             root: pyright_root,
         },
         ServerInfo {
             id: "clojure-lsp",
-            extensions: &["clj", "cljs", "cljc", "edn", "bb"],
+            extensions: owned(&["clj", "cljs", "cljc", "edn", "bb"]),
             root: clojure_root,
         },
+        // Audit M5: semantic adapters cover 10 languages but only 4
+        // had LSP servers (rust, ts, python, clojure). Added gopls,
+        // jdtls, clangd (c/cpp), ruby-lsp, and bash-language-server
+        // so diagnostics + go-to-def work on edits in those files.
+        // Each entry is best-effort: if the binary isn't on PATH the
+        // spawn errors and the broken-server backoff (10s → 10min)
+        // takes over.
+        ServerInfo {
+            id: "gopls",
+            extensions: owned(&["go"]),
+            root: go_root,
+        },
+        ServerInfo {
+            id: "jdtls",
+            extensions: owned(&["java"]),
+            root: java_root,
+        },
+        ServerInfo {
+            id: "clangd",
+            extensions: owned(&["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "m", "mm"]),
+            root: cfamily_root,
+        },
+        ServerInfo {
+            id: "ruby-lsp",
+            extensions: owned(&["rb", "rake", "gemspec"]),
+            root: ruby_root,
+        },
+        ServerInfo {
+            id: "bash-language-server",
+            extensions: owned(&["sh", "bash"]),
+            root: bash_root,
+        },
     ]
+}
+
+/// Apply config-time per-server overrides. For each `(server_id,
+/// override)` in `overrides`, if `override.extensions` is set,
+/// REPLACE the builtin's claimed extensions (matches the
+/// principle-of-least-surprise: a user-listed extension list is
+/// the full list they want, not an additive one). Skips overrides
+/// for unknown server ids — those are silently ignored today
+/// since we have no out-of-tree server registry. `disabled` is
+/// honored by removing the entry entirely (matches the spawn
+/// path's `disabled: true` semantics).
+///
+/// Lowercases user-supplied extensions to match the
+/// `servers_for_extension` lookup, which also lowercases input.
+pub fn apply_extension_overrides<C>(
+    servers: &mut Vec<ServerInfo>,
+    overrides: &std::collections::HashMap<String, C>,
+) where
+    C: AsExtensionOverride,
+{
+    let mut to_remove: Vec<String> = Vec::new();
+    for (id, ovr) in overrides {
+        if ovr.disabled() {
+            to_remove.push(id.clone());
+            continue;
+        }
+        if let Some(exts) = ovr.extensions() {
+            let normalized: Vec<String> = exts
+                .iter()
+                .map(|e| e.trim_start_matches('.').to_lowercase())
+                .collect();
+            if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
+                s.extensions = normalized;
+            }
+        }
+    }
+    servers.retain(|s| !to_remove.contains(&s.id.to_string()));
+}
+
+/// Shim trait so `apply_extension_overrides` works against the
+/// real `LspServerConfig` (in `config/mod.rs`) AND against test
+/// fixtures without dragging the config module into here.
+pub trait AsExtensionOverride {
+    fn extensions(&self) -> Option<&[String]>;
+    fn disabled(&self) -> bool;
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct StubOverride {
+        extensions: Option<Vec<String>>,
+        disabled: bool,
+    }
+    impl AsExtensionOverride for StubOverride {
+        fn extensions(&self) -> Option<&[String]> {
+            self.extensions.as_deref()
+        }
+        fn disabled(&self) -> bool {
+            self.disabled
+        }
+    }
+
+    /// Regression: `apply_extension_overrides` actually replaces a
+    /// server's claimed extensions when the user config specifies
+    /// `extensions: [...]`. Previously this field was parsed but
+    /// silently ignored.
+    #[test]
+    fn extensions_override_replaces_builtin_list() {
+        let mut servers = builtin_servers();
+        let mut overrides: HashMap<String, StubOverride> = HashMap::new();
+        overrides.insert(
+            "rust".to_string(),
+            StubOverride {
+                extensions: Some(vec!["rs".to_string(), "rlib".to_string()]),
+                disabled: false,
+            },
+        );
+        apply_extension_overrides(&mut servers, &overrides);
+        let rust = servers.iter().find(|s| s.id == "rust").unwrap();
+        assert_eq!(rust.extensions, vec!["rs".to_string(), "rlib".to_string()]);
+    }
+
+    /// `disabled: true` removes the entry entirely (matches spawn-command path).
+    #[test]
+    fn disabled_override_removes_server() {
+        let mut servers = builtin_servers();
+        let mut overrides: HashMap<String, StubOverride> = HashMap::new();
+        overrides.insert(
+            "rust".to_string(),
+            StubOverride {
+                extensions: None,
+                disabled: true,
+            },
+        );
+        apply_extension_overrides(&mut servers, &overrides);
+        assert!(servers.iter().all(|s| s.id != "rust"));
+    }
+
+    /// Unknown server ids are silently ignored — there's no
+    /// out-of-tree server registry yet.
+    #[test]
+    fn unknown_server_override_is_silently_ignored() {
+        let mut servers = builtin_servers();
+        let original_len = servers.len();
+        let mut overrides: HashMap<String, StubOverride> = HashMap::new();
+        overrides.insert(
+            "kotlin-lsp".to_string(),
+            StubOverride {
+                extensions: Some(vec!["kt".to_string()]),
+                disabled: false,
+            },
+        );
+        apply_extension_overrides(&mut servers, &overrides);
+        assert_eq!(servers.len(), original_len);
+    }
+
+    /// User-supplied extensions are normalized (leading-dot
+    /// stripped, lowercased) to match `servers_for_extension`.
+    #[test]
+    fn override_extensions_are_normalized() {
+        let mut servers = builtin_servers();
+        let mut overrides: HashMap<String, StubOverride> = HashMap::new();
+        overrides.insert(
+            "rust".to_string(),
+            StubOverride {
+                extensions: Some(vec![".RS".to_string(), "Rlib".to_string()]),
+                disabled: false,
+            },
+        );
+        apply_extension_overrides(&mut servers, &overrides);
+        let rust = servers.iter().find(|s| s.id == "rust").unwrap();
+        assert_eq!(rust.extensions, vec!["rs".to_string(), "rlib".to_string()]);
+    }
 }
 
 /// Returns the descriptors claiming the given file extension (no leading dot,
@@ -178,7 +406,7 @@ pub fn servers_for_extension(ext: &str) -> Vec<ServerInfo> {
     let ext = ext.trim_start_matches('.').to_lowercase();
     builtin_servers()
         .into_iter()
-        .filter(|s| s.extensions.iter().any(|e| *e == ext))
+        .filter(|s| s.extensions.iter().any(|e| e == &ext))
         .collect()
 }
 

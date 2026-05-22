@@ -4,7 +4,6 @@ mod config;
 mod context;
 mod event;
 mod extras;
-mod image_util;
 #[cfg(feature = "lsp")]
 mod lsp;
 mod permission;
@@ -57,6 +56,29 @@ struct Channels {
 }
 
 fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
+    // Warn on conflicting CLI flags. Previously `--yolo --restrictive`
+    // silently picked yolo (the first-match in the if-else chain)
+    // without surfacing the conflict — the user thought they had
+    // restricted permissions and got the opposite. Emit a stderr
+    // warning naming the active mode so the user can correct it.
+    let cli_modes: &[(bool, &str)] = &[
+        (cli.yolo, "--yolo"),
+        (cli.accept_all, "--accept-all"),
+        (cli.restrictive, "--restrictive"),
+    ];
+    let cli_picks: Vec<&str> = cli_modes
+        .iter()
+        .filter(|(v, _)| *v)
+        .map(|(_, name)| *name)
+        .collect();
+    if cli_picks.len() > 1 {
+        eprintln!(
+            "warning: conflicting permission flags {:?}; using the most permissive ({}). \
+             Pass only one of --yolo / --accept-all / --restrictive.",
+            cli_picks, cli_picks[0],
+        );
+    }
+
     if cli.yolo || cfg.yolo.unwrap_or(false) {
         SecurityMode::Yolo
     } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
@@ -68,7 +90,19 @@ fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
             "yolo" => SecurityMode::Yolo,
             "accept" => SecurityMode::Accept,
             "restrictive" => SecurityMode::Restrictive,
-            _ => SecurityMode::Standard,
+            "standard" => SecurityMode::Standard,
+            other => {
+                // Unknown value silently mapped to Standard before
+                // this — a typo like `restritctive` ended up as
+                // Standard and the user never knew. Warn explicitly
+                // and name the valid values.
+                eprintln!(
+                    "warning: unknown default_permission_mode {:?} in config; using standard. \
+                     Valid values: yolo, accept, restrictive, standard.",
+                    other,
+                );
+                SecurityMode::Standard
+            }
         }
     } else {
         SecurityMode::Standard
@@ -88,6 +122,22 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
 
     let mode = resolve_mode(cli, cfg);
     let checker = PermissionChecker::new(&perm_config, mode, None);
+    // Audit H11: Yolo mode unconditionally returns Allowed BEFORE rule
+    // lookup, so any explicit Deny rule the user configured (for
+    // `rm -rf /`, `aws *`, an `external_directory` deny, etc.) is
+    // silently inert. Warn once at startup so the user understands
+    // the implication of their config; we don't change the behavior
+    // (Yolo is documented as "all rules off") but the warning makes
+    // the gap visible instead of hidden.
+    if mode == SecurityMode::Yolo {
+        let n = checker.deny_rule_count();
+        if n > 0 {
+            eprintln!(
+                "warning: Yolo mode is active and your config has {} deny rule(s) — those rules will be IGNORED. Yolo allows every tool call unconditionally. Remove --yolo (or `yolo = true` in config) to honor deny rules.",
+                n,
+            );
+        }
+    }
     let perm: PermCheck = std::sync::Arc::new(std::sync::Mutex::new(checker));
 
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
@@ -101,7 +151,18 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
         let worktree = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let commands = compile_lsp_commands(cfg);
         let spawner = std::sync::Arc::new(ProcessSpawner::new(commands));
-        Some(std::sync::Arc::new(LspManager::new(spawner, worktree)))
+        // Apply per-server config overrides (extensions, disabled).
+        // Without this, user config like
+        //   "lsp": { "rust": { "extensions": ["rs", "rlib"] } }
+        // was silently ignored — the manager always used the
+        // builtin list.
+        let mut servers = crate::lsp::server::builtin_servers();
+        if let Some(lsp_cfg) = &cfg.lsp {
+            crate::lsp::server::apply_extension_overrides(&mut servers, lsp_cfg.server_overrides());
+        }
+        Some(std::sync::Arc::new(LspManager::with_servers(
+            spawner, worktree, servers,
+        )))
     } else {
         None
     };
@@ -125,11 +186,9 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
 /// and applying per-server overrides from user config. A `disabled = true`
 /// override removes the entry; any non-empty `command` replaces the default.
 ///
-/// Known limitation: `extensions` on the override is currently ignored. The
-/// claimed-extensions list lives in the static `builtin_servers()` registry
-/// (`lsp/server.rs`) — making it instance-overridable requires plumbing a
-/// per-session server set down through `LspManager`. Follow-up; users who
-/// need new extensions today must edit `server.rs`.
+/// Extensions overrides are applied separately in `build_channels` via
+/// `lsp::server::apply_extension_overrides` since they live on the
+/// per-session `ServerInfo` registry, not on the spawn-command map.
 #[cfg(feature = "lsp")]
 fn compile_lsp_commands(cfg: &config::Config) -> std::collections::HashMap<String, ProcessCommand> {
     let mut commands = ProcessSpawner::default_commands();
@@ -311,30 +370,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let client = provider::create_client(
-        &provider,
-        cli.api_key.as_deref(),
-        &cfg.custom_providers_map(),
-    )?;
-
-    #[cfg(feature = "mcp")]
-    let mcp_manager = if let Some(servers) = &cfg.mcp_servers {
-        if !cli.resolve_no_tools(&cfg) {
-            Some(extras::mcp::McpClientManager::connect_all(servers).await)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    #[cfg(feature = "semantic")]
-    let semantic_manager = if !cli.resolve_no_tools(&cfg) {
-        Some(semantic::SemanticManager::new())
-    } else {
-        None
-    };
-
+    // Plugin loading must happen BEFORE `create_client` so plugin-
+    // registered providers (via `harness/register-provider`) are
+    // installed into `PLUGIN_PROVIDERS` before
+    // `resolve_provider_info` runs. Previously plugins loaded later,
+    // so `--provider <plugin-name>` failed with "Unknown provider"
+    // even though the plugin defined it.
     #[cfg(feature = "plugin")]
     let plugin_manager = match plugin::PluginManager::try_new() {
         Ok(pm) => Some(std::sync::Arc::new(std::sync::Mutex::new(pm))),
@@ -343,7 +384,6 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
-
     // Make the PluginManager visible to HookedToolDyn (which runs inside
     // rig's tool dispatch, where we can't easily plumb the Arc through).
     // Set once, before any tool is built or called.
@@ -351,7 +391,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pm_arc) = plugin_manager.as_ref() {
         plugin::hook::init_global(pm_arc.clone());
     }
-
     // Pull the dialog-request receiver out of the PluginManager once,
     // here, so we can hand it to the UI loop. After this point, calling
     // take_dialog_rx again returns None — single owner by design. Always
@@ -364,7 +403,6 @@ async fn main() -> anyhow::Result<()> {
     });
     #[cfg(not(feature = "plugin"))]
     let dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<plugin::DialogRequest>> = None;
-
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;
@@ -396,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
                 //     `*.janet` contents are concatenated into one Janet
                 //     env (multi-file plugins)
                 let is_janet_file =
-                    path.is_file() && path.extension().is_some_and(|e| e == "janet");
+                    path.is_file() && path.extension().map_or(false, |e| e == "janet");
                 let is_plugin_dir = path.is_dir();
                 if !is_janet_file && !is_plugin_dir {
                     continue;
@@ -448,6 +486,66 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  registered {} plugin provider(s)", n);
         }
     }
+
+    // Audit C2: resolve `--api-key-file` / `--api-key-stdin` before
+    // falling back to `--api-key`. The flag-based key is still
+    // accepted for backward compat but the explicit warning in
+    // `resolve_api_key` fires when it's used. Mutually-exclusive
+    // checks: stdin OR file, never both.
+    if cli.api_key_stdin && cli.api_key_file.is_some() {
+        anyhow::bail!("--api-key-stdin and --api-key-file are mutually exclusive");
+    }
+    if cli.api_key.is_some() && !cli.api_key.as_deref().unwrap_or("").is_empty() {
+        eprintln!(
+            "warning: --api-key value is visible in process listings (/proc/*/cmdline, `ps`). Prefer --api-key-file <path>, --api-key-stdin, or the provider's env var."
+        );
+    }
+    let resolved_key: Option<String> = if let Some(path) = &cli.api_key_file {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("--api-key-file: read {:?}: {}", path, e))?;
+        let key = raw.trim().to_string();
+        if key.is_empty() {
+            anyhow::bail!("--api-key-file: file {:?} is empty after trimming", path);
+        }
+        Some(key)
+    } else if cli.api_key_stdin {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| anyhow::anyhow!("--api-key-stdin: read: {}", e))?;
+        let key = buf.trim().to_string();
+        if key.is_empty() {
+            anyhow::bail!("--api-key-stdin: received empty input");
+        }
+        Some(key)
+    } else {
+        cli.api_key.clone()
+    };
+
+    let client = provider::create_client(
+        &provider,
+        resolved_key.as_deref(),
+        &cfg.custom_providers_map(),
+    )?;
+
+    #[cfg(feature = "mcp")]
+    let mcp_manager = if let Some(servers) = &cfg.mcp_servers {
+        if !cli.resolve_no_tools(&cfg) {
+            Some(extras::mcp::McpClientManager::connect_all(servers).await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    #[cfg(feature = "semantic")]
+    let semantic_manager = if !cli.resolve_no_tools(&cfg) {
+        Some(semantic::SemanticManager::new())
+    } else {
+        None
+    };
 
     #[cfg(feature = "acp")]
     if cli.acp_enabled {
@@ -591,6 +689,12 @@ async fn main() -> anyhow::Result<()> {
         if !initial_msg.is_empty() {
             session.add_message(MessageRole::User, &initial_msg);
         }
+        // Clone the LSP manager Arc so we can call didClose
+        // cleanup after `run_interactive` has consumed its handle.
+        // The Arc is cheap to clone; both copies point at the same
+        // manager state, which is what we need for shutdown.
+        #[cfg(feature = "lsp")]
+        let lsp_manager_for_shutdown = lsp_manager.clone();
         ui::run_interactive(
             client,
             agent,
@@ -619,6 +723,18 @@ async fn main() -> anyhow::Result<()> {
             dialog_rx,
         )
         .await?;
+
+        // Best-effort `textDocument/didClose` for every file each
+        // LSP server saw this session. Servers retain parse trees
+        // + diagnostic caches keyed on open files; without this
+        // cleanup a long session leaves them holding all that
+        // state for the lifetime of their process. The notify is
+        // fire-and-forget; individual failures are swallowed
+        // inside `close_all_files`.
+        #[cfg(feature = "lsp")]
+        if let Some(mgr) = lsp_manager_for_shutdown.as_ref() {
+            mgr.close_all_files().await;
+        }
     }
 
     #[cfg(feature = "mcp")]

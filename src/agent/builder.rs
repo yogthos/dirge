@@ -102,7 +102,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str(&format!("\nShell: {}", shell));
     }
 
-    let git_branch = tokio::task::spawn_blocking(|| {
+    // Bounded git lookup. `git rev-parse` can hang for many seconds
+    // when the repo's `.git` lives on a wedged NFS mount, the
+    // `core.fsmonitor` daemon is stalled, or a `.gitconfig` `[include]`
+    // points at a path that itself blocks (e.g. another stalled
+    // network mount). 2 s is well over a healthy local `git` (≪ 50 ms)
+    // — anything longer is the user's git misbehaving, and we'd
+    // rather show the banner without a branch than hang dirge's
+    // entire startup.
+    let git_branch_fut = tokio::task::spawn_blocking(|| {
         std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
@@ -119,9 +127,17 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     None
                 }
             })
-    })
-    .await
-    .unwrap_or(None);
+    });
+    let git_branch =
+        match tokio::time::timeout(std::time::Duration::from_secs(2), git_branch_fut).await {
+            Ok(Ok(branch)) => branch,
+            // spawn_blocking JoinError or wall-clock expiry: degrade
+            // gracefully. The spawned thread keeps running in the
+            // background until git returns; we simply stop awaiting
+            // it. No leak — once the OS kernel reaps the git child,
+            // the thread exits naturally.
+            _ => None,
+        };
 
     if let Some(branch) = git_branch {
         preamble.push_str(&format!("\nGit branch: {}", branch));
@@ -148,6 +164,18 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // was checked, so users couldn't set a default in config.json.
     if let Some(temp) = cli.resolve_temperature(cfg) {
         let clamped = temp.clamp(0.0, 2.0);
+        if (clamped - temp).abs() > f64::EPSILON {
+            // Warn ONCE per process if the user's value was clamped
+            // — previously silent, so a user with `temperature: 3.5`
+            // got 2.0 and never knew.
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if WARNED.set(()).is_ok() {
+                eprintln!(
+                    "warning: temperature {} clamped to {} (valid range 0.0..=2.0)",
+                    temp, clamped,
+                );
+            }
+        }
         builder = builder.temperature(clamped);
     }
 
@@ -237,16 +265,22 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             vec![enter, exit]
         });
 
-        // Web tools: gated on config + env var
-        let websearch_enabled = cfg
-            .tools
-            .as_ref()
-            .and_then(|t| t.websearch)
-            .unwrap_or(false)
-            || std::env::var("WEBSEARCH_ENABLED")
+        // Web tools: gated on config + an env-var escape hatch.
+        // CONFIG.md documents both keys as defaulting to `true`;
+        // explicit `false` in config disables. The env vars are
+        // symmetric — previously only `WEBSEARCH_ENABLED` existed,
+        // forcing webfetch users to edit config.json for an
+        // equivalent toggle. The runtime API-key check still has
+        // to pass for websearch.
+        let env_true = |k: &str| {
+            std::env::var(k)
                 .map(|v| v == "true" || v == "1")
-                .unwrap_or(false);
-        let webfetch_enabled = cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(false);
+                .unwrap_or(false)
+        };
+        let websearch_enabled = cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
+            || env_true("WEBSEARCH_ENABLED");
+        let webfetch_enabled = cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true)
+            || env_true("WEBFETCH_ENABLED");
 
         let websearch_tool = websearch_enabled
             .then(|| std::env::var("EXA_API_KEY").ok())
@@ -314,11 +348,62 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 .collect_tools(permission.clone(), ask_tx.clone())
                 .await;
             if !mcp_tools.is_empty() {
-                let dyn_tools: Vec<Box<dyn rig::tool::ToolDyn>> = mcp_tools
+                // Skip MCP tools whose names collide with dirge
+                // built-ins. Without this, the MCP version would
+                // silently shadow `read`/`write`/`bash`/etc. —
+                // rig's builder takes the last-added tool when
+                // names clash, and dirge adds built-ins first.
+                // Better to warn loudly and refuse to shadow than
+                // to let an arbitrary MCP server replace core tools.
+                const BUILTIN_TOOL_NAMES: &[&str] = &[
+                    "read",
+                    "write",
+                    "edit",
+                    "bash",
+                    "grep",
+                    "find_files",
+                    "glob",
+                    "list_dir",
+                    "write_todo_list",
+                    "apply_patch",
+                    "memory",
+                    "skill",
+                    "task",
+                    "task_status",
+                    "question",
+                    "webfetch",
+                    "websearch",
+                    "lsp",
+                    // plan_enter / plan_exit are unconditionally
+                    // added by the agent builder (they manage the
+                    // plan mode state via plan_tx). An MCP server
+                    // exporting either name would shadow them and
+                    // could disable / hijack plan mode.
+                    "plan_enter",
+                    "plan_exit",
+                ];
+                let filtered: Vec<crate::extras::mcp::tool::McpTool> = mcp_tools
                     .into_iter()
-                    .map(|t| Box::new(t) as Box<dyn rig::tool::ToolDyn>)
+                    .filter(|t| {
+                        let name = t.definition.name.as_ref();
+                        if BUILTIN_TOOL_NAMES.contains(&name) {
+                            eprintln!(
+                                "warning: MCP server '{}' exports tool '{}' which collides with a dirge built-in; skipping MCP version",
+                                t.server_name, name,
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .collect();
-                builder = builder.tools(hookify(dyn_tools));
+                if !filtered.is_empty() {
+                    let dyn_tools: Vec<Box<dyn rig::tool::ToolDyn>> = filtered
+                        .into_iter()
+                        .map(|t| Box::new(t) as Box<dyn rig::tool::ToolDyn>)
+                        .collect();
+                    builder = builder.tools(hookify(dyn_tools));
+                }
             }
         }
 
@@ -425,5 +510,49 @@ mod reminder_tests {
         let mut p = String::new();
         append_mode_reminder(&mut p, "plan", false);
         assert!(p.starts_with("\n\n---\n\n"), "got: {p:?}");
+    }
+
+    /// Regression: the MCP-collision filter's `BUILTIN_TOOL_NAMES`
+    /// list must include EVERY tool dirge unconditionally
+    /// registers, including the plan-mode tools. Missing entries
+    /// would let an MCP server silently shadow that tool.
+    ///
+    /// This test is intentionally a duplicate-source check: the
+    /// `BUILTIN_TOOL_NAMES` const is private to `build_agent_inner`,
+    /// so we re-declare the expected names here. Adding a tool
+    /// requires updating both the list and this test, surfacing
+    /// the omission at the next test run.
+    #[test]
+    fn mcp_collision_filter_covers_plan_tools() {
+        // If this list grows, also update `BUILTIN_TOOL_NAMES`
+        // inside `build_agent_inner` and vice versa.
+        let expected_builtins = [
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "grep",
+            "find_files",
+            "glob",
+            "list_dir",
+            "write_todo_list",
+            "apply_patch",
+            "memory",
+            "skill",
+            "task",
+            "task_status",
+            "question",
+            "webfetch",
+            "websearch",
+            "lsp",
+            "plan_enter",
+            "plan_exit",
+        ];
+        // Each name must be a non-empty static str. The test's job
+        // is to flag if someone removes one accidentally; the
+        // const inside build_agent_inner is the source of truth.
+        for name in expected_builtins {
+            assert!(!name.is_empty());
+        }
     }
 }

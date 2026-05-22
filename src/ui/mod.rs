@@ -412,7 +412,7 @@ fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
 /// Build the rounded-chamber top border, left-truncating `value`
 /// to fill the available width up to `─╮`. Layout:
 ///
-///   `╭─ TOOL ─ "value" ─…─╮`
+///   `╭─ TOOL ─ "value"─…─╮`
 ///
 /// - When `value` fits, pad with extra `─` between the closing
 ///   quote and `─╮` so the border is flush right.
@@ -420,11 +420,45 @@ fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
 ///   (so filenames stay readable: paths put the filename on the
 ///   right). Original PR used right-truncation, which was the
 ///   wrong direction for paths.
+/// - The suffix is a tight `─╮` (no leading space) to match the
+///   chamber bottom's `╰────╯` solid-dash style. A previous
+///   version used ` ─╮` (leading space) which produced a visible
+///   gap `── ─╮` at the right edge that looked like a defect.
 fn fit_banner_header(name_upper: &str, value: &str, frame_w: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
     use unicode_width::UnicodeWidthStr;
 
-    let prefix = format!("╭─ {} ─ ", name_upper);
-    let suffix = " ─╮";
+    // Cap the tool name so a pathological long name
+    // (e.g. `mcp_tool:long_server:long_function`) doesn't push
+    // the prefix past `frame_w` and overflow the chamber. Reserve
+    // enough room for the surrounding `╭─ ` + ` ─ ` + suffix +
+    // 2 quote chars + at least 1 cell of value. If the name itself
+    // is too long, left-truncate with `…` so the part closest to
+    // the colon-separated suffix (typically the function name)
+    // survives — same rationale as path truncation.
+    const FRAME_OVERHEAD: usize = 8; // "╭─ " (3) + " ─ " (3) + "─╮" (2)
+    let name_budget = frame_w.saturating_sub(FRAME_OVERHEAD + 3); // 3 = quotes + 1 value cell
+    let name_w = name_upper.width();
+    let displayed_name: String = if name_w <= name_budget || name_budget == 0 {
+        name_upper.to_string()
+    } else {
+        let tail_budget = name_budget.saturating_sub(1); // for `…`
+        let mut tail: Vec<char> = Vec::new();
+        let mut used = 0;
+        for ch in name_upper.chars().rev() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > tail_budget {
+                break;
+            }
+            tail.push(ch);
+            used += w;
+        }
+        tail.reverse();
+        format!("…{}", tail.into_iter().collect::<String>())
+    };
+
+    let prefix = format!("╭─ {} ─ ", displayed_name);
+    let suffix = "─╮";
     let prefix_w = prefix.as_str().width();
     let suffix_w = suffix.width();
     // Reserve at least 1 cell for padding-or-truncation marker.
@@ -589,6 +623,20 @@ pub async fn run_interactive(
         })
     };
 
+    // Populate the right-hand info panel *before* the initial paint so
+    // MCP servers, LSP, cwd, etc. show their real values on startup.
+    // The event-loop top refreshes this every iteration, but waits on
+    // `tokio::select!` first — without seeding it here, the very first
+    // paint runs against the default-empty `PanelData` and "(none)"
+    // shows for every panel field until the user nudges any event.
+    renderer.set_panel_data(build_panel_data(
+        session,
+        #[cfg(feature = "mcp")]
+        mcp_manager,
+        #[cfg(feature = "lsp")]
+        lsp_manager.as_ref(),
+    ));
+
     render_session(&mut renderer, session, cli, cfg, context)?;
     renderer.draw_bottom(
         &input,
@@ -609,7 +657,26 @@ pub async fn run_interactive(
     let (user_tx, mut user_rx) = mpsc::channel::<UserEvent>(64);
     let user_tx_clone = user_tx.clone();
     std::thread::spawn(move || {
+        // Poll-based loop so `TerminalGuard::drop` can signal a
+        // cooperative shutdown via `EVENT_READER_SHUTDOWN`. Previously
+        // this thread blocked in `event::read()` indefinitely; on
+        // teardown the guard's drain pass and this `read()` both held
+        // crossterm's internal mutex, racing for terminal-response
+        // bytes (OSC 11, primary DA, CPR). With the flag + 50ms
+        // poll-tick, the reader exits within ~50ms of the guard
+        // signalling, the mutex is released, and the drain runs
+        // uncontended.
         loop {
+            if crate::ui::terminal::EVENT_READER_SHUTDOWN
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+            match event::poll(std::time::Duration::from_millis(50)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
             match event::read() {
                 Ok(event::Event::Key(key)) => {
                     if user_tx_clone.blocking_send(UserEvent::Key(key)).is_err() {
@@ -627,19 +694,19 @@ pub async fn run_interactive(
                             break;
                         }
                     }
-                    MouseEventKind::Down(MouseButton::Left) => {
+                    MouseEventKind::Down(btn) if btn == MouseButton::Left => {
                         let _ = user_tx_clone.blocking_send(UserEvent::MouseDown {
                             row: m.row,
                             col: m.column,
                         });
                     }
-                    MouseEventKind::Drag(MouseButton::Left) => {
+                    MouseEventKind::Drag(btn) if btn == MouseButton::Left => {
                         let _ = user_tx_clone.blocking_send(UserEvent::MouseDrag {
                             row: m.row,
                             col: m.column,
                         });
                     }
-                    MouseEventKind::Up(MouseButton::Left) => {
+                    MouseEventKind::Up(btn) if btn == MouseButton::Left => {
                         let _ = user_tx_clone.blocking_send(UserEvent::MouseUp {
                             row: m.row,
                             col: m.column,
@@ -693,7 +760,14 @@ pub async fn run_interactive(
                     "error" => c_error(),
                     _ => theme::dim(),
                 };
-                renderer.write_line(&format!("[plugin] {}", msg), color)?;
+                // Sanitize plugin-supplied strings: a misbehaving
+                // or malicious plugin could emit ANSI escape codes
+                // through `harness/notify`, painting the terminal
+                // or moving the cursor. All other LLM/tool output
+                // paths go through `sanitize_output`; plugin
+                // notifications were the only path bypassing it.
+                let safe = sanitize_output(&msg);
+                renderer.write_line(&format!("[plugin] {}", safe), color)?;
             }
         }
 
@@ -749,6 +823,15 @@ pub async fn run_interactive(
                 }
             }
             if any_session_replaced {
+                // Cancel any in-flight background subagent tasks
+                // belonging to the previous session. Without this the
+                // tasks survive the swap, continue consuming API
+                // budget against a session their parent agent no
+                // longer sees, and would later try to notify a store
+                // whose recipient is gone.
+                if let Some(store) = bg_store.as_ref() {
+                    store.cancel_all();
+                }
                 // Repaint chat from the (possibly fresh) session so
                 // the user sees the new state. The agent runtime
                 // keeps the same model — reset_to_new / switch_session
@@ -1012,7 +1095,9 @@ pub async fn run_interactive(
                                     continue;
                                 }
                                 KeyCode::Up => {
-                                    search_selected = search_selected.saturating_sub(1);
+                                    if search_selected > 0 {
+                                        search_selected -= 1;
+                                    }
                                 }
                                 KeyCode::Down => {
                                     if search_selected + 1 < search_matches.len() {
@@ -1116,8 +1201,8 @@ pub async fn run_interactive(
 
                         if key.code == KeyCode::Esc && !is_running && !renderer.selection_active {
                             let now = std::time::Instant::now();
-                            if let Some(prev) = last_esc
-                                && now.duration_since(prev) < std::time::Duration::from_millis(1500) {
+                            if let Some(prev) = last_esc {
+                                if now.duration_since(prev) < std::time::Duration::from_millis(1500) {
                                     last_esc = None;
                                     open_rewind_picker(session, &mut rewind_picker);
                                     rewind_picker.draw()?;
@@ -1128,6 +1213,7 @@ pub async fn run_interactive(
                                     )?;
                                     continue;
                                 }
+                            }
                             last_esc = Some(now);
                             renderer.write_line("Press Esc again to rewind...", theme::dim())?;
                             renderer.draw_bottom(
@@ -1250,7 +1336,7 @@ pub async fn run_interactive(
                                 }
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
                                 match prefix {
@@ -1309,7 +1395,7 @@ pub async fn run_interactive(
                                 }
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
                                 let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager).await;
@@ -1471,13 +1557,15 @@ pub async fn run_interactive(
                                     )?;
                                 }
                                 renderer.write_line(
-                                    "(queued; runner will stop at next safe boundary — Ctrl+X drops, Ctrl+C cancels)",
+                                    &format!(
+                                        "(queued; runner will stop at next safe boundary — Ctrl+X drops, Ctrl+C cancels)"
+                                    ),
                                     theme::dim(),
                                 )?;
                             } else {
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
 
@@ -1499,8 +1587,10 @@ pub async fn run_interactive(
                                     ) {
                                         Ok(results) if !results.is_empty() => {
                                             for line in &results {
+                                                // Sanitize plugin output (ANSI injection defense).
+                                                let safe = sanitize_output(line);
                                                 renderer.write_line(
-                                                    &format!("[plugin] {}", line),
+                                                    &format!("[plugin] {}", safe),
                                                     theme::dim(),
                                                 )?;
                                             }
@@ -1737,7 +1827,27 @@ pub async fn run_interactive(
                         // on-tool-end is also fired by HookedToolDyn so the
                         // host doesn't re-dispatch it here.
 
-                        if show_details {
+                        // Permission-deny path: the ALERT handler
+                        // already closed the chamber (and the dim
+                        // `↳ denied: …` trailer printed there). The
+                        // tool still returns an error to the agent
+                        // which surfaces here as a ToolResult — but
+                        // painting chamber rows + a chamber bottom
+                        // now would produce orphan borders for a
+                        // chamber whose top no longer exists. Emit
+                        // a single dim line with the error body
+                        // instead and skip the chamber paint.
+                        if show_details && last_tool_name.is_none() {
+                            let trimmed = output.trim();
+                            if !trimmed.is_empty() {
+                                let first_line = trimmed.lines().next().unwrap_or("");
+                                renderer.write_line(
+                                    &format!("  ↳ {}", sanitize_output(first_line)),
+                                    theme::dim(),
+                                )?;
+                            }
+                        }
+                        if show_details && last_tool_name.is_some() {
                             let is_edit =
                                 last_tool_name.as_deref() == Some("edit") && show_diff;
 
@@ -1846,8 +1956,10 @@ pub async fn run_interactive(
                             ) {
                                 Ok(results) if !results.is_empty() => {
                                     for line in &results {
+                                        // Sanitize plugin output (ANSI injection defense).
+                                        let safe = sanitize_output(line);
                                         renderer.write_line(
-                                            &format!("[plugin] {}", line),
+                                            &format!("[plugin] {}", safe),
                                             theme::dim(),
                                         )?;
                                     }
@@ -2137,7 +2249,7 @@ pub async fn run_interactive(
                             for line in combined.lines() {
                                 let safe_line = sanitize_output(line);
                                 renderer
-                                    .write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                    .write_line(&format!("<you> {}", safe_line), theme::user())?;
                             }
                             renderer.write_line("", Color::White)?;
 
@@ -2242,7 +2354,7 @@ pub async fn run_interactive(
                             let combined = queued.join("\n\n");
                             for line in combined.lines() {
                                 let safe_line = sanitize_output(line);
-                                renderer.write_line(&format!("<you>   {}", safe_line), theme::user())?;
+                                renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                             }
                             renderer.write_line("", Color::White)?;
 
@@ -2415,11 +2527,53 @@ pub async fn run_interactive(
                     agent_line_started = false;
                 }
 
-                // If a tool chamber is open (the in-flight tool that
-                // triggered this permission check), close it first so
-                // the alert renders outside the chamber rather than
-                // nested inside it.
-                close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                // Chamber-vs-alert interleaving:
+                //
+                // The in-flight tool's chamber TOP was already drawn
+                // by the ToolCall handler when the LLM emitted the
+                // call. Drawing the alert box directly below would
+                // visually orphan that top — the chamber would have
+                // no body and no bottom, looking like a broken card.
+                //
+                // Old behavior (PR #100): leave the chamber open and
+                // hope the body lands inside it. In practice the
+                // alert renders BETWEEN the chamber top and the
+                // chamber body, so the top is visually disconnected
+                // from the body that arrives later.
+                //
+                // New behavior: close the in-flight chamber with a
+                // "awaiting permission" footer BEFORE the alert
+                // displays. If the user allows, reopen a fresh
+                // chamber (matching banner) below the alert so the
+                // ToolResult body lands inside it as usual. If the
+                // user denies, the chamber is already closed and
+                // we add a brief "(denied)" line below.
+                let pending_chamber_tool =
+                    if let Some(open_name) = last_tool_name.clone() {
+                        let (frame_w, inner) = chamber_widths(&renderer);
+                        renderer.write_line(
+                            &chamber_row("awaiting permission…", inner),
+                            theme::dim(),
+                        )?;
+                        renderer.write_line(&chamber_bottom(frame_w), c_tool())?;
+                        last_tool_name = None;
+                        Some(open_name)
+                    } else {
+                        None
+                    };
+                // Blank line above the ALERT box guarantees visual
+                // separation from whatever was just on screen — a
+                // closed tool chamber, plain agent text, or even
+                // nothing at all. Previously this blank only fired
+                // when a chamber was closed; if `last_tool_name`
+                // happened to be `None` at ask time (e.g. tokio
+                // select! picked the ask channel between when the
+                // ToolCall handler drew the chamber TOP and when the
+                // ToolResult would have cleared `last_tool_name`),
+                // the alert's `╭─ ⚠ ALERT` sat flush against the
+                // previous line and read as a stacked second border.
+                renderer.write_line("", Color::White)?;
+
                 renderer.set_avatar_state(avatar::AvatarState::Alert);
                 // Force a bottom-row repaint so the avatar updates to
                 // the Alert face immediately, before the user reads
@@ -2475,8 +2629,20 @@ pub async fn run_interactive(
                     &format!("{}{}╮", pre, "─".repeat(top_fill)),
                     c_perm(),
                 )?;
-                renderer.write_line(&row(&format!("tool : {}", ask_req.tool)), c_perm())?;
-                renderer.write_line(&row(&format!("args : {}", ask_req.input)), c_perm())?;
+                // ASNI/control-char sanitize the tool name + args
+                // before painting. These fields can carry attacker-
+                // shaped content (MCP tool name, plugin-injected
+                // call, pathological filename), and the ALERT row
+                // is the single moment the user is being asked to
+                // make a security decision — a raw escape here
+                // could recolor the row, blank the prompt, or move
+                // the cursor. The sibling reopen path at the bottom
+                // of this handler already sanitizes; do the same
+                // here for symmetry.
+                let safe_tool = sanitize_output(&ask_req.tool);
+                let safe_input = sanitize_output(&ask_req.input);
+                renderer.write_line(&row(&format!("tool : {}", safe_tool)), c_perm())?;
+                renderer.write_line(&row(&format!("args : {}", safe_input)), c_perm())?;
                 renderer.write_line(&format!("├{}┤", bot_bar), c_perm())?;
                 renderer.write_line(
                     &row("[y] allow once  [a] allow always  [n] deny  [ESC] abort"),
@@ -2488,7 +2654,24 @@ pub async fn run_interactive(
                     tokio::select! {
                         Some(ev) = user_rx.recv() => {
                             match ev {
-                                UserEvent::Key(key) => match key.code {
+                                UserEvent::Key(key) => {
+                                    // Ctrl+C / Ctrl+D in the alert
+                                    // = "I want out" → treat as
+                                    // Deny. Without this the loop
+                                    // fell through to `_ => {}` and
+                                    // the tool hung waiting for an
+                                    // answer that never came; the
+                                    // user had to keyboard-mash to
+                                    // discover that only y/a/n/Esc
+                                    // worked.
+                                    let is_ctrl_c = key.code == KeyCode::Char('c')
+                                        && key.modifiers.contains(KeyModifiers::CONTROL);
+                                    let is_ctrl_d = key.code == KeyCode::Char('d')
+                                        && key.modifiers.contains(KeyModifiers::CONTROL);
+                                    if is_ctrl_c || is_ctrl_d {
+                                        break UserDecision::Deny;
+                                    }
+                                    match key.code {
                                     KeyCode::Char('y') => break UserDecision::AllowOnce,
                                     KeyCode::Char('a') => {
                                         let pattern = suggest_pattern(&ask_req.tool, &ask_req.input);
@@ -2511,14 +2694,18 @@ pub async fn run_interactive(
                                             break UserDecision::AllowOnce;
                                         }
                                         renderer.write_line(
-                                            &format!("  -> will allow: {}", pattern),
+                                            &format!(
+                                                "  -> will allow: {}",
+                                                sanitize_output(&pattern),
+                                            ),
                                             Color::Green,
                                         )?;
                                         break UserDecision::AllowAlways(pattern);
                                     }
                                     KeyCode::Char('n') | KeyCode::Esc => break UserDecision::Deny,
                                     _ => {}
-                                },
+                                    }
+                                }
                                 // Keep scroll responsive while the
                                 // alert is up — previously these
                                 // events were dropped on the floor
@@ -2542,22 +2729,112 @@ pub async fn run_interactive(
                     UserDecision::AllowAlways(p) => Some(p.clone()),
                     _ => None,
                 };
+                let was_denied = matches!(decision, UserDecision::Deny);
                 let _ = ask_req.reply.send(decision);
+
+                // Audit H10: cascading reject. When the user denies
+                // one tool, any other tool requests already queued
+                // in `ask_rx` belong to the same agent run and the
+                // user almost certainly doesn't want to be asked
+                // about them serially. Drain whatever's already
+                // enqueued and auto-deny each. New requests that
+                // arrive after this drain still go through the
+                // normal alert flow on the next iteration.
+                if was_denied
+                    && let Some(rx) = ask_rx.as_mut()
+                {
+                    let mut cascaded = 0usize;
+                    while let Ok(stale) = rx.try_recv() {
+                        let _ = stale.reply.send(UserDecision::Deny);
+                        cascaded += 1;
+                    }
+                    if cascaded > 0 {
+                        renderer.write_line(
+                            &format!(
+                                "  ↳ also denied {} queued tool request{}",
+                                cascaded,
+                                if cascaded == 1 { "" } else { "s" },
+                            ),
+                            theme::dim(),
+                        )?;
+                    }
+                }
+
+                // Reopen / mark the chamber depending on outcome:
+                //
+                // - **Allow**: write a fresh chamber TOP banner so
+                //   the about-to-arrive ToolResult body has a
+                //   chamber to land inside. This gives the user a
+                //   clear "permission granted, tool running" visual
+                //   pair (closed chamber for the pause, fresh
+                //   chamber for the result).
+                //
+                // - **Deny**: chamber stayed closed; render a
+                //   single dim "(denied)" trailer line so it's
+                //   clear no result is coming.
+                if let Some(reopen_name) = pending_chamber_tool {
+                    // Visual breathing room between the alert box's
+                    // bottom border and whatever follows (reopened
+                    // chamber OR denied trailer). Without this, the
+                    // alert's `╰─╯` sits flush against the next
+                    // line which reads as continuous output.
+                    renderer.write_line("", Color::White)?;
+                    if was_denied {
+                        // Same sanitization as the ALERT rows above:
+                        // tool name + args can carry attacker-shaped
+                        // bytes; don't paint them raw even on the
+                        // deny path.
+                        renderer.write_line(
+                            &format!(
+                                "  ↳ denied: {} {}",
+                                sanitize_output(&ask_req.tool),
+                                sanitize_output(&ask_req.input),
+                            ),
+                            theme::dim(),
+                        )?;
+                    } else {
+                        // Reopen with the same banner shape the
+                        // ToolCall handler uses. `ask_req.input` is
+                        // the value that the original banner would
+                        // have rendered (path for read/write/edit,
+                        // command for bash, etc.) so we can pass it
+                        // directly without re-parsing the JSON args.
+                        //
+                        // Note for `apply_patch`: the initial chamber
+                        // showed "N ops" (overview); the reopened
+                        // chamber here shows the specific path the
+                        // user just permitted. Intentional — the
+                        // user is approving per-op, so per-op
+                        // identification is more useful at the
+                        // reopen point.
+                        let upper = reopen_name.to_ascii_uppercase();
+                        let raw_value = sanitize_output(&ask_req.input).into_string();
+                        let (frame_w, _) = chamber_widths(&renderer);
+                        let header = fit_banner_header(&upper, &raw_value, frame_w);
+                        renderer.write_line(&header, c_tool())?;
+                        last_tool_name = Some(reopen_name);
+                    }
+                }
 
                 if let Some(pattern) = allow_pattern {
                     session.permission_allowlist.push(PermissionAllowEntry {
                         tool: ask_req.tool.clone(),
                         pattern: pattern.clone(),
                     });
-                    if !cli.no_session
-                        && let Err(e) = crate::session::storage::save_session(session) {
+                    if !cli.no_session {
+                        if let Err(e) = crate::session::storage::save_session(session) {
                             renderer.write_line(
                                 &format!("warning: failed to save session: {}", e),
                                 c_error(),
                             )?;
                         }
+                    }
                     renderer.write_line(
-                        &format!("  allowed {} {} (saved to session)", ask_req.tool, pattern),
+                        &format!(
+                            "  allowed {} {} (saved to session)",
+                            sanitize_output(&ask_req.tool),
+                            pattern,
+                        ),
                         Color::Green,
                     )?;
                 }
@@ -2669,14 +2946,16 @@ pub async fn run_interactive(
                                 } else {
                                     "▶"
                                 }
-                            } else if multi {
-                                if selected[i] { "  [x]" } else { "  [ ]" }
                             } else {
-                                "  "
+                                if multi {
+                                    if selected[i] { "  [x]" } else { "  [ ]" }
+                                } else {
+                                    "  "
+                                }
                             };
                             lines.push(LineEntry {
                                 text: compact_str::CompactString::new(
-                                    format!("  {} {} — {}", marker, opt.label, opt.description),
+                                    &format!("  {} {} — {}", marker, opt.label, opt.description),
                                 ),
                                 color: c_perm(),
                             });
@@ -2719,7 +2998,7 @@ pub async fn run_interactive(
 
                         match key.code {
                             KeyCode::Up | KeyCode::Char('k') => {
-                                cursor = cursor.saturating_sub(1);
+                                if cursor > 0 { cursor -= 1; }
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
                                 let max = if custom { num_options } else { num_options.saturating_sub(1) };
@@ -2736,7 +3015,7 @@ pub async fn run_interactive(
                                             input_anchor,
                                             vec![LineEntry {
                                                 text: compact_str::CompactString::new(
-                                                    format!("  > {}", buf),
+                                                    &format!("  > {}", buf),
                                                 ),
                                                 color: c_perm(),
                                             }],
@@ -3039,13 +3318,14 @@ pub async fn run_interactive(
                     )?;
 
                     // Re-render the session to show new prompt mode
-                    if !cli.print
-                        && let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
+                    if !cli.print {
+                        if let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
                             renderer.write_line(
                                 &format!("render error: {}", e),
                                 resolve_color(c_error(), cli.no_color),
                             )?;
                         }
+                    }
                 } else {
                     let _ = plan_req.reply.send(PlanSwitchResponse::Rejected);
                 }
@@ -3166,11 +3446,29 @@ fn close_tool_chamber_if_open(
 /// `│   <content centered to inner>   │` — pad text on both sides so
 /// it sits horizontally centered within the chamber inner width.
 fn chamber_row_centered(content: &str, inner: usize) -> String {
-    let len = content.chars().count();
-    if len + 2 >= inner {
+    // Total row width matches `chamber_row`: exactly `inner + 4`
+    // terminal cells (`│ ` (2) + inner-cell middle + ` │` (2)).
+    // The middle is `inner` cells: left_pad + content + right_pad.
+    //
+    // TWO bugs were stacked here:
+    // (1) Used `chars().count()` instead of display width — the
+    //     NO-OUTPUT chamber starts with `⚠` (2 cells / 1 char) so
+    //     centering was off by 1 cell.
+    // (2) Subtracted `len + 2` from `inner` for the pad, leaving
+    //     the row 2 cells short of `inner + 4` total — the right
+    //     `│` didn't line up under the chamber's top `╮` /
+    //     bottom `╯`. Correct: pad = inner - len (the middle is
+    //     `inner` cells wide; subtracting only `len` reserves the
+    //     rest for padding around it).
+    //
+    // Anything wider than `inner` falls back to `chamber_row`
+    // which truncates with `…` and pads to exactly `inner` cells.
+    use unicode_width::UnicodeWidthStr;
+    let len = UnicodeWidthStr::width(content);
+    if len >= inner {
         return chamber_row(content, inner);
     }
-    let pad = inner.saturating_sub(len + 2);
+    let pad = inner - len;
     let left = pad / 2;
     let right = pad - left;
     format!("│ {}{}{} │", " ".repeat(left), content, " ".repeat(right))
@@ -3223,18 +3521,38 @@ fn chamber_bottom(frame_w: usize) -> String {
 }
 
 /// `│ content (truncated/padded to inner) │` row of a tool chamber.
+///
+/// Sizing is by *display width* (`UnicodeWidthStr`), not `char` count,
+/// so CJK / emoji / other wide glyphs from tool output don't push the
+/// right `│` past the chamber column. Truncation walks chars from the
+/// front, summing display widths until adding the next would exceed
+/// `inner - 1` cells (1 cell reserved for the `…` marker).
 fn chamber_row(content: &str, inner: usize) -> String {
-    let chars: Vec<char> = content.chars().collect();
-    let trimmed: String = if chars.len() <= inner {
-        chars.iter().collect()
+    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
+    let total_w = UnicodeWidthStr::width(content);
+    let (trimmed, trimmed_w): (String, usize) = if total_w <= inner {
+        (content.to_string(), total_w)
     } else if inner == 0 {
-        String::new()
+        (String::new(), 0)
     } else {
-        let mut out: String = chars[..inner.saturating_sub(1)].iter().collect();
+        // Reserve 1 cell for `…`. Pull chars from the start until
+        // adding the next one would overflow the remaining budget.
+        let budget = inner.saturating_sub(1);
+        let mut out = String::with_capacity(content.len());
+        let mut used = 0;
+        for ch in content.chars() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > budget {
+                break;
+            }
+            out.push(ch);
+            used += w;
+        }
         out.push('…');
-        out
+        (out, used + 1)
     };
-    let pad = inner.saturating_sub(trimmed.chars().count());
+    let pad = inner.saturating_sub(trimmed_w);
     format!("│ {}{} │", trimmed, " ".repeat(pad))
 }
 
@@ -3526,6 +3844,28 @@ mod tests {
         assert!(header.ends_with("─╮"));
     }
 
+    /// Regression: the suffix must be a tight `─╮` (no leading
+    /// space). The previous ` ─╮` form left a visible gap
+    /// `── ─╮` at the right edge that looked like the dash run
+    /// was broken. Solid dashes match the chamber bottom
+    /// (`╰────╯`) style.
+    #[test]
+    fn banner_has_no_internal_space_before_corner() {
+        let header = fit_banner_header("READ", "/short", 50);
+        // Strip the closing ╮ and check the char just before it
+        // is `─`, not ` `.
+        let mut chars: Vec<char> = header.chars().collect();
+        let last = chars.pop();
+        assert_eq!(last, Some('╮'));
+        let second_last = chars.pop();
+        assert_eq!(
+            second_last,
+            Some('─'),
+            "char before closing ╮ must be `─`, not space; got {:?}",
+            second_last,
+        );
+    }
+
     /// Banner left-truncates long paths so the filename (right side
     /// of a path) stays visible. The prefix `…` signals truncation.
     #[test]
@@ -3567,6 +3907,65 @@ mod tests {
         );
         assert!(header.starts_with("╭─ DONE ─"));
         assert!(header.ends_with("─╮"));
+    }
+
+    /// Regression: `chamber_row_centered` must use DISPLAY width
+    /// not char count. The NO-OUTPUT chamber message starts with
+    /// `⚠` (2 cells wide, 1 char). Before this, centering was off
+    /// by 1 cell and the right `│` border misaligned with the
+    /// chamber's top/bottom borders.
+    #[test]
+    fn chamber_row_centered_handles_wide_emoji() {
+        let row = chamber_row_centered("⚠ tool denied", 40);
+        // Row must occupy exactly `inner + 4` display cells
+        // (`│ ` + content + padding + ` │` = inner + 4 = 44).
+        let row_width = UnicodeWidthStr::width(row.as_str());
+        assert_eq!(
+            row_width, 44,
+            "row must be exactly inner+4 cells wide; got {row_width} for {row:?}",
+        );
+        // Right border `│` MUST be at the very end (no trailing
+        // pad mismatch).
+        assert!(
+            row.ends_with(" │"),
+            "right border missing or padded wrong: {row:?}"
+        );
+    }
+
+    /// `chamber_row` must align by display width too, not `char` count.
+    /// Tool output rows (`render_tool_output`) flow through this, so
+    /// any CJK/emoji in a `read`/`bash`/`grep` result would push the
+    /// right `│` past the chamber's column. Sibling
+    /// `chamber_row_centered` was already fixed; this is the same
+    /// bug in the asymmetric helper.
+    #[test]
+    fn chamber_row_handles_wide_emoji() {
+        // Short content with one wide char: must pad to exactly
+        // inner+4 cells. "ok ✅" = 2+1+2 = 5 cells (4 chars).
+        let row = chamber_row("ok ✅", 40);
+        let row_width = UnicodeWidthStr::width(row.as_str());
+        assert_eq!(
+            row_width, 44,
+            "row must be exactly inner+4 cells wide; got {row_width} for {row:?}",
+        );
+        assert!(
+            row.ends_with(" │"),
+            "right border missing: {row:?}"
+        );
+
+        // Long content with mixed wide chars: must truncate by
+        // display width and still land at exactly inner+4 cells.
+        let long = "日本語日本語日本語日本語日本語日本語日本語日本語日本語日本語";
+        let row = chamber_row(long, 20);
+        let row_width = UnicodeWidthStr::width(row.as_str());
+        assert_eq!(
+            row_width, 24,
+            "wide-char row must be exactly inner+4 cells wide; got {row_width} for {row:?}",
+        );
+        assert!(
+            row.ends_with(" │"),
+            "right border missing on truncated wide-char row: {row:?}"
+        );
     }
 
     /// Self-review bug 1: `apply_patch` arg is `operations`
@@ -3622,6 +4021,25 @@ mod tests {
         let header = fit_banner_header("READ", "/some/path", 12);
         // Don't pin the exact string — just make sure no panic and
         // we got SOMETHING with the borders intact.
+        assert!(header.starts_with("╭"));
+        assert!(header.ends_with("╮"));
+    }
+
+    /// Regression: a very long tool name (e.g. an MCP-registered
+    /// tool like `MCP_TOOL:LONG_SERVER:LONG_FUNCTION`) used to
+    /// overflow frame_w because the prefix `╭─ NAME ─ ` was wider
+    /// than the entire chamber. Now the name itself gets
+    /// left-truncated to keep the header at most frame_w wide.
+    #[test]
+    fn banner_truncates_pathological_long_tool_name() {
+        let very_long = "MCP_TOOL:VERY_LONG_SERVER_NAME:VERY_LONG_FUNCTION_NAME";
+        let header = fit_banner_header(very_long, "/some/path", 40);
+        assert!(
+            header.as_str().width() <= 40,
+            "header must not exceed frame_w; got width {} for {:?}",
+            header.as_str().width(),
+            header,
+        );
         assert!(header.starts_with("╭"));
         assert!(header.ends_with("╮"));
     }

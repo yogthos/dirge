@@ -5,7 +5,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
 use crate::semantic::SymbolIndex;
 use crate::semantic::types::SymbolKind;
 
@@ -63,7 +63,10 @@ impl Tool for ListSymbolsTool {
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {
-        check_perm(
+        // Path-aware check so external_directory rules apply.
+        // `args.path` is None when scanning the whole project — pass
+        // "." which check_perm_path resolves against the working dir.
+        check_perm_path(
             &self.permission,
             &self.ask_tx,
             "list_symbols",
