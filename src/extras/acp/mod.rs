@@ -249,6 +249,24 @@ async fn run_prompt(
             AgentEvent::Error(_) => {
                 break;
             }
+            AgentEvent::ContextOverflow { error, .. } => {
+                // ACP has no auto-compact-and-respawn flow — the
+                // client (editor) owns submission and would re-issue
+                // on its own. Surface the friendly error and end
+                // the stream, same shape as `Error`. Same warning:
+                // the original prompt isn't lost (ACP keeps its own
+                // history), but auto-recovery is interactive-only.
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
+                    "context overflow: {}",
+                    error
+                ))));
+                let notif = SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(chunk),
+                );
+                let _ = cx.send_notification(notif);
+                break;
+            }
             // Observability markers added for the interactive UI's
             // turn tracker + interjection queue. ACP doesn't have a
             // mid-stream interjection concept (the client owns
