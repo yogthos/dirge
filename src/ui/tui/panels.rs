@@ -18,7 +18,6 @@ use ratatui::widgets::Widget;
 use crate::ui::renderer::{LeftPanelInfo, PanelData, SubagentStatusRow};
 
 use super::chat::crossterm_to_ratatui;
-use super::layout::Layout;
 
 /// One framed sub-panel: `╭─[TITLE]─╮` top, `│ content │` body,
 /// `╰─╯` bottom. Content lines are LEFT-aligned with one cell of
@@ -340,6 +339,7 @@ const _: fn(crossterm::style::Color) -> RColor = crossterm_to_ratatui;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::layout::Layout;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 

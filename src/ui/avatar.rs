@@ -54,7 +54,11 @@ impl AvatarState {
     }
 }
 
-/// Width of the avatar in terminal columns.
+/// Width of the avatar in terminal columns. Used by the avatar
+/// tests to assert each face string is exactly this many cells;
+/// production now reads the face width directly from the string
+/// length via ratatui's set_stringn.
+#[allow(dead_code)]
 pub const AVATAR_W: usize = 5;
 
 /// Return the ASCII face for the given state + animation tick. `tick`

@@ -310,6 +310,11 @@ fn marker_blocks(s: &str) -> Vec<(usize, usize, usize)> {
 }
 
 /// Compute the placeholder display string for a paste body.
+// Paste-placeholder render used by `render_line` — both currently
+// unused by production code (BottomStrip renders the buffer string
+// directly, no placeholder expansion yet). Kept for the multi-row
+// input port.
+#[allow(dead_code)]
 fn placeholder_display(text: &str) -> String {
     let lines = text.matches('\n').count() + 1;
     format!("[{} lines pasted]", lines)
@@ -461,6 +466,7 @@ impl InputEditor {
     /// Return (display_text, display_cursor_col) for a logical line of the
     /// buffer with placeholders rendered as `[N lines pasted]`. Used by the
     /// renderer so the input bar shows a compact representation.
+    #[allow(dead_code)]
     pub fn render_line(&self, line: &str, cursor_in_line: usize) -> (String, usize) {
         let blocks = marker_blocks(line);
         if blocks.is_empty() {

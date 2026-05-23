@@ -12,7 +12,6 @@
 
 use ratatui::Frame;
 use ratatui::style::{Color as RColor, Style};
-use ratatui::widgets::Widget;
 
 use super::bottom::{AvatarSpec, BottomBody, BottomStrip};
 use super::chat::{ChatPane, crossterm_to_ratatui};
