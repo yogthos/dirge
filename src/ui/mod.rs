@@ -894,17 +894,24 @@ pub async fn run_interactive(
             lsp_manager.as_ref(),
         ));
 
+        // H-R1: loop-top PM acquisitions use `try_lock` so a
+        // long-running plugin tool (holding the mutex inside
+        // spawn_blocking) doesn't freeze the UI. On contention we
+        // skip the refresh this iteration; the next iteration
+        // retries. drain_* tolerates the one-tick delay; the
+        // shortcut snapshot picks up new bindings on the next idle
+        // tick after the tool returns.
+
         // Re-snapshot plugin shortcuts (M2). A hook that called
         // harness/register-shortcut on the previous turn is now
-        // visible to the next keystroke. One Janet eval; same
-        // cost envelope as drain_notifications below.
+        // visible to the next keystroke.
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = crate::plugin::hook::global() {
-            let metas = {
-                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
-                mgr.list_shortcuts()
-            };
-            plugin_shortcuts = crate::plugin::extension::parse_shortcuts(metas);
+            if let Ok(mut mgr) = pm_arc.try_lock() {
+                let metas = mgr.list_shortcuts();
+                drop(mgr);
+                plugin_shortcuts = crate::plugin::extension::parse_shortcuts(metas);
+            }
         }
 
         // Drain any pending plugin notifications and surface each as a
@@ -913,9 +920,9 @@ pub async fn run_interactive(
         // not several events later.
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = crate::plugin::hook::global() {
-            let pending = {
-                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
-                mgr.drain_notifications()
+            let pending = match pm_arc.try_lock() {
+                Ok(mut mgr) => mgr.drain_notifications(),
+                Err(_) => Vec::new(),
             };
             for (level, msg) in pending {
                 let color = match level.as_str() {
@@ -941,9 +948,9 @@ pub async fn run_interactive(
         // no renderer is registered.
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = crate::plugin::hook::global() {
-            let drained = {
-                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
-                mgr.drain_entries()
+            let drained = match pm_arc.try_lock() {
+                Ok(mut mgr) => mgr.drain_entries(),
+                Err(_) => Vec::new(),
             };
             for (custom_type, data, display) in drained {
                 // Record into session unconditionally (display=false
@@ -965,9 +972,9 @@ pub async fn run_interactive(
         // event takes effect before the next user input is shown.
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = crate::plugin::hook::global() {
-            let ops = {
-                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
-                mgr.drain_tree_ops()
+            let ops = match pm_arc.try_lock() {
+                Ok(mut mgr) => mgr.drain_tree_ops(),
+                Err(_) => Vec::new(),
             };
             let mut any_session_replaced = false;
             for op in ops {
