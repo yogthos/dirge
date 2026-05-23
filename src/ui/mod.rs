@@ -1699,7 +1699,7 @@ pub async fn run_interactive(
                                     renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref()).await;
+                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref()).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -1710,7 +1710,7 @@ pub async fn run_interactive(
                                         let compress_result = handle_compress(
                                             instructions.as_deref(),
                                             &mut agent, &client, &mut renderer, session, cli, cfg, context,
-                                            &permission, &ask_tx, &bg_store, &sandbox,
+                                            &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
                                             #[cfg(feature = "mcp")] mcp_manager,
                                             #[cfg(feature = "semantic")] semantic_manager,
                                             #[cfg(feature = "lsp")] lsp_manager.as_ref(),
@@ -1969,7 +1969,7 @@ pub async fn run_interactive(
                                     let compact_result = handle_compress(
                                         None,
                                         &mut agent, &client, &mut renderer, session, cli, cfg, context,
-                                        &permission, &ask_tx, &bg_store, &sandbox,
+                                        &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
                                         #[cfg(feature = "mcp")] mcp_manager,
                                         #[cfg(feature = "semantic")] semantic_manager,
                                         #[cfg(feature = "lsp")] lsp_manager.as_ref(),
@@ -2618,7 +2618,7 @@ pub async fn run_interactive(
                             let compress_result = handle_compress(
                                 None,
                                 &mut agent, &client, &mut renderer, session, cli, cfg, context,
-                                &permission, &ask_tx, &bg_store, &sandbox,
+                                &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
                                 #[cfg(feature = "mcp")] mcp_manager,
                                 #[cfg(feature = "semantic")] semantic_manager,
                                 #[cfg(feature = "lsp")] lsp_manager.as_ref(),
@@ -2999,6 +2999,8 @@ pub async fn run_interactive(
                             context,
                             &permission,
                             &ask_tx,
+                            &question_tx,
+                            &plan_tx,
                             &bg_store,
                             &sandbox,
                             #[cfg(feature = "mcp")]

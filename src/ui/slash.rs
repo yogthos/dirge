@@ -107,6 +107,14 @@ pub async fn handle_compress(
     context: &mut ContextFiles,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
+    // Audit followup (companion to C8 LSP fix): question_tx +
+    // plan_tx were previously passed as None when this function
+    // rebuilt the agent post-compact. Tools that depend on either
+    // (the `question` tool, plan-mode switch hooks) silently
+    // broke after every auto-compact + manual /compress. Thread
+    // the channels through.
+    question_tx: &Option<crate::agent::tools::question::QuestionSender>,
+    plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
     bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
     sandbox: &Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
@@ -224,8 +232,8 @@ pub async fn handle_compress(
         context,
         permission.clone(),
         ask_tx.clone(),
-        None,
-        None,
+        question_tx.clone(),
+        plan_tx.clone(),
         bg_store.clone(),
         #[cfg(feature = "lsp")]
         lsp_manager.cloned(),
@@ -283,6 +291,13 @@ pub async fn handle_slash(
     input: &mut InputEditor,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
+    // Audit followup: same threading as ask_tx — every build_agent
+    // rebuild inside handle_slash previously passed None for
+    // question_tx + plan_tx, silently killing the `question` tool
+    // and plan-switch hooks after any rebuild-triggering slash
+    // command. Companion to the C8 LSP fix.
+    question_tx: &Option<crate::agent::tools::question::QuestionSender>,
+    plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
     todo_tools_enabled: &mut bool,
     bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
     sandbox: &Sandbox,
@@ -311,8 +326,8 @@ pub async fn handle_slash(
                     context,
                     permission.clone(),
                     ask_tx.clone(),
-                    None,
-                    None,
+                    question_tx.clone(),
+                    plan_tx.clone(),
                     bg_store.clone(),
                     #[cfg(feature = "lsp")]
                     lsp_manager.cloned(),
@@ -482,8 +497,8 @@ pub async fn handle_slash(
                                 context,
                                 permission.clone(),
                                 ask_tx.clone(),
-                                None,
-                                None,
+                                question_tx.clone(),
+                                plan_tx.clone(),
                                 bg_store.clone(),
                                 #[cfg(feature = "lsp")]
                                 lsp_manager.cloned(),
@@ -719,8 +734,8 @@ pub async fn handle_slash(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
-                        None,
-                        None,
+                        question_tx.clone(),
+                        plan_tx.clone(),
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
                         lsp_manager.cloned(),
@@ -907,8 +922,8 @@ pub async fn handle_slash(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
-                        None,
-                        None,
+                        question_tx.clone(),
+                        plan_tx.clone(),
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
                         lsp_manager.cloned(),
@@ -941,8 +956,8 @@ pub async fn handle_slash(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
-                        None,
-                        None,
+                        question_tx.clone(),
+                        plan_tx.clone(),
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
                         lsp_manager.cloned(),
@@ -994,8 +1009,8 @@ pub async fn handle_slash(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
-                        None,
-                        None,
+                        question_tx.clone(),
+                        plan_tx.clone(),
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
                         lsp_manager.cloned(),
@@ -1105,8 +1120,8 @@ pub async fn handle_slash(
                     context,
                     permission.clone(),
                     ask_tx.clone(),
-                    None,
-                    None,
+                    question_tx.clone(),
+                    plan_tx.clone(),
                     bg_store.clone(),
                     #[cfg(feature = "lsp")]
                     lsp_manager.cloned(),
@@ -1334,8 +1349,8 @@ pub async fn handle_slash(
                         context,
                         permission.clone(),
                         ask_tx.clone(),
-                        None,
-                        None,
+                        question_tx.clone(),
+                        plan_tx.clone(),
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
                         lsp_manager.cloned(),
