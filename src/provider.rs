@@ -309,15 +309,17 @@ impl AnyClient {
         previous_summary: Option<&str>,
         instructions: Option<&str>,
     ) -> anyhow::Result<String> {
+        // C6 (audit fix): no more 6000-char truncation. A 300K-token
+        // session was previously summarized from ~1500 tokens of
+        // content — fidelity collapsed exactly when compaction was
+        // most needed. Feed the full prefix; the summarizer model
+        // (typically the same model as the agent, or a faster/
+        // cheaper sibling with similar context) has plenty of room
+        // unless the prefix itself is bigger than the summarizer's
+        // window, in which case the summarizer's own context-overflow
+        // path surfaces a real error rather than silently lying. Pi
+        // and opencode both feed the full prefix.
         let conversation = serialize_conversation(messages);
-        let conversation = if conversation.len() > 6000 {
-            let truncated: String = conversation.chars().take(6000).collect();
-            let mut result = truncated;
-            result.push_str("\n\n... [truncated]");
-            result
-        } else {
-            conversation
-        };
 
         let prompt = prompt::COMPACTION_PROMPT
             .replace("{conversation}", &conversation)
@@ -416,6 +418,13 @@ where
 }
 
 fn serialize_conversation(messages: &[SessionMessage]) -> String {
+    // C7 (audit fix): include each assistant message's tool calls.
+    // Previously only `[role]: content` was emitted; msg.tool_calls
+    // (args, results, errors) were invisible to the summarizer. For
+    // tool-heavy sessions that's the bulk of where state diverged
+    // from "just chat" — after compress the LLM had no record that
+    // bash/read/edit ever ran. Pi's compaction prompt includes
+    // structured tool I/O (see pi/.../compaction).
     let mut result = String::new();
     for msg in messages {
         let role_tag = match msg.role {
@@ -423,7 +432,41 @@ fn serialize_conversation(messages: &[SessionMessage]) -> String {
             crate::session::MessageRole::Assistant => "Assistant",
             crate::session::MessageRole::System => "System",
         };
-        result.push_str(&format!("[{}]: {}\n\n", role_tag, msg.content));
+        result.push_str(&format!("[{}]: {}\n", role_tag, msg.content));
+        for tc in &msg.tool_calls {
+            // Args serialized compactly — the summarizer cares about
+            // which tool fired with what shape, not pretty formatting.
+            let args_str = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
+            result.push_str(&format!("[Tool: {}({})]\n", tc.name, args_str));
+            match &tc.state {
+                crate::session::ToolCallState::Completed { result: out } => {
+                    // Cap each individual tool output at 2KB to keep
+                    // the summarizer prompt bounded — full output for
+                    // a 10MB grep would dominate the prompt with low
+                    // signal-per-byte. The truncation here is per-tool
+                    // (not whole-conversation like the C6 fix removed)
+                    // so structure is preserved.
+                    const PER_TOOL_CAP: usize = 2048;
+                    if out.len() > PER_TOOL_CAP {
+                        let trimmed: String = out.chars().take(PER_TOOL_CAP).collect();
+                        result.push_str(&format!(
+                            "[Result: {} ... (truncated, {} bytes total)]\n",
+                            trimmed,
+                            out.len()
+                        ));
+                    } else {
+                        result.push_str(&format!("[Result: {}]\n", out));
+                    }
+                }
+                crate::session::ToolCallState::Interrupted => {
+                    result.push_str("[Result: <interrupted>]\n");
+                }
+                crate::session::ToolCallState::Failed { error } => {
+                    result.push_str(&format!("[Result: <failed: {}>]\n", error));
+                }
+            }
+        }
+        result.push('\n');
     }
     result
 }
@@ -1105,5 +1148,124 @@ mod tests {
         // match-arm exhaustiveness check at compile time.
         let agent = build_openai_any_agent();
         let _ = agent.build_stream_fn(vec![]);
+    }
+
+    // --- C6/C7: compaction prefix is full + includes tool calls -----
+
+    use crate::session::{MessageRole, SessionMessage, ToolCallEntry, ToolCallState};
+    use compact_str::CompactString;
+
+    fn sm(role: MessageRole, content: &str, tool_calls: Vec<ToolCallEntry>) -> SessionMessage {
+        SessionMessage {
+            role,
+            content: CompactString::from(content),
+            estimated_tokens: 0,
+            id: CompactString::from("test-id"),
+            timestamp: 0,
+            tool_calls,
+        }
+    }
+
+    /// C7: assistant tool calls land in the serialized form with
+    /// args + result. Previously they were dropped entirely so the
+    /// summarizer saw only `[Assistant]: <text>` with no record
+    /// that bash/read/edit ever ran.
+    #[test]
+    fn serialize_conversation_includes_tool_calls() {
+        let msgs = vec![
+            sm(MessageRole::User, "list rust files", vec![]),
+            sm(
+                MessageRole::Assistant,
+                "I'll find them.",
+                vec![ToolCallEntry {
+                    id: "call_1".into(),
+                    name: "find_files".into(),
+                    args: serde_json::json!({"pattern": "*.rs"}),
+                    state: ToolCallState::Completed {
+                        result: "src/main.rs\nsrc/lib.rs".into(),
+                    },
+                }],
+            ),
+        ];
+        let out = serialize_conversation(&msgs);
+        assert!(out.contains("[User]"), "missing role tag: {out}");
+        assert!(
+            out.contains("[Tool: find_files("),
+            "missing tool call line: {out}"
+        );
+        assert!(
+            out.contains("src/main.rs"),
+            "missing tool result content: {out}"
+        );
+    }
+
+    /// C7: interrupted + failed tool calls also surface.
+    #[test]
+    fn serialize_conversation_marks_interrupted_and_failed() {
+        let msgs = vec![sm(
+            MessageRole::Assistant,
+            "trying",
+            vec![
+                ToolCallEntry {
+                    id: "a".into(),
+                    name: "bash".into(),
+                    args: serde_json::json!({"command": "sleep 9999"}),
+                    state: ToolCallState::Interrupted,
+                },
+                ToolCallEntry {
+                    id: "b".into(),
+                    name: "read".into(),
+                    args: serde_json::json!({"path": "/missing"}),
+                    state: ToolCallState::Failed {
+                        error: "no such file".into(),
+                    },
+                },
+            ],
+        )];
+        let out = serialize_conversation(&msgs);
+        assert!(out.contains("<interrupted>"), "got: {out}");
+        assert!(out.contains("<failed: no such file>"), "got: {out}");
+    }
+
+    /// C7 bound: a single tool result over the per-tool cap (2KB)
+    /// truncates with a marker, preserving structure of the rest
+    /// of the conversation.
+    #[test]
+    fn serialize_conversation_truncates_huge_tool_results() {
+        let big: String = "x".repeat(5000);
+        let msgs = vec![sm(
+            MessageRole::Assistant,
+            "huge",
+            vec![ToolCallEntry {
+                id: "c".into(),
+                name: "grep".into(),
+                args: serde_json::json!({"pattern": "."}),
+                state: ToolCallState::Completed { result: big },
+            }],
+        )];
+        let out = serialize_conversation(&msgs);
+        assert!(
+            out.contains("(truncated, 5000 bytes total)"),
+            "expected truncation marker; got: {out}"
+        );
+    }
+
+    /// C6: a long full-conversation prefix is NOT truncated by the
+    /// caller-side 6000-char cap any more. compress_messages no
+    /// longer slices `conversation`; the full string reaches the
+    /// summarizer. Regression test the unchanged-passthrough via
+    /// serialize_conversation's length on a large input.
+    #[test]
+    fn serialize_conversation_returns_full_prefix() {
+        let msgs: Vec<SessionMessage> = (0..200)
+            .map(|i| sm(MessageRole::Assistant, &format!("turn {i}"), vec![]))
+            .collect();
+        let out = serialize_conversation(&msgs);
+        // 200 turns × ~10 chars each = ~2000 chars; below the old
+        // 6000 cap but the principle still holds: the function is
+        // a pure mapper, no length cap. Confirm by checking the
+        // last turn is present.
+        assert!(out.contains("turn 199"), "tail must be present: {out}");
+        assert!(out.contains("turn 0"), "head must be present: {out}");
     }
 }

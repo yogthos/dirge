@@ -4,7 +4,9 @@ use tokio::process::Command;
 use tokio::time::Duration;
 
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError, check_perm, check_perm_path};
+#[cfg(feature = "semantic-bash")]
+use crate::agent::tools::check_perm_path;
+use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError, check_perm};
 
 use crate::sandbox::Sandbox;
 #[cfg(feature = "semantic-bash")]
