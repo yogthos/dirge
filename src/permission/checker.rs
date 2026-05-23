@@ -150,6 +150,31 @@ impl PermissionChecker {
             rules.insert(tool_name.to_string(), entries);
         }
 
+        // M2 (dirge-cep): merge the unified `tools` map. New configs
+        // can declare rules for ANY tool name (including plugin / MCP
+        // / future tools) without extending `PermissionConfig`. If a
+        // tool is named in both the legacy per-field surface and the
+        // `tools` map, the map wins — it's the explicit, newer shape
+        // and the migration path is "move per-tool fields into
+        // tools". `mcp_tool` (and the other umbrella names) take the
+        // same syntax: `tools: { mcp_tool: { "mcp_tool:fs:*": "deny" } }`.
+        if let Some(tools_map) = &config.tools {
+            for (tool_name, tp) in tools_map {
+                let mut entries = Vec::new();
+                match tp {
+                    ToolPerm::Simple(action) => {
+                        entries.push((pattern_for_tool(tool_name, "*"), *action));
+                    }
+                    ToolPerm::Granular(map) => {
+                        for (pat, action) in map {
+                            entries.push((pattern_for_tool(tool_name, pat), *action));
+                        }
+                    }
+                }
+                rules.insert(tool_name.clone(), entries);
+            }
+        }
+
         if !rules.contains_key("bash") {
             let mut defaults = Vec::new();
             for (pat, action) in crate::permission::default_bash_rules() {
@@ -798,6 +823,61 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// M2 (dirge-cep): the unified `tools` map at the top of
+    /// `PermissionConfig` lets rules be declared for ANY tool name
+    /// (including ones dirge doesn't ship per-tool struct fields
+    /// for — plugin-registered tools, future tools). Pin three
+    /// invariants:
+    ///   1. A rule in `tools` for a tool name with no legacy field
+    ///      is honored.
+    ///   2. A rule in `tools` for a tool name that ALSO has a
+    ///      legacy field overrides the legacy field (explicit
+    ///      newer shape wins).
+    ///   3. The `Simple(action)` shape (string shorthand for
+    ///      `{"*": action}`) works in the map.
+    #[test]
+    fn tools_map_unified_schema_honored_and_overrides_legacy() {
+        use crate::permission::{PermissionConfig, ToolPerm};
+        use std::collections::HashMap;
+
+        // Tool with no legacy field — only reachable via `tools`.
+        let mut tools_map = HashMap::new();
+        let mut plugin_rules = HashMap::new();
+        plugin_rules.insert("dangerous".to_string(), Action::Deny);
+        tools_map.insert(
+            "plugin_xyz".to_string(),
+            ToolPerm::Granular(plugin_rules),
+        );
+
+        // Tool with a legacy field — map version should win.
+        tools_map.insert("websearch".to_string(), ToolPerm::Simple(Action::Deny));
+
+        let config = PermissionConfig {
+            // Legacy field says Allow…
+            websearch: Some(ToolPerm::Simple(Action::Allow)),
+            tools: Some(tools_map),
+            ..Default::default()
+        };
+
+        let mut checker = PermissionChecker::new(
+            &config,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        );
+
+        // (1) tools-only entry honored.
+        assert!(matches!(
+            checker.check("plugin_xyz", "dangerous"),
+            CheckResult::Denied(_)
+        ));
+
+        // (2) tools map overrides legacy field.
+        assert!(matches!(
+            checker.check("websearch", "anything"),
+            CheckResult::Denied(_)
+        ));
     }
 
     /// Adversarial-review #1: the deny-list match must also fire for

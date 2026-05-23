@@ -101,6 +101,34 @@ pub struct PermissionConfig {
     pub mcp_tool: Option<ToolPerm>,
     pub external_directory: Option<HashMap<String, Action>>,
     pub doom_loop: Option<Action>,
+    /// M2 (dirge-cep): unified per-tool rule map. Lets a user write
+    /// rules for ANY tool name (including plugin / MCP / future-added
+    /// tools) without dirge extending its `PermissionConfig` struct.
+    ///
+    /// Schema (JSON):
+    /// ```json
+    /// "permission": {
+    ///   "tools": {
+    ///     "bash":       { "rm *": "deny", "git *": "allow" },
+    ///     "write":      { "/etc/**": "deny", "**": "ask" },
+    ///     "skill":      "allow",
+    ///     "plugin_xyz": "ask"
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// Mirrors opencode's permission shape (Schema.StructWithRest with
+    /// Schema.Record(String, Rule)) and maki's per-tool TOML sections.
+    /// Coexists with the legacy per-tool fields above for back-compat:
+    /// both are merged into the same `HashMap<tool, Vec<(Pattern,
+    /// Action)>>` inside `PermissionChecker::new`. If both name the
+    /// same tool, the `tools` map wins (it's the explicit new shape).
+    ///
+    /// Deprecation path: the legacy `bash`/`read`/`write`/... fields
+    /// stay through one release cycle, then get removed once docs and
+    /// example configs migrate to `tools`. Internally the checker
+    /// treats them as syntactic sugar for `tools.{name}`.
+    pub tools: Option<HashMap<String, ToolPerm>>,
 }
 
 /// Per-session security mode. Selected via `--yolo` / `--accept-all` /
