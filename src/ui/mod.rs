@@ -899,6 +899,14 @@ pub async fn run_interactive(
     let mut subagent_chat_map: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
+    // dirge-gek: per-subagent state for the left-gutter panel.
+    // Ordered by insertion so the most-recently-spawned tasks sit
+    // at the top of the panel (matches the chat-window ordering in
+    // /tasks). Each entry holds (state, prompt) — state is one of
+    // "running" / "completed" / "failed".
+    let mut subagent_panel_rows: indexmap::IndexMap<String, (String, String)> =
+        indexmap::IndexMap::new();
+
     // Last collapsed tool result, re-printable by Ctrl+O. Each
     // `render_tool_output` call that truncates the body stashes the
     // (tool, args-banner, full-output) tuple here; Ctrl+O reprints
@@ -4320,6 +4328,25 @@ pub async fn run_interactive(
                 // — or sees it scroll into view if they're already
                 // on that chat when the event fires.
                 use crate::agent::tools::task::SubagentChatEvent as E;
+                // dirge-gek: track lifecycle for the left panel.
+                // Build a fresh status snapshot after the match
+                // arm updates `subagent_panel_rows`.
+                match &chat_evt {
+                    E::Spawn { id, prompt } => {
+                        subagent_panel_rows
+                            .insert(id.clone(), ("running".to_string(), prompt.clone()));
+                    }
+                    E::Complete { id, .. } => {
+                        if let Some((state, _)) = subagent_panel_rows.get_mut(id) {
+                            *state = "completed".to_string();
+                        }
+                    }
+                    E::Failed { id, .. } => {
+                        if let Some((state, _)) = subagent_panel_rows.get_mut(id) {
+                            *state = "failed".to_string();
+                        }
+                    }
+                }
                 match chat_evt {
                     E::Spawn { id, prompt } => {
                         // Truncate the prompt to a short chat name
@@ -4377,6 +4404,26 @@ pub async fn run_interactive(
                         }
                     }
                 }
+
+                // dirge-gek: push the updated panel snapshot to the
+                // renderer. Build from `subagent_panel_rows` so
+                // ordering matches insertion (oldest at top).
+                // Trigger a viewport repaint so the gutter
+                // refreshes without waiting for the next chat
+                // event / keystroke.
+                let panel_rows: Vec<crate::ui::renderer::SubagentStatusRow> =
+                    subagent_panel_rows
+                        .iter()
+                        .map(|(id, (state, prompt))| {
+                            crate::ui::renderer::SubagentStatusRow {
+                                id_short: id.chars().take(6).collect(),
+                                state: state.clone(),
+                                prompt_short: prompt.lines().next().unwrap_or("").to_string(),
+                            }
+                        })
+                        .collect();
+                renderer.set_subagent_status(panel_rows);
+                renderer.render_viewport()?;
 
                 // dirge-9xo: auto-resume the parent agent when a
                 // background subagent finishes and the parent is

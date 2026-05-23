@@ -303,6 +303,15 @@ impl Renderer {
         self.panel_mode
     }
 
+    /// dirge-gek: replace the subagent panel data. UI loop calls this
+    /// on each subagent lifecycle event (Spawn / Complete / Failed)
+    /// + on Ctrl-N/P chat switch so the panel reflects current
+    /// state. Cheap — just swaps the Vec; the next `render_viewport`
+    /// repaints the gutter.
+    pub fn set_subagent_status(&mut self, rows: Vec<SubagentStatusRow>) {
+        self.subagent_status = rows;
+    }
+
     pub fn set_panel_data(&mut self, data: PanelData) {
         self.panel_data = data;
     }
@@ -821,7 +830,87 @@ impl Renderer {
             self.draw_panel(&mut stdout, rows)?;
         }
 
+        // dirge-gek: paint the LEFT subagent panel after the chat
+        // content + right panel. Painting last keeps the gutter
+        // current with the chat scroll without forcing an extra
+        // full redraw on every chat update.
+        self.draw_left_panel(&mut stdout, rows)?;
+
         stdout.flush()?;
+        Ok(())
+    }
+
+    /// dirge-gek: paint the subagent overview in the left gutter.
+    /// Uses the area between col 0 and `content_indent`, rows 0
+    /// through `input_top - 3` (leaving the bottom 3 rows free for
+    /// the avatar). No-op when the gutter is too narrow (< 16 cols)
+    /// or there are no subagents to surface.
+    ///
+    /// One row per subagent: `<glyph> <id> <prompt>` where glyph
+    /// signals state (running=⋯, completed=✓, failed=✗). Each
+    /// field is truncated to fit the gutter width.
+    fn draw_left_panel(&self, stdout: &mut io::Stdout, rows: u16) -> io::Result<()> {
+        if self.subagent_status.is_empty() {
+            return Ok(());
+        }
+        let indent = self.content_indent();
+        // Need ≥16 cols of gutter for the panel to read meaningfully
+        // (glyph + space + 6-char id + space + 6+-char prompt).
+        if indent < 16 {
+            return Ok(());
+        }
+        // Leave the bottom 3 rows for the avatar.
+        let avatar_reserve: u16 = 3;
+        let panel_bottom = rows.saturating_sub(self.input_rows + 1 + avatar_reserve);
+        if panel_bottom == 0 {
+            return Ok(());
+        }
+        let dim = self.color(crate::ui::theme::dim());
+        let header_color = self.color(crate::ui::theme::header());
+        let agent = self.color(crate::ui::theme::agent());
+        let err = self.color(crate::ui::theme::system());
+
+        // Header row.
+        stdout.execute(MoveTo(0, 0))?;
+        write!(stdout, "{}", " ".repeat(indent.saturating_sub(1)))?;
+        stdout.execute(MoveTo(0, 0))?;
+        write!(stdout, "{}", SetForegroundColor(header_color))?;
+        write!(stdout, "SUBAGENTS")?;
+        write!(stdout, "{}", ResetColor)?;
+
+        // Rows. Cap at the available height; oldest entries drop off.
+        let row_budget = (panel_bottom.saturating_sub(1)) as usize;
+        let show = self.subagent_status.iter().take(row_budget);
+        for (i, row) in show.enumerate() {
+            let y = (i as u16).saturating_add(1);
+            if y >= panel_bottom {
+                break;
+            }
+            stdout.execute(MoveTo(0, y))?;
+            // Wipe the row first so a previous longer entry doesn't
+            // leave fossil characters.
+            write!(stdout, "{}", " ".repeat(indent.saturating_sub(1)))?;
+            stdout.execute(MoveTo(0, y))?;
+            let (glyph, color) = match row.state.as_str() {
+                "running" => ("⋯", agent),
+                "completed" => ("✓", agent),
+                "failed" => ("✗", err),
+                _ => ("·", dim),
+            };
+            write!(stdout, "{}", SetForegroundColor(color))?;
+            write!(stdout, "{} ", glyph)?;
+            write!(stdout, "{}", SetForegroundColor(dim))?;
+            // 6-char short id + space.
+            let id_field: String = row.id_short.chars().take(6).collect();
+            write!(stdout, "{:6} ", id_field)?;
+            // Prompt fills the rest of the gutter (minus 2 for the
+            // glyph/space and 7 for the id/space).
+            write!(stdout, "{}", SetForegroundColor(agent))?;
+            let prompt_max = indent.saturating_sub(2 + 7 + 1);
+            let prompt_field: String = row.prompt_short.chars().take(prompt_max).collect();
+            write!(stdout, "{}", prompt_field)?;
+            write!(stdout, "{}", ResetColor)?;
+        }
         Ok(())
     }
 
