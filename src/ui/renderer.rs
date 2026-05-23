@@ -266,21 +266,22 @@ impl Renderer {
     pub fn buffer_pos_at(&self, row: u16, col: u16) -> Option<(usize, usize)> {
         let line_idx = self.buffer_line_at_row(row)?;
         let entry = self.buffer.get(line_idx)?;
-        // L-R3: clamp to the VISIBLE char count (post ANSI strip),
-        // not the raw count which includes escape bytes. The column
-        // coming in is a display offset (terminal col − indent),
-        // and `selected_text` indexes the strip_ansi-ed line, so
-        // the two must agree on units. Pre-fix this was
-        // entry.text.chars().count() which over-permitted for
-        // styled lines (markdown-rendered text with embedded SGR).
-        let line_len = crate::ui::ansi::strip_ansi(&entry.text).chars().count();
+        // L-R3 + B3-8: the column coming in is a DISPLAY offset
+        // (terminal col − indent), but `selected_text` indexes
+        // the strip_ansi-ed line by CHAR. For ASCII the two are
+        // equivalent; for CJK / emoji a display column maps to
+        // half as many chars. Walk the visible string accumulating
+        // display widths until we reach the target column; return
+        // the char index at that point.
+        let clean = crate::ui::ansi::strip_ansi(&entry.text);
         let indent = self.content_indent() as u16;
-        let char_col = if col < indent {
+        let display_col = if col < indent {
             0
         } else {
             (col - indent) as usize
         };
-        Some((line_idx, char_col.min(line_len)))
+        let char_col = display_col_to_char_index(&clean, display_col);
+        Some((line_idx, char_col))
     }
 
     pub fn buffer_line_at_row(&self, row: u16) -> Option<usize> {
@@ -1455,7 +1456,23 @@ pub(crate) fn wrap_input(
     let mut cursor_visual_col = 0usize;
 
     for (li, line) in display_lines.iter().enumerate() {
+        // B3-8 (audit fix): the cursor end-of-line detection
+        // previously compared `cursor_display_col == char_count`,
+        // misfiring on lines containing wide chars (CJK / emoji)
+        // because col is a DISPLAY column and char_count is a
+        // CHAR count. For a line like "日本" with cursor at the
+        // end, col=4 (display cells) but char_count=2 — the
+        // comparison failed and the cursor wrapped to row 1.
+        // Compare against the line's display WIDTH instead.
+        //
+        // Row count and char_start/char_end slicing remain in
+        // CHAR units (callers slice the chars vector). For pure
+        // ASCII this is equivalent. Lines with wide chars + soft-
+        // wrap can still split mid-double-width but the cursor
+        // position math is correct.
+        use unicode_width::UnicodeWidthStr;
         let char_count = line.chars().count();
+        let display_width = UnicodeWidthStr::width(line.as_str());
         let row_count = if char_count == 0 {
             1
         } else {
@@ -1467,7 +1484,7 @@ pub(crate) fn wrap_input(
 
         if li == cursor_line_idx {
             let col = cursor_display_col;
-            let (vr, vc) = if col > 0 && col == char_count && col.is_multiple_of(wrap_width) {
+            let (vr, vc) = if col > 0 && col == display_width && col.is_multiple_of(wrap_width) {
                 // End of a line that exactly fills the last row — stay on
                 // the filled row, position cursor past its last char.
                 (col / wrap_width - 1, wrap_width)
@@ -1494,6 +1511,35 @@ pub(crate) fn wrap_input(
     }
 
     (rows, cursor_visual_row, cursor_visual_col)
+}
+
+/// B3-8: map a DISPLAY column on `s` to its CHAR index. ASCII-only
+/// strings return `display_col` verbatim; lines containing CJK /
+/// emoji compress to half the char count for full-width glyphs.
+/// Clamps to the line's char count when `display_col` overshoots.
+///
+/// Used by `Renderer::buffer_pos_at` so mouse drag → clipboard
+/// selection lines up with the visible characters on screen,
+/// not the raw char positions which would mis-land in the middle
+/// of double-width glyphs.
+pub(crate) fn display_col_to_char_index(s: &str, display_col: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut acc = 0usize;
+    for (char_idx, ch) in s.chars().enumerate() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if acc >= display_col {
+            return char_idx;
+        }
+        // If adding this char's width would cross the target,
+        // anchor on the boundary BEFORE the char (so a click in
+        // the middle of a 2-cell glyph lands at the glyph's start,
+        // not after it).
+        if acc + w > display_col {
+            return char_idx;
+        }
+        acc += w;
+    }
+    s.chars().count()
 }
 
 /// Truncate a string from the LEFT so the tail survives when content
@@ -1862,6 +1908,42 @@ mod tests {
         // after saturating, idx = row).
         let pos = r.buffer_pos_at(0, 999);
         assert_eq!(pos, Some((0, 5)));
+    }
+
+    // --- B3-8: display-width-aware column mapping --------------
+
+    #[test]
+    fn display_col_to_char_index_ascii_round_trip() {
+        // ASCII: 1 char = 1 display cell. char_index == display_col.
+        assert_eq!(display_col_to_char_index("hello", 0), 0);
+        assert_eq!(display_col_to_char_index("hello", 3), 3);
+        assert_eq!(display_col_to_char_index("hello", 5), 5);
+        // Past EOL clamps to char count.
+        assert_eq!(display_col_to_char_index("hello", 99), 5);
+    }
+
+    #[test]
+    fn display_col_to_char_index_cjk_compresses() {
+        // "日本" — 2 chars, 4 display cells.
+        let s = "日本";
+        assert_eq!(display_col_to_char_index(s, 0), 0);
+        // Display col 1: middle of 日 — anchor to its start (char 0).
+        assert_eq!(display_col_to_char_index(s, 1), 0);
+        assert_eq!(display_col_to_char_index(s, 2), 1); // start of 本
+        assert_eq!(display_col_to_char_index(s, 3), 1); // middle of 本
+        assert_eq!(display_col_to_char_index(s, 4), 2); // EOL
+        assert_eq!(display_col_to_char_index(s, 99), 2);
+    }
+
+    #[test]
+    fn display_col_to_char_index_emoji() {
+        // "a🦀b" — 3 chars, widths 1 + 2 + 1 = 4 cells.
+        let s = "a🦀b";
+        assert_eq!(display_col_to_char_index(s, 0), 0); // start
+        assert_eq!(display_col_to_char_index(s, 1), 1); // start of 🦀
+        assert_eq!(display_col_to_char_index(s, 2), 1); // middle of 🦀
+        assert_eq!(display_col_to_char_index(s, 3), 2); // start of b
+        assert_eq!(display_col_to_char_index(s, 4), 3); // EOL
     }
 
     /// L-R3: buffer_pos_at clamps to VISIBLE char count (post ANSI
