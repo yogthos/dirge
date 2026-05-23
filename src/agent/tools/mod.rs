@@ -217,91 +217,92 @@ async fn handle_ask_inner(
     }
 }
 
-pub async fn check_perm(
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    tool: &str,
-    input_key: &str,
-) -> Result<(), ToolError> {
-    let Some(perm) = permission else {
-        return Ok(());
-    };
-    let result = {
-        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check(tool, input_key)
-    };
-    match result {
-        CheckResult::Allowed => Ok(()),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
-            };
-            handle_ask_inner(tx, perm, tool, input_key).await
-        }
-    }
+/// Scope arg passed to the [`enforce`] chokepoint. Discriminates
+/// path-style checks (`Path` / `PathResolve`, route through
+/// `PermissionChecker::check_path`, glob with `*` excluding `/`) from
+/// raw checks (`Raw`, route through `PermissionChecker::check`, shell-
+/// style patterns where `*` matches across `/`).
+///
+/// `PathResolve` additionally canonicalizes the path (resolving
+/// symlinks, normalizing `..`) and returns the resolved path so the
+/// calling tool can open EXACTLY the path the user authorized
+/// (audit H12 — TOCTOU symlink swap defense).
+pub enum Scope<'a> {
+    /// Non-path tool input. Examples: a bash command string, an MCP
+    /// `server:tool` identifier, a grep pattern, a URL.
+    Raw(&'a str),
+    /// Filesystem path; check_path-style rule matching.
+    Path(&'a str),
+    /// Filesystem path with canonical resolution returned in the
+    /// `Ok` value of [`enforce`]. Use this from tools that follow
+    /// the permission check with a file open (read / write / edit /
+    /// apply_patch) — the resolved path pins the file across the
+    /// check↔open window.
+    PathResolve(&'a str),
 }
 
-pub async fn check_perm_path(
+/// **Single chokepoint for all tool permission decisions in dirge.**
+///
+/// Ported from maki's `PermissionManager::enforce`
+/// (`maki-agent/src/permissions.rs:283-350`): one function, one
+/// signature, internal dispatch based on [`Scope`]. The legacy
+/// `check_perm` / `check_perm_path` / `check_perm_path_resolve`
+/// trio are retained as thin back-compat wrappers that delegate
+/// here, so existing call sites continue to compile unchanged.
+///
+/// Returns the (possibly canonicalized) scope string on success.
+/// `Raw` and `Path` scopes echo their input; `PathResolve` returns
+/// the canonical path. Callers that don't need the return value
+/// can discard with `enforce(...).await?;`.
+///
+/// Future milestones planning to compose against this chokepoint:
+///   - **M2 (dirge-cep)**: replace per-tool `PermissionConfig`
+///     fields with a uniform rule schema. `enforce` keeps its
+///     signature; only the underlying checker changes.
+///   - **M3 (dirge-6ab)**: tree-sitter-parse bash commands inside
+///     `enforce` and recurse per-segment so `git diff && rm -rf /`
+///     gets BOTH `git` AND `rm` checked. Currently the bash tool
+///     does its own segmenting in [`crate::agent::tools::bash`];
+///     M3 collapses that into the chokepoint.
+///   - **M4 (dirge-ojn)**: flip unmatched-tool default from Allow
+///     to Ask. Pure config change inside the underlying checker.
+pub async fn enforce(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     tool: &str,
-    path: &str,
-) -> Result<(), ToolError> {
-    let Some(perm) = permission else {
-        return Ok(());
-    };
-    let result = {
-        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check_path(tool, path)
-    };
-    match result {
-        CheckResult::Allowed => Ok(()),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
-            };
-            handle_ask_inner(tx, perm, tool, path).await
-        }
-    }
-}
-
-/// Same as `check_perm_path` but additionally returns the canonical
-/// path the check resolved to (symlinks followed, `..` normalized).
-/// Tools that perform a follow-up file operation (read/edit/write/
-/// apply_patch) should pass this canonical path to the file API
-/// instead of re-using the original `args.path`. Without this, the
-/// OS dereferences the symlink a SECOND time at open, and a swap
-/// between check-time and open-time lands the operation on a
-/// different file than the one the user authorized (audit H12).
-pub async fn check_perm_path_resolve(
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    tool: &str,
-    path: &str,
+    scope: Scope<'_>,
 ) -> Result<String, ToolError> {
-    let Some(perm) = permission else {
-        // No permission checker (e.g. ACP path) — pass the path
-        // through unchanged. We still want callers to operate on
-        // SOME resolved form, but without a checker we can't pin
-        // an authoritative canonical path.
-        return Ok(path.to_string());
+    let raw_scope: &str = match &scope {
+        Scope::Raw(s) | Scope::Path(s) | Scope::PathResolve(s) => s,
     };
+
+    let Some(perm) = permission else {
+        // No checker installed (e.g. ACP / --no-tools paths). Pass
+        // through with the original scope text — matches the legacy
+        // `check_perm_path_resolve` fallback. Raw/Path callers
+        // discard the return; PathResolve callers see the
+        // unchanged input.
+        return Ok(raw_scope.to_string());
+    };
+
     let (result, resolved) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        let resolved = guard.resolve_path_for_tool(path);
-        let r = guard.check_path(tool, path);
-        (r, resolved)
+        match &scope {
+            Scope::Raw(key) => (guard.check(tool, key), raw_scope.to_string()),
+            Scope::Path(path) => (guard.check_path(tool, path), raw_scope.to_string()),
+            Scope::PathResolve(path) => {
+                // Compute resolved BEFORE check_path so a `Denied`
+                // result still gets the canonical path back for
+                // the (currently-discarded) error path. Cheap —
+                // just a canonicalize call on the underlying
+                // checker's cached path.
+                let resolved = guard.resolve_path_for_tool(path);
+                let r = guard.check_path(tool, path);
+                (r, resolved)
+            }
+        }
     };
+
     match result {
         CheckResult::Allowed => Ok(resolved),
         CheckResult::Denied(reason) => {
@@ -313,10 +314,57 @@ pub async fn check_perm_path_resolve(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, path).await?;
+            handle_ask_inner(tx, perm, tool, raw_scope).await?;
             Ok(resolved)
         }
     }
+}
+
+/// Back-compat wrapper for the legacy non-path check. Delegates to
+/// [`enforce`] with [`Scope::Raw`]. New code should call `enforce`
+/// directly.
+pub async fn check_perm(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    input_key: &str,
+) -> Result<(), ToolError> {
+    enforce(permission, ask_tx, tool, Scope::Raw(input_key))
+        .await
+        .map(|_| ())
+}
+
+/// Back-compat wrapper for the legacy path check. Delegates to
+/// [`enforce`] with [`Scope::Path`]. New code should call `enforce`
+/// directly.
+pub async fn check_perm_path(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    path: &str,
+) -> Result<(), ToolError> {
+    enforce(permission, ask_tx, tool, Scope::Path(path))
+        .await
+        .map(|_| ())
+}
+
+/// Back-compat wrapper for the legacy resolve-and-check entrypoint.
+/// Delegates to [`enforce`] with [`Scope::PathResolve`] and returns
+/// the canonical path. New code should call `enforce` directly.
+///
+/// Tools that perform a follow-up file operation (read/edit/write/
+/// apply_patch) MUST pass this canonical path to the file API
+/// instead of re-using the original `args.path`. Without this, the
+/// OS dereferences the symlink a SECOND time at open, and a swap
+/// between check-time and open-time lands the operation on a
+/// different file than the one the user authorized (audit H12).
+pub async fn check_perm_path_resolve(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    path: &str,
+) -> Result<String, ToolError> {
+    enforce(permission, ask_tx, tool, Scope::PathResolve(path)).await
 }
 
 // `is_plan_file` and `canonicalize_or_parent` were removed when the
