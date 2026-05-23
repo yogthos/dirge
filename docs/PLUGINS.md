@@ -371,7 +371,23 @@ built-in ones. Mirrors pi's `api.registerTool({...})`.
 | `label` | UI display name (chat banner). Falls back to `name` when empty. |
 | `parameters` | JSON-schema string. Parsed once at startup; invalid JSON falls back to `{}` with a `tracing::warn`. |
 | `handler` | Janet function name. Called as `(handler args-json-string)`. Returns either a string (used directly) or any value `(string …)` can render. Errors surface to the LLM as tool failure. |
-| `execution-mode` | `:parallel` (default; read-only) or `:sequential` (mutating). One sequential tool forces the whole tool batch sequential. |
+| `execution-mode` | `:parallel` (default; read-only) or `:sequential` (mutating). One sequential tool forces the whole tool batch sequential. Pass `nil` here when you only want to set `prepare-arguments`. |
+| `prepare-arguments` | Optional 7th positional — name of a Janet function that runs BEFORE schema validation to normalize the LLM-supplied args. Receives the raw JSON args string; returns a JSON string the loop validates. Errors / invalid JSON / non-string returns fall back to the original args. Mirrors pi's `prepareArguments?` (extensions/types.ts:443). |
+
+```janet
+# Optional: normalize args before the loop validates them.
+(defn prep-echo [args]
+  # Wrap legacy positional input as a structured object the schema
+  # expects. Returns a JSON string.
+  (string "{\"msg\":" args "}"))
+
+(harness/register-tool
+  "plugin_echo" "Echoes arg" "Echo"
+  "{\"type\":\"object\",\"properties\":{\"msg\":{\"type\":\"string\"}}}"
+  "echo-tool-handler"
+  :parallel
+  "prep-echo")
+```
 
 See [`plugins/example_tool.janet`](../plugins/example_tool.janet).
 

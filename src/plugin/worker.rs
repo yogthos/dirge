@@ -429,22 +429,36 @@ const HARNESS_INIT: &str = r#"
                    (harness/-escape desc) "\n")))))
 
 # Plugin-registered LLM-callable tools (P9a). Plugins call
-#   (harness/register-tool name description label parameters handler &opt execution-mode)
+#   (harness/register-tool name description label parameters handler
+#                          &opt execution-mode prepare-arguments)
 # at load time to make a new tool available to the LLM alongside
-# the built-ins. `parameters` is a JSON-schema string. `handler` is
-# the name of a Janet function that takes one argument (the raw JSON
-# args string the LLM produced) and returns either a string (the
-# tool result text) or any value that (string ...) can render.
-# `execution-mode` is :parallel (read-only, default) or :sequential
-# (mutating). Stored as a tab-separated, escape-encoded line per
-# tool so a single Janet -> Rust round-trip surfaces them all.
+# the built-ins.
+#
+# - `parameters` is a JSON-schema string.
+# - `handler` is the name of a Janet function that takes one
+#   argument (the raw JSON args string the LLM produced) and
+#   returns either a string (the tool result text) or any value
+#   that (string ...) can render.
+# - `execution-mode` is :parallel (read-only, default) or
+#   :sequential (mutating). Pass nil to skip when you only want
+#   to set prepare-arguments.
+# - `prepare-arguments` (H3) is the name of an optional Janet
+#   function that takes the raw JSON args string and returns a
+#   mutated JSON string the loop validates against the schema.
+#   Mirrors pi's `prepareArguments` (extensions/types.ts:443).
+#   Errors fall back to the original args.
+#
+# Stored as tab-separated, escape-encoded line per tool.
 (var harness-tools-list "")
-(defn harness/register-tool [name description label parameters handler &opt execution-mode]
+(defn harness/register-tool [name description label parameters handler &opt execution-mode prepare-arguments]
   (when (and (string? name) (string? description) (string? label)
              (string? parameters) (string? handler))
     (let [mode (cond
                  (or (= execution-mode :sequential) (= execution-mode "sequential")) "sequential"
                  (or (= execution-mode :parallel) (= execution-mode "parallel")) "parallel"
+                 "")
+          prep (if (and prepare-arguments (string? prepare-arguments))
+                 prepare-arguments
                  "")]
       (set harness-tools-list
            (string harness-tools-list
@@ -453,7 +467,8 @@ const HARNESS_INIT: &str = r#"
                    (harness/-escape label) "\t"
                    (harness/-escape parameters) "\t"
                    (harness/-escape handler) "\t"
-                   mode "\n")))))
+                   mode "\t"
+                   (harness/-escape prep) "\n")))))
 "#;
 
 /// Janet-side aliases that defer the actual blocking work to the

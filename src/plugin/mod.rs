@@ -1077,6 +1077,73 @@ mod tests {
         );
     }
 
+    // --- H3: register-tool prepare-arguments field ---------------------
+
+    /// `(harness/register-tool ... :parallel "my-prep")` records the
+    /// 7th positional and surfaces it in `PluginToolMeta::prepare_handler`.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_tool_records_prepare_handler() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-tool "t" "d" "L" "{}" "h" :parallel "my-prep")"#)
+            .unwrap();
+        let tools = mgr.list_plugin_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].prepare_handler.as_deref(), Some("my-prep"));
+    }
+
+    /// Omitting the 7th positional leaves `prepare_handler == None`.
+    /// Backwards compat: existing 5- and 6-positional callers
+    /// continue to work.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_tool_without_prepare_handler_leaves_field_none() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-tool "t" "d" "L" "{}" "h" :parallel)"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-tool "u" "d" "L" "{}" "h2")"#)
+            .unwrap();
+        let tools = mgr.list_plugin_tools();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].prepare_handler, None);
+        assert_eq!(tools[1].prepare_handler, None);
+    }
+
+    /// `invoke_prepare_arguments` round-trips: Janet handler returns
+    /// a mutated JSON string; the host gets `Ok(Some(json))`.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_prepare_arguments_returns_handler_output() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn prep [args] (string "{\"normalized\":" args "}"))"#)
+            .unwrap();
+        let out = mgr.invoke_prepare_arguments("prep", r#"{"x":1}"#).unwrap();
+        assert_eq!(out, Some(r#"{"normalized":{"x":1}}"#.to_string()));
+    }
+
+    /// Handler errors swallow to `Ok(None)` — caller falls back to
+    /// the original args.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_prepare_arguments_swallows_handler_error() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn boom [args] (error "kaboom"))"#).unwrap();
+        let out = mgr.invoke_prepare_arguments("boom", "{}").unwrap();
+        assert_eq!(out, None);
+    }
+
+    /// Non-string return values swallow to `Ok(None)` — the
+    /// contract is "JSON string back", anything else is treated as
+    /// no-op.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_prepare_arguments_non_string_return_swallows() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn t [args] @{:not "a-string"})"#).unwrap();
+        let out = mgr.invoke_prepare_arguments("t", "{}").unwrap();
+        assert_eq!(out, None);
+    }
+
     // --- H4: dedup duplicate registrations -----------------------------
 
     /// Registering two tools with the same name resolves last-wins —
@@ -2950,6 +3017,39 @@ impl PluginManager {
         dedup_last_wins(parsed, "plugin shortcut", |s| s.keys.clone())
     }
 
+    /// Invoke a Janet `prepare-arguments` handler (H3 / pi parity —
+    /// `prepareArguments?` at extensions/types.ts:443). The handler
+    /// is called as `(handler args-json)` and is expected to return a
+    /// mutated JSON string the loop will then validate against the
+    /// tool's schema. Errors or non-string returns swallow back to
+    /// `Ok(None)` — the caller falls through to the original args
+    /// rather than failing the tool call on a buggy plugin.
+    pub fn invoke_prepare_arguments(
+        &mut self,
+        handler: &str,
+        args_json: &str,
+    ) -> Result<Option<String>, String> {
+        let escaped_args = escape_janet_string(args_json);
+        let escaped_fn = escape_janet_string(handler);
+        let code = format!(
+            r#"(try
+                 (let [f (get (curenv) (symbol "{fname}"))]
+                   (if (and f (function? (f :value)))
+                     (let [r ((f :value) "{args}")]
+                       (if (string? r) r nil))
+                     nil))
+                 ([err fib] nil))"#,
+            fname = escaped_fn,
+            args = escaped_args,
+        );
+        let result = self.worker.eval(&code)?;
+        if result == "nil" || result.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+
     /// Invoke a Janet tool handler with the raw JSON args string the
     /// LLM produced. The handler is called as `(handler args)` and may
     /// return any value `(string ...)` can render. Returns the tool's
@@ -3165,6 +3265,11 @@ pub struct PluginToolMeta {
     pub handler: String,
     /// `"sequential"` or `"parallel"`, or `None` when unset.
     pub execution_mode: Option<String>,
+    /// Name of an optional Janet function that runs BEFORE schema
+    /// validation to normalize the LLM-supplied args. Pi parity —
+    /// `prepareArguments?` (extensions/types.ts:443). `None` means
+    /// the loop validates args verbatim.
+    pub prepare_handler: Option<String>,
 }
 
 fn parse_plugin_tool_line(line: &str) -> Option<PluginToolMeta> {
@@ -3175,12 +3280,21 @@ fn parse_plugin_tool_line(line: &str) -> Option<PluginToolMeta> {
     let parameters = unescape_harness_field(parts.next()?);
     let handler = unescape_harness_field(parts.next()?);
     let mode_raw = parts.next().unwrap_or("").trim();
+    // 7th field (prepare-arguments handler name) is optional — a
+    // line without it (legacy pre-H3 emitters) parses with
+    // prepare_handler = None.
+    let prepare_raw = parts.next().map(unescape_harness_field).unwrap_or_default();
     if name.is_empty() || handler.is_empty() {
         return None;
     }
     let execution_mode = match mode_raw {
         "sequential" | "parallel" => Some(mode_raw.to_string()),
         _ => None,
+    };
+    let prepare_handler = if prepare_raw.is_empty() {
+        None
+    } else {
+        Some(prepare_raw)
     };
     Some(PluginToolMeta {
         name,
@@ -3189,6 +3303,7 @@ fn parse_plugin_tool_line(line: &str) -> Option<PluginToolMeta> {
         parameters,
         handler,
         execution_mode,
+        prepare_handler,
     })
 }
 

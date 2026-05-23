@@ -239,6 +239,10 @@ pub struct JanetLoopTool {
     parameters: Value,
     handler: String,
     execution_mode: Option<ToolExecutionMode>,
+    /// Optional Janet `prepare-arguments` handler. When set, runs
+    /// before schema validation to normalize LLM-supplied args
+    /// (pi parity — `prepareArguments?` at extensions/types.ts:443).
+    prepare_handler: Option<String>,
     pm: Arc<Mutex<PluginManager>>,
 }
 
@@ -285,6 +289,7 @@ impl JanetLoopTool {
             parameters,
             handler: meta.handler,
             execution_mode,
+            prepare_handler: meta.prepare_handler,
             pm,
         })
     }
@@ -313,6 +318,45 @@ impl LoopTool for JanetLoopTool {
 
     fn execution_mode(&self) -> Option<ToolExecutionMode> {
         self.execution_mode
+    }
+
+    /// H3 — call the Janet `prepare-arguments` handler (if any) to
+    /// normalize args before schema validation. Pi parity:
+    /// `prepareArguments?` at extensions/types.ts:443. The handler
+    /// returns a JSON string we parse back to `Value`; any failure
+    /// (no handler, error, invalid JSON) falls back to the original
+    /// args so a broken plugin can't poison the tool call.
+    fn prepare_arguments(&self, args: Value) -> Value {
+        let Some(handler) = self.prepare_handler.as_deref() else {
+            return args;
+        };
+        let args_json = args.to_string();
+        let mutated = {
+            let mut guard = match self.pm.lock() {
+                Ok(g) => g,
+                Err(_) => return args,
+            };
+            guard
+                .invoke_prepare_arguments(handler, &args_json)
+                .ok()
+                .flatten()
+        };
+        match mutated {
+            Some(json) => match serde_json::from_str::<Value>(&json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        tool = %self.name,
+                        handler = %handler,
+                        error = %e,
+                        "plugin prepare-arguments returned invalid JSON — ignoring",
+                    );
+                    args
+                }
+            },
+            None => args,
+        }
     }
 
     fn execute<'a>(
@@ -603,6 +647,97 @@ mod tests {
     }
 
     // --- back to JanetLoopTool tests --------------------------------
+
+    /// H3: `prepare_arguments` calls the registered Janet handler
+    /// and substitutes the returned JSON for the original args.
+    #[tokio::test]
+    async fn janet_loop_tool_prepare_arguments_normalizes_via_handler() {
+        let pm = {
+            let mut mgr = PluginManager::try_new().unwrap();
+            mgr.eval(
+                r#"(defn echo [args] args)
+                   (defn prep [args]
+                     # Wrap the input so we can confirm prepare actually ran.
+                     (string "{\"wrapped\":" args "}"))
+                   (harness/register-tool "wrap" "" "Wrap" "{}" "echo" :parallel "prep")"#,
+            )
+            .unwrap();
+            Arc::new(Mutex::new(mgr))
+        };
+        let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
+        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+
+        let original = serde_json::json!({"x": 1});
+        let mutated = tool.prepare_arguments(original);
+        // Handler wrapped the input — `wrapped` field now present.
+        assert_eq!(mutated.get("wrapped"), Some(&serde_json::json!({"x": 1})));
+    }
+
+    /// Without a prepare-arguments handler, prepare_arguments is the
+    /// identity function — backwards compat for plugins that don't
+    /// opt into the field.
+    #[tokio::test]
+    async fn janet_loop_tool_prepare_arguments_passthrough_when_unset() {
+        let pm = {
+            let mut mgr = PluginManager::try_new().unwrap();
+            mgr.eval(
+                r#"(defn h [args] "ok")
+                   (harness/register-tool "no-prep" "" "" "{}" "h")"#,
+            )
+            .unwrap();
+            Arc::new(Mutex::new(mgr))
+        };
+        let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
+        assert_eq!(metas[0].prepare_handler, None);
+        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+
+        let original = serde_json::json!({"a": 1, "b": "two"});
+        let out = tool.prepare_arguments(original.clone());
+        assert_eq!(out, original);
+    }
+
+    /// Prepare-arguments handlers that throw fall back to the
+    /// original args — pi tolerates throws too (handler errors
+    /// don't crash tool dispatch).
+    #[tokio::test]
+    async fn janet_loop_tool_prepare_arguments_error_falls_back_to_original() {
+        let pm = {
+            let mut mgr = PluginManager::try_new().unwrap();
+            mgr.eval(
+                r#"(defn h [args] "ok")
+                   (defn bad-prep [args] (error "boom"))
+                   (harness/register-tool "bad" "" "" "{}" "h" :parallel "bad-prep")"#,
+            )
+            .unwrap();
+            Arc::new(Mutex::new(mgr))
+        };
+        let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
+        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let original = serde_json::json!({"x": 1});
+        let out = tool.prepare_arguments(original.clone());
+        assert_eq!(out, original, "throw must fall back to original args");
+    }
+
+    /// Prepare-arguments handlers that return invalid JSON fall back
+    /// to the original args (plus a tracing::warn — not asserted).
+    #[tokio::test]
+    async fn janet_loop_tool_prepare_arguments_invalid_json_falls_back() {
+        let pm = {
+            let mut mgr = PluginManager::try_new().unwrap();
+            mgr.eval(
+                r#"(defn h [args] "ok")
+                   (defn weird [args] "not valid json {{{")
+                   (harness/register-tool "w" "" "" "{}" "h" :parallel "weird")"#,
+            )
+            .unwrap();
+            Arc::new(Mutex::new(mgr))
+        };
+        let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
+        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+        let original = serde_json::json!({"x": 1});
+        let out = tool.prepare_arguments(original.clone());
+        assert_eq!(out, original);
+    }
 
     /// H1: a signal that's already cancelled when execute() is
     /// called short-circuits BEFORE acquiring the PluginManager
