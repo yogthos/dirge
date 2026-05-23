@@ -97,6 +97,29 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
         });
     }
     f.render_widget(strip, area);
+
+    // Show the hardware cursor at the editor position. The terminal
+    // blinks it naturally — much clearer feedback than the
+    // inverted-bg cell trick the widget used during the migration.
+    if let BottomBody::Editor { cursor_col, .. } = scene.body {
+        let prompt_w: u16 = 3; // "▌▌ " or "░▌ "; both 3 cells.
+        let cursor_x = layout
+            .input_box
+            .x
+            .saturating_add(1) // skip the │ border
+            .saturating_add(prompt_w)
+            .saturating_add(cursor_col);
+        let cursor_y = layout.input_box.y.saturating_add(1); // skip top frame row
+        // Clamp inside the input box so a long line doesn't put the
+        // cursor in the right margin.
+        let cursor_x_max = layout
+            .input_box
+            .x
+            .saturating_add(layout.input_box.width)
+            .saturating_sub(2); // -1 for the right │, -1 for 0-based
+        let cursor_x = cursor_x.min(cursor_x_max);
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 // `BottomBody` is Copy so `render_frame` can pass it to BottomStrip
@@ -309,6 +332,81 @@ mod tests {
             }
         }
         assert!(!found_dirge, "DIRGE banner should not appear on narrow term");
+    }
+
+    /// Typing into the input field: render the same Scene twice
+    /// with different editor text and assert the input box content
+    /// updates on the second draw. This is the smoke test for the
+    /// "typing doesn't work" bug — if it passes, the widget +
+    /// scene path is correct and any runtime regression must be in
+    /// the integration layer (event loop, draw_bottom caching).
+    #[test]
+    fn editor_text_updates_between_draws() {
+        let buf: Vec<LineEntry> = Vec::new();
+        let pd = PanelData::default();
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+
+        let mut backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+
+        // First draw: empty input.
+        let s1 = Scene {
+            chat_buffer: &buf,
+            scroll_offset: 0,
+            input_rows: 1,
+            panel_data: &pd,
+            left_info: &info,
+            subagents: &subs,
+            avatar: None,
+            body: BottomBody::Editor {
+                text: "",
+                cursor_col: 0,
+                is_running: false,
+            },
+            status: "",
+            show_side_panels: true,
+            frame_color: crossterm::style::Color::Green,
+        };
+        terminal.draw(|f| render_frame(&s1, f)).unwrap();
+
+        // Second draw: "hello" typed.
+        let s2 = Scene {
+            chat_buffer: &buf,
+            scroll_offset: 0,
+            input_rows: 1,
+            panel_data: &pd,
+            left_info: &info,
+            subagents: &subs,
+            avatar: None,
+            body: BottomBody::Editor {
+                text: "hello",
+                cursor_col: 5,
+                is_running: false,
+            },
+            status: "",
+            show_side_panels: true,
+            frame_color: crossterm::style::Color::Green,
+        };
+        terminal.draw(|f| render_frame(&s2, f)).unwrap();
+        backend = terminal.backend().clone();
+
+        // Locate the input box's first inner row and assert "hello"
+        // is present somewhere on it.
+        let layout = Layout::new(160, 30, 1);
+        let inner_y = layout.input_box.y + 1;
+        let row: String = (layout.input_box.x
+            ..layout.input_box.x + layout.input_box.width)
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, inner_y))
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert!(row.contains("hello"), "input row should contain typed text; got {row:?}");
     }
 
     /// Chat content from the scene's buffer paints into the chat

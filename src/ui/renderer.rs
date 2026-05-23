@@ -249,6 +249,26 @@ impl Renderer {
         })
     }
 
+    /// Build a `Scene` snapshot from current renderer state.
+    /// Extracted from `tui_redraw` so tests can inspect the scene
+    /// without driving the actual ratatui Terminal.
+    #[cfg(test)]
+    pub(crate) fn build_test_scene(
+        &self,
+    ) -> (
+        String,
+        u16,
+        bool,
+        bool,
+    ) {
+        (
+            self.cached_input_text.clone(),
+            self.cached_input_cursor,
+            self.cached_is_running,
+            self.alert_overlay.is_some(),
+        )
+    }
+
     /// Phase 6 paint entry point. Builds a `Scene` from current
     /// Renderer state and calls `render_frame` through the ratatui
     /// Terminal. Every legacy paint method funnels here.
@@ -260,6 +280,25 @@ impl Renderer {
         use crate::ui::avatar;
         use crate::ui::tui::bottom::{AvatarSpec, BottomBody};
         use crate::ui::tui::scene::{Scene, render_frame};
+
+        // TEMP DEBUG: log every redraw + the text we'd paint into the
+        // input box. Tail /tmp/dirge-debug.log to verify the runtime
+        // is calling this path and the cached_input_text is updating.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/dirge-debug.log")
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                f,
+                "tui_redraw: text={:?} cursor={} overlay={} running={}",
+                self.cached_input_text,
+                self.cached_input_cursor,
+                self.alert_overlay.is_some(),
+                self.cached_is_running
+            );
+        }
 
         // panel_visible() borrows &self via terminal_size, so compute
         // it BEFORE we take the split mutable borrow on tui_terminal.
@@ -328,7 +367,16 @@ impl Renderer {
             frame_color,
         };
 
-        terminal.draw(|f| render_frame(&scene, f))?;
+        let result = terminal.draw(|f| render_frame(&scene, f));
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/dirge-debug.log")
+        {
+            use std::io::Write as _;
+            let _ = writeln!(f, "  terminal.draw result: {:?}", result.is_ok());
+        }
+        result?;
         Ok(())
     }
 

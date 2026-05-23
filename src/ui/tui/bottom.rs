@@ -285,14 +285,11 @@ fn paint_editor_box(
     let text_avail = inner_w.saturating_sub(prompt_w as usize);
     buf.set_stringn(text_x, y, text, text_avail, user);
 
-    // Cursor cell: invert background so it's visible. ratatui's
-    // CrosstermBackend will translate the inverted style into a
-    // visible cursor block.
-    let cursor_x = text_x.saturating_add(cursor_col.min(text_avail as u16));
-    if cursor_x < area.x + area.width - 1 {
-        let cell = &mut buf[(cursor_x, y)];
-        cell.set_style(Style::default().fg(RColor::Black).bg(RColor::White));
-    }
+    // Cursor is shown via `Frame::set_cursor_position` at the
+    // render-frame layer (so it blinks naturally). The widget only
+    // owns text + style; it doesn't try to fake the cursor with an
+    // inverted-bg cell anymore.
+    let _ = cursor_col;
 }
 
 fn paint_overlay_box(
