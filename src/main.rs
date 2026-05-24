@@ -261,39 +261,61 @@ async fn main() -> anyhow::Result<()> {
     // authors can see hook-error logs without having to know the
     // RUST_LOG syntax.
     //
-    // Logs go to a file (`$XDG_STATE_HOME/dirge/dirge.log` →
-    // `~/.local/state/dirge/dirge.log` → `/tmp/dirge.log`). Writing
-    // to stdout/stderr in raw mode would corrupt the TUI: bare `\n`
-    // produces staircase artifacts, and ANY out-of-band write
-    // bypasses ratatui's tracked buffer state — the next diff
-    // emits only the delta from a screen state that no longer
-    // matches reality, leaving visible ghosts (stale panel text,
-    // scrambled titles like `[56P]` for `[MCP]`, duplicate
-    // avatars). Pipe everything to a file so the screen is solely
-    // ratatui's domain.
+    // Log destination: opt-in only. By default, tracing output is
+    // dropped (`io::sink`) and the fd-isolation redirect in
+    // `TerminalGuard` sends stdout/stderr to `/dev/null` — no file
+    // is created on disk. When the user opts in via `--verbose`,
+    // `RUST_LOG=...`, or `DIRGE_LOG=path`, the file at
+    // `$XDG_STATE_HOME/dirge/dirge.log` (or `$DIRGE_LOG` if set
+    // explicitly) becomes the target for BOTH tracing events AND
+    // the stdout/stderr redirect, so plugin authors can see
+    // everything in one place.
     let default_filter = if cli.verbose {
         "dirge=debug,dirge::plugin=warn,rig=off"
     } else {
         "warn,rig=off"
     };
-    let log_path: std::path::PathBuf = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            dirs::home_dir().map(|h| h.join(".local").join("state"))
-        })
-        .map(|base| base.join("dirge"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("dirge.log");
-    let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new("/tmp")));
-    let log_writer: Box<dyn std::io::Write + Send + Sync> = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(f) => Box::new(f),
-        // If the log file can't be opened (read-only fs, etc.),
-        // drop trace output entirely rather than spam the TUI.
-        Err(_) => Box::new(std::io::sink()),
+    let want_log_file = cli.verbose
+        || std::env::var_os("RUST_LOG").is_some()
+        || std::env::var_os("DIRGE_LOG").is_some();
+    let log_path_opt: Option<std::path::PathBuf> = if want_log_file {
+        let path = std::env::var_os("DIRGE_LOG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("XDG_STATE_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
+                    .map(|base| base.join("dirge"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("dirge.log")
+            });
+        let _ = std::fs::create_dir_all(
+            path.parent().unwrap_or(std::path::Path::new("/tmp")),
+        );
+        Some(path)
+    } else {
+        None
+    };
+    // Publish the chosen path (or absence) for TerminalGuard's
+    // stdout/stderr fd redirect — both sinks need to agree.
+    if let Some(ref p) = log_path_opt {
+        ui::terminal::set_log_path(Some(p.clone()));
+    } else {
+        ui::terminal::set_log_path(None);
+    }
+    let log_writer: Box<dyn std::io::Write + Send + Sync> = match log_path_opt.as_ref() {
+        Some(path) => match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => Box::new(f),
+            // File couldn't be opened (read-only fs, etc.) — drop
+            // trace output rather than spam the TUI.
+            Err(_) => Box::new(std::io::sink()),
+        },
+        // No log file requested — discard tracing events.
+        None => Box::new(std::io::sink()),
     };
     tracing_subscriber::fmt()
         .with_env_filter(

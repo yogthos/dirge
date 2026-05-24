@@ -20,6 +20,21 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen};
 /// reach it.
 pub(crate) static TTY_FD_PATH: OnceLock<bool> = OnceLock::new();
 
+/// Optional log file path for the stdout/stderr fd redirect.
+/// `None` means redirect to `/dev/null` (default — no log file is
+/// created on disk). Set by `main.rs::set_log_path` before
+/// `TerminalGuard::new` runs, based on `--verbose`, `RUST_LOG`, or
+/// `DIRGE_LOG` opt-ins.
+static LOG_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// Publish the log destination for the fd redirect. Setting `None`
+/// keeps the default (redirect to `/dev/null`); setting `Some(path)`
+/// makes the fd target match what the tracing subscriber writes to.
+/// First call wins (matches `tracing_subscriber::init` semantics).
+pub fn set_log_path(path: Option<std::path::PathBuf>) {
+    let _ = LOG_PATH.set(path);
+}
+
 /// Shared shutdown signal between the input-reader background thread
 /// in `ui::mod` and `TerminalGuard::drop`. The reader polls this with
 /// each `event::poll` tick; the guard sets it before tearing down so
@@ -156,41 +171,49 @@ pub(crate) fn tty_size() -> (u16, u16) {
     }
 }
 
-/// dup2 fd 1 and fd 2 to the dirge log file. Returns the saved
-/// originals so `Drop` can restore them. The same path the tracing
-/// subscriber uses is reused so all out-of-band output ends up in
-/// one place.
+/// dup2 fd 1 and fd 2 either to the dirge log file (when the user
+/// opted in via `--verbose` / `RUST_LOG` / `DIRGE_LOG`) or to
+/// `/dev/null` (default — silently discard stdout/stderr without
+/// creating a log on disk). The redirect itself is mandatory for
+/// TUI correctness; the destination is what's configurable.
+/// Returns the saved originals so `Drop` can restore them.
 #[cfg(unix)]
 fn redirect_stdout_stderr_to_log() -> (Option<libc::c_int>, Option<libc::c_int>) {
-    let log_path: std::path::PathBuf = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
-        .map(|base| base.join("dirge"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("dirge.log");
-    let _ = std::fs::create_dir_all(
-        log_path.parent().unwrap_or(std::path::Path::new("/tmp")),
-    );
-    let log = match std::fs::OpenOptions::new()
+    // Try the configured target first (a log file if the user
+    // opted in, /dev/null otherwise). If that fails (read-only fs,
+    // missing /dev/null on a weird container, etc.), force-fall
+    // back to /dev/null — we MUST redirect somewhere, since
+    // leaving fd 1/2 attached to the TTY would let stray writes
+    // corrupt the ratatui screen.
+    let configured = LOG_PATH
+        .get()
+        .and_then(|opt| opt.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
-    {
+        .open(&configured)
+        .or_else(|_| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+        });
+    let file = match file {
         Ok(f) => f,
         Err(_) => return (None, None),
     };
     use std::os::fd::AsRawFd;
-    let log_fd = log.as_raw_fd();
+    let target_fd = file.as_raw_fd();
     // dup the originals so Drop can restore.
     let saved_stdout_fd = unsafe { libc::dup(1) };
     let saved_stderr_fd = unsafe { libc::dup(2) };
-    // Redirect fds 1 and 2 to the log.
+    // Redirect fds 1 and 2 to the chosen target.
     unsafe {
-        libc::dup2(log_fd, 1);
-        libc::dup2(log_fd, 2);
+        libc::dup2(target_fd, 1);
+        libc::dup2(target_fd, 2);
     }
-    // Drop our log handle — the duplicated fds in 1/2 keep the file alive.
-    drop(log);
+    // Drop our handle — the duplicated fds in 1/2 keep the file alive.
+    drop(file);
     (
         if saved_stdout_fd >= 0 { Some(saved_stdout_fd) } else { None },
         if saved_stderr_fd >= 0 { Some(saved_stderr_fd) } else { None },
