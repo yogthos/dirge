@@ -94,7 +94,7 @@ as is sensible.
 
 **Goal**: persist every session transcript in SQLite with full-text search.
 This is the foundation that session search (Phase 5) and background review
-(Phase 4) depend on.
+(Phase 4) depend on. Session transcripts live in the project folder the session is associated with.
 
 **Reference**: `hermes_state.py` (full file, 1174 lines). Key sections:
 - Lines 1-15: module docstring — design decisions (WAL mode, FTS5, session

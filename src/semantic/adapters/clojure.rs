@@ -4,7 +4,6 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 use crate::semantic::adapter::LanguageAdapter;
-use crate::semantic::common;
 use crate::semantic::common::{find_node_at_range, node_text};
 use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbol, SymbolKind};
 

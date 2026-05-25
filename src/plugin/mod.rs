@@ -2542,8 +2542,6 @@ pub fn filter_existing_dirs(candidates: &[std::path::PathBuf]) -> Vec<std::path:
     loader::filter_existing_dirs(candidates)
 }
 
-/// All hook names the host knows about. Re-exported from loader.
-pub use loader::HOOK_NAMES;
 
 /// One loaded plugin's stem (used for hook-name namespacing) and the
 /// source path(s) that contributed code. For single-file plugins this
