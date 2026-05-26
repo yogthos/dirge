@@ -136,7 +136,7 @@ impl SessionDb {
     ) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT INTO sessions (id, source, model, provider, started_at, last_active)
+                "INSERT OR IGNORE INTO sessions (id, source, model, provider, started_at, last_active)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
                 params![id, source, model, provider, started_at],
             )

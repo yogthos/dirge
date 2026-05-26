@@ -138,6 +138,28 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str(&format!("\nGit branch: {}", branch));
     }
 
+    // Phase 8: inject per-project memory + skills into the system
+    // prompt. Frozen snapshots of MEMORY.md and PITFALLS.md become
+    // reference material for every turn. Skills from .dirge/skills/
+    // and global dirs are listed so the model knows what procedural
+    // knowledge is available (it loads them on demand via the
+    // `skill` tool).
+    if let Ok(cwd) = std::env::current_dir() {
+        let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
+        if let Ok(mem) = crate::extras::memory_store::MemoryStore::load_memory(&paths) {
+            let mem_text = mem.format_for_system_prompt();
+            if !mem_text.is_empty() {
+                preamble.push_str(&mem_text);
+            }
+        }
+        if let Ok(pit) = crate::extras::memory_store::MemoryStore::load_pitfalls(&paths) {
+            let pit_text = pit.format_for_system_prompt();
+            if !pit_text.is_empty() {
+                preamble.push_str(&pit_text);
+            }
+        }
+    }
+
     // Inject mode-specific reminders
     if let Some(prompt_name) = &context.current_prompt_name {
         let plan_exists = std::env::current_dir()

@@ -674,6 +674,8 @@ pub async fn run_interactive(
     // the run finishes) are picked up when the run ends and spawn a follow-up.
     let interjection_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    // Track the most recent user prompt for session DB persistence (Phase 8).
+    let mut last_user_prompt = String::new();
     let mut agent_rx: Option<mpsc::Receiver<AgentEvent>> = None;
     // Handle to the background agent task. Held alongside `agent_rx` so the
     // UI can abort in-flight work on Ctrl+C/D/Esc — otherwise tools keep
@@ -1951,6 +1953,10 @@ pub async fn run_interactive(
                                     text.to_string()
                                 };
 
+                                // Phase 8: track the user prompt for
+                                // session DB persistence.
+                                last_user_prompt = text.to_string();
+
                                 // Batch2-1 (audit fix): preemptive
                                 // compaction check. Estimate the new
                                 // prompt's token cost; if
@@ -2906,11 +2912,47 @@ pub async fn run_interactive(
                         if !is_running {
                             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
                             let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
+
+                            // Persist the completed turn to the SQLite
+                            // session DB for future search. Uses a
+                            // stable session id so messages from the
+                            // same interactive session are grouped.
+                            if let Ok(db) = crate::extras::session_db::SessionDb::open(
+                                &paths.session_db_path(),
+                            ) {
+                                let now = chrono::Utc::now().to_rfc3339();
+                                let sid = format!("dirge-{}", session.id.as_str().chars().take(8).collect::<String>());
+                                // Best-effort: insert_session is
+                                // idempotent (primary key, duplicates
+                                // silently ignored by rusqlite OR
+                                // IGNORE). We always try to create
+                                // and then append messages.
+                                let _ = db.insert_session(&sid, "cli", &session.model, &session.provider, &now);
+                                if !last_user_prompt.is_empty() {
+                                    let _ = db.insert_message(&sid, "user", &last_user_prompt, None, None, None, &now);
+                                }
+                                if !response.is_empty() {
+                                    let _ = db.insert_message(&sid, "assistant", &response, None, None, None, &now);
+                                }
+                            }
+
                             crate::agent::review::spawn_background_review(
                                 agent.clone(),
-                                paths,
+                                paths.clone(),
                                 response.to_string(),
                             );
+
+                            // Curator check: run periodic skill maintenance
+                            // if the interval has elapsed. Fire-and-forget.
+                            tokio::spawn(async move {
+                                if let Ok(mut curator) = crate::extras::skills::curator::Curator::new(&paths) {
+                                    if curator.should_run_now() {
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            let _ = curator.apply_automatic_transitions();
+                                        }).await;
+                                    }
+                                }
+                            });
                         }
 
                         #[cfg(feature = "git-worktree")]
