@@ -1249,28 +1249,7 @@ pub async fn run_interactive(
                                 // matches alone; if there's an
                                 // argument, treat as potentially
                                 // mutating and gate.
-                                let head = text.split_whitespace().next().unwrap_or("");
-                                let args = text
-                                    .split_whitespace()
-                                    .nth(1)
-                                    .map(|s| s.to_string());
-                                let always_safe = matches!(
-                                    head,
-                                    "/quit" | "/help" | "/reasoning" | "/tasks"
-                                );
-                                let safe_when_no_arg = matches!(
-                                    head,
-                                    "/sessions"
-                                        | "/tree"
-                                        | "/model"
-                                        | "/prompt"
-                                ) && args.is_none();
-                                let safe_when_list = matches!(
-                                    (head, args.as_deref()),
-                                    ("/memory", Some("list")) | ("/skill", Some("list"))
-                                );
-                                let safe_during_agent =
-                                    always_safe || safe_when_no_arg || safe_when_list;
+                                let safe_during_agent = is_safe_during_agent(&text);
                                 if is_running && !safe_during_agent {
                                     write_outside_chamber(
                                         &mut renderer,
@@ -1278,7 +1257,7 @@ pub async fn run_interactive(
                                         &mut tool_chamber_open,
                                     &mut chamber_top_start,
                                     &mut chamber_top_end,
-                                        "agent is busy — wait, interrupt (Ctrl+C), or use /quit. (/tasks /help /sessions /tree /model /prompt run during agent activity.)",
+                                        "agent is busy — wait, interrupt (Ctrl+C), or use /quit. (/mode /tasks /help /sessions /tree /model /prompt run during agent activity.)",
                                         c_error(),
                                     )?;
                                     renderer.draw_bottom(
@@ -1437,6 +1416,12 @@ pub async fn run_interactive(
                                 // the steering queue at turn boundaries and injects
                                 // it as mid-turn guidance within the same run.
                                 interjection_queue.lock().unwrap().push_back(text.to_string());
+                                // Signal the agent to stop at the next tool-result
+                                // boundary so the queued message is injected as a new
+                                // user turn rather than waiting for the run to complete.
+                                if let Some(tx) = agent_interject.as_ref() {
+                                    let _ = tx.try_send(());
+                                }
                                 for line in text.lines() {
                                     let safe_line = sanitize_output(line);
                                     renderer.write_line(
@@ -3531,6 +3516,21 @@ pub async fn run_interactive(
     }
 
     Ok(())
+}
+
+/// Whether a slash command is safe to run while the agent is active.
+/// Read-only inspection commands don't need the agent idle.
+fn is_safe_during_agent(text: &str) -> bool {
+    let head = text.split_whitespace().next().unwrap_or("");
+    let args = text.split_whitespace().nth(1).map(|s| s.to_string());
+    let always_safe = matches!(head, "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode");
+    let safe_when_no_arg =
+        matches!(head, "/sessions" | "/tree" | "/model" | "/prompt") && args.is_none();
+    let safe_when_list = matches!(
+        (head, args.as_deref()),
+        ("/memory", Some("list")) | ("/skill", Some("list"))
+    );
+    always_safe || safe_when_no_arg || safe_when_list
 }
 
 #[cfg(test)]

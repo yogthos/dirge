@@ -566,3 +566,57 @@ fn chat_index_next_prev_one_chat_is_noop() {
     assert_eq!((0 + 1) % count, 0);
     assert_eq!((0 + count - 1) % count, 0);
 }
+
+// ============================================================
+// safe_during_agent — slash commands allowed while agent runs
+// ============================================================
+
+#[test]
+fn mode_is_safe_during_agent() {
+    assert!(is_safe_during_agent("/mode"));
+    assert!(is_safe_during_agent("/mode yolo"));
+    assert!(is_safe_during_agent("/mode standard"));
+    assert!(is_safe_during_agent("/mode accept"));
+    assert!(is_safe_during_agent("/mode restrictive"));
+}
+
+#[test]
+fn quit_help_reasoning_tasks_always_safe_during_agent() {
+    assert!(is_safe_during_agent("/quit"));
+    assert!(is_safe_during_agent("/help"));
+    assert!(is_safe_during_agent("/reasoning"));
+    assert!(is_safe_during_agent("/tasks"));
+    assert!(is_safe_during_agent("/tasks list"));
+}
+
+#[test]
+fn sessions_tree_model_prompt_safe_only_without_args() {
+    assert!(is_safe_during_agent("/sessions"));
+    assert!(is_safe_during_agent("/tree"));
+    assert!(is_safe_during_agent("/model"));
+    assert!(is_safe_during_agent("/prompt"));
+    assert!(!is_safe_during_agent("/sessions 42"));
+    assert!(!is_safe_during_agent("/model gpt-4"));
+    assert!(!is_safe_during_agent("/prompt my-prompt"));
+}
+
+#[test]
+fn mutating_commands_are_not_safe_during_agent() {
+    assert!(!is_safe_during_agent("/cd /tmp"));
+    assert!(!is_safe_during_agent("/clear"));
+    assert!(!is_safe_during_agent("/compress"));
+    assert!(!is_safe_during_agent("/clone"));
+    assert!(!is_safe_during_agent("/fork"));
+    assert!(!is_safe_during_agent("/compact"));
+    assert!(!is_safe_during_agent("/undo"));
+    assert!(!is_safe_during_agent("/retry"));
+    assert!(!is_safe_during_agent("/allow bash rm *"));
+}
+
+#[test]
+fn memory_skill_list_safe_during_agent() {
+    assert!(is_safe_during_agent("/memory list"));
+    assert!(is_safe_during_agent("/skill list"));
+    assert!(!is_safe_during_agent("/memory add key value"));
+    assert!(!is_safe_during_agent("/skill load foo"));
+}
