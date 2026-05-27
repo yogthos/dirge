@@ -35,23 +35,50 @@ const INVISIBLE_CHARS: &[char] = &[
 static THREAT_PATTERNS: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
     vec![
         // Shell command injection — literal patterns, no whitespace flex.
-        (Regex::new(r"\$\(curl").unwrap(), "shell command substitution with curl"),
-        (Regex::new(r"\$\(wget").unwrap(), "shell command substitution with wget"),
+        (
+            Regex::new(r"\$\(curl").unwrap(),
+            "shell command substitution with curl",
+        ),
+        (
+            Regex::new(r"\$\(wget").unwrap(),
+            "shell command substitution with wget",
+        ),
         (Regex::new(r"`curl").unwrap(), "backtick command with curl"),
         (Regex::new(r"`wget").unwrap(), "backtick command with wget"),
         (Regex::new(r"(?i)eval\(").unwrap(), "JavaScript/Python eval"),
         (Regex::new(r"(?i)exec\(").unwrap(), "Python exec"),
         (Regex::new(r"(?i)os\.system\(").unwrap(), "Python os.system"),
-        (Regex::new(r"(?i)subprocess\.call").unwrap(), "Python subprocess"),
-        (Regex::new(r"(?i)runtime\.exec").unwrap(), "Java runtime exec"),
-        (Regex::new(r"(?i)ProcessBuilder").unwrap(), "Java process builder"),
+        (
+            Regex::new(r"(?i)subprocess\.call").unwrap(),
+            "Python subprocess",
+        ),
+        (
+            Regex::new(r"(?i)runtime\.exec").unwrap(),
+            "Java runtime exec",
+        ),
+        (
+            Regex::new(r"(?i)ProcessBuilder").unwrap(),
+            "Java process builder",
+        ),
         // Credential exfiltration
-        (Regex::new(r"(?i)curl\s+-F").unwrap(), "multipart form upload (potential exfiltration)"),
+        (
+            Regex::new(r"(?i)curl\s+-F").unwrap(),
+            "multipart form upload (potential exfiltration)",
+        ),
         (Regex::new(r"/etc/passwd").unwrap(), "sensitive file access"),
-        (Regex::new(r"\.env\b").unwrap(), "environment secret reference"),
+        (
+            Regex::new(r"\.env\b").unwrap(),
+            "environment secret reference",
+        ),
         (Regex::new(r"~/\.ssh/").unwrap(), "SSH key reference"),
-        (Regex::new(r"(?i)Authorization:\s*Bearer").unwrap(), "hardcoded auth token"),
-        (Regex::new(r"-----BEGIN RSA PRIVATE KEY").unwrap(), "private key in skill"),
+        (
+            Regex::new(r"(?i)Authorization:\s*Bearer").unwrap(),
+            "hardcoded auth token",
+        ),
+        (
+            Regex::new(r"-----BEGIN RSA PRIVATE KEY").unwrap(),
+            "private key in skill",
+        ),
         // Prompt injection — whitespace-flexible patterns to defeat evasion.
         // "ignore   previous   instructions" → caught. "IGNORE ALL INSTRUCTIONS" → caught.
         (

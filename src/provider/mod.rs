@@ -96,9 +96,7 @@ pub fn resolve_provider_info(
         .or_else(|| custom_providers.get(&lower))
     {
         let kind = parse_provider(&custom.provider_type)?;
-        if let Err(err) =
-            validate_custom_provider(name, &custom.base_url, custom.allow_insecure)
-        {
+        if let Err(err) = validate_custom_provider(name, &custom.base_url, custom.allow_insecure) {
             tracing::error!(
                 target: "dirge::provider",
                 "{err}"
@@ -117,9 +115,7 @@ pub fn resolve_provider_info(
     // in this process.
     if let Some(custom) = plugin_provider(name).or_else(|| plugin_provider(&lower)) {
         let kind = parse_provider(&custom.provider_type)?;
-        if let Err(err) =
-            validate_custom_provider(name, &custom.base_url, custom.allow_insecure)
-        {
+        if let Err(err) = validate_custom_provider(name, &custom.base_url, custom.allow_insecure) {
             tracing::error!(
                 target: "dirge::provider",
                 "{err}"
@@ -145,9 +141,16 @@ pub fn resolve_provider_info(
 /// if they collide with one of these. Protects against a malicious
 /// plugin that registers "openai" to silently intercept credentials.
 const BUILTIN_PROVIDER_NAMES: &[&str] = &[
-    "openai", "anthropic", "gemini", "google",
-    "deepseek", "glm", "zhipu", "ollama",
-    "openrouter", "custom",
+    "openai",
+    "anthropic",
+    "gemini",
+    "google",
+    "deepseek",
+    "glm",
+    "zhipu",
+    "ollama",
+    "openrouter",
+    "custom",
 ];
 
 /// Validate a custom/plugin provider's configuration.
@@ -159,7 +162,10 @@ fn validate_custom_provider(
     allow_insecure: bool,
 ) -> Result<(), String> {
     let lower = name.to_ascii_lowercase();
-    if BUILTIN_PROVIDER_NAMES.iter().any(|b| b.eq_ignore_ascii_case(&lower)) {
+    if BUILTIN_PROVIDER_NAMES
+        .iter()
+        .any(|b| b.eq_ignore_ascii_case(&lower))
+    {
         return Err(format!(
             "Custom provider '{}' collides with built-in provider name. \
              Choose a different name.",
@@ -1407,7 +1413,10 @@ mod tests {
             },
         )]);
         let result = resolve_provider_info("bad-proxy", &custom);
-        assert!(result.is_none(), "http provider without allow_insecure should be rejected");
+        assert!(
+            result.is_none(),
+            "http provider without allow_insecure should be rejected"
+        );
     }
 
     /// Custom provider with http base_url + allow_insecure: true is accepted.
@@ -1424,7 +1433,10 @@ mod tests {
             },
         )]);
         let result = resolve_provider_info("local-ollama", &custom);
-        assert!(result.is_some(), "http provider with allow_insecure should be accepted");
+        assert!(
+            result.is_some(),
+            "http provider with allow_insecure should be accepted"
+        );
     }
 
     /// Custom provider name colliding with built-in is rejected.
@@ -1442,6 +1454,9 @@ mod tests {
             },
         )]);
         let result = resolve_provider_info("openai", &custom);
-        assert!(result.is_none(), "builtin name collision should be rejected");
+        assert!(
+            result.is_none(),
+            "builtin name collision should be rejected"
+        );
     }
 }

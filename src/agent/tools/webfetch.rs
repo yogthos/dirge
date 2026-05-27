@@ -179,8 +179,12 @@ fn is_private_or_loopback(ip: std::net::IpAddr) -> bool {
 fn is_ipv4_mapped_ipv6(v6: std::net::Ipv6Addr) -> bool {
     let segs = v6.segments();
     // IPv4-mapped: first 80 bits are zero, next 16 bits are 0xffff.
-    if segs[0] == 0 && segs[1] == 0 && segs[2] == 0
-        && segs[3] == 0 && segs[4] == 0 && segs[5] == 0xffff
+    if segs[0] == 0
+        && segs[1] == 0
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0
+        && segs[5] == 0xffff
     {
         // The last 32 bits are the IPv4 address.
         let v4_bytes = v6.octets();
@@ -227,12 +231,7 @@ fn parse_alt_ipv4(s: &str) -> Option<[u8; 4]> {
     if let Some(hex) = lower.strip_prefix("0x") {
         if !hex.contains('.') && hex.chars().all(|c| c.is_ascii_hexdigit()) {
             if let Ok(n) = u32::from_str_radix(hex, 16) {
-                return Some([
-                    (n >> 24) as u8,
-                    (n >> 16) as u8,
-                    (n >> 8) as u8,
-                    n as u8,
-                ]);
+                return Some([(n >> 24) as u8, (n >> 16) as u8, (n >> 8) as u8, n as u8]);
             }
         }
         // Don't return None here — the "0x" prefix on a dotted-quad
@@ -242,12 +241,7 @@ fn parse_alt_ipv4(s: &str) -> Option<[u8; 4]> {
     if !s.contains('.') && s.chars().all(|c| c.is_ascii_digit()) {
         if let Ok(n) = s.parse::<u64>() {
             if n <= u32::MAX as u64 {
-                return Some([
-                    (n >> 24) as u8,
-                    (n >> 16) as u8,
-                    (n >> 8) as u8,
-                    n as u8,
-                ]);
+                return Some([(n >> 24) as u8, (n >> 16) as u8, (n >> 8) as u8, n as u8]);
             }
         }
         return None;

@@ -202,20 +202,23 @@ where
 }
 
 async fn dispatch(inner: &Arc<Inner>, msg: Value) {
-        // EXT-5: JSON-RPC spec permits string IDs; some servers (e.g.
-        // rust-analyzer's internal notifications, clangd diagnostics)
-        // use them. Previously only u64 was handled, so string-ID
-        // responses were silently dropped and callers timed out.
-        let id_value = msg.get("id").cloned();
-        let id_num = id_value.as_ref().and_then(|v| v.as_u64());
-        let id_str = id_value.as_ref().and_then(|v| v.as_str()).map(String::from);
-        let method = msg.get("method").and_then(|v| v.as_str()).map(String::from);
+    // EXT-5: JSON-RPC spec permits string IDs; some servers (e.g.
+    // rust-analyzer's internal notifications, clangd diagnostics)
+    // use them. Previously only u64 was handled, so string-ID
+    // responses were silently dropped and callers timed out.
+    let id_value = msg.get("id").cloned();
+    let id_num = id_value.as_ref().and_then(|v| v.as_u64());
+    let id_str = id_value.as_ref().and_then(|v| v.as_str()).map(String::from);
+    let method = msg.get("method").and_then(|v| v.as_str()).map(String::from);
 
-        match (id_num.or_else(|| id_str.as_ref().and_then(|s| s.parse().ok())), method) {
-            (Some(id), None) => {
-                // Response to one of our requests.
-                let sender = inner.pending.lock().await.remove(&id);
-                if let Some(sender) = sender {
+    match (
+        id_num.or_else(|| id_str.as_ref().and_then(|s| s.parse().ok())),
+        method,
+    ) {
+        (Some(id), None) => {
+            // Response to one of our requests.
+            let sender = inner.pending.lock().await.remove(&id);
+            if let Some(sender) = sender {
                 let result = if let Some(err) = msg.get("error") {
                     let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
                     let message = err

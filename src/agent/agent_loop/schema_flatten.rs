@@ -200,7 +200,10 @@ fn set_by_path(target: &mut serde_json::Map<String, Value>, path: Vec<&str>, val
             // between the check and the get_mut, or an adversarial
             // schema that inserts a non-object between our insert
             // and read), skip instead of panicking.
-            cur = match cur.get_mut(&key.to_string()).and_then(|v| v.as_object_mut()) {
+            cur = match cur
+                .get_mut(&key.to_string())
+                .and_then(|v| v.as_object_mut())
+            {
                 Some(obj) => obj,
                 None => {
                     tracing::warn!(

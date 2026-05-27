@@ -154,7 +154,11 @@ fn dump_events(events: &[AgentEvent]) {
             AgentEvent::ContextCompacted { .. } => {
                 eprintln!("\n[context_compacted]");
             }
-            AgentEvent::RetryNotice { attempt, delay_ms, error } => {
+            AgentEvent::RetryNotice {
+                attempt,
+                delay_ms,
+                error,
+            } => {
                 eprintln!("\n[retry_notice] attempt={attempt} delay_ms={delay_ms}: {error}");
             }
         }

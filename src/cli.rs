@@ -199,7 +199,8 @@ pub struct Cli {
     )]
     pub loop_run: Option<String>,
 
-    #[arg(long = "auto-confirm",
+    #[arg(
+        long = "auto-confirm",
         value_enum,
         help = "Auto-respond to plugin harness/confirm and harness/select dialogs in headless modes. Without this flag, dialogs hang waiting for an interactive UI."
     )]

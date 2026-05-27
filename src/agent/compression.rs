@@ -479,10 +479,17 @@ mod tests {
         let pruned = prune_tool_outputs(&msgs, 2);
         // The large toolResult should be summarized now (contains "[bash]" marker).
         let summary = pruned[1]["content"].as_str().unwrap();
-        assert!(summary.contains("[bash]"), "should summarize bash tool result: {summary}");
+        assert!(
+            summary.contains("[bash]"),
+            "should summarize bash tool result: {summary}"
+        );
         // The summary should be MUCH shorter than the original 1000 chars
         // (it contains the escaped command + metadata, but the 1000 x's are truncated).
-        assert!(summary.len() < 500, "summary should be under 500 chars: {}", summary.len());
+        assert!(
+            summary.len() < 500,
+            "summary should be under 500 chars: {}",
+            summary.len()
+        );
         // Small result in tail should be untouched.
         assert_eq!(pruned[2]["content"].as_str().unwrap(), "small");
     }
