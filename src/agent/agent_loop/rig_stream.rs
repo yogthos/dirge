@@ -107,6 +107,22 @@ where
         // `internal_call_id`.
         let mut tool_indices: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        // Phase-1 item #4 (docs/AGENTIC_LOOP_PLAN.md): set of tool
+        // calls whose `ToolCallEnd` hasn't fired yet. While any
+        // entry is open we apply a TIGHTER chunk timeout — a
+        // provider that stalls mid-tool-call surfaces an error
+        // within ~30s instead of waiting the full
+        // `stream_chunk_timeout_secs` (default 300s). Tool-call
+        // reassembly is the failure mode the catalogue
+        // specifically calls out (§2.2: "Implement a timeout
+        // (e.g., 2 seconds) after which a repair attempt is made,
+        // or an error is returned to the model"). We're more
+        // conservative than 2s — provider tail latency is real —
+        // but much tighter than the broad chunk timeout.
+        let mut open_tool_calls: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        const TOOL_CALL_GAP_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(30);
 
         // Token usage captured from the Final(R) provider response.
         let mut token_usage: Option<super::message::TokenUsage> = None;
@@ -129,10 +145,16 @@ where
                 };
                 return;
             }
-            // Apply per-chunk timeout if configured. The yield
-            // pattern below mirrors `while let Some(...)` exactly
-            // for the non-timeout path.
-            let next = match chunk_timeout {
+            // Apply per-chunk timeout if configured. When a tool
+            // call is mid-assembly, narrow the wait to the gap
+            // timeout so a stalled reassembly surfaces fast.
+            let effective_timeout = match chunk_timeout {
+                Some(t) if !open_tool_calls.is_empty() => Some(t.min(TOOL_CALL_GAP_TIMEOUT)),
+                Some(t) => Some(t),
+                None if !open_tool_calls.is_empty() => Some(TOOL_CALL_GAP_TIMEOUT),
+                None => None,
+            };
+            let next = match effective_timeout {
                 Some(t) => match tokio::time::timeout(t, raw.next()).await {
                     Ok(item) => item,
                     Err(_) => {
@@ -140,12 +162,19 @@ where
                         // recovery::classify_error matches on
                         // it and routes to ErrorKind::Network for
                         // retry. Matches runner.rs:301-304.
-                        yield StreamEvent::Error {
-                            error: format!(
+                        let detail = if !open_tool_calls.is_empty() {
+                            format!(
+                                "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls)",
+                                t.as_secs(),
+                                TOOL_CALL_GAP_TIMEOUT.as_secs(),
+                            )
+                        } else {
+                            format!(
                                 "stream chunk timed out after {}s (provider stalled or connection silently dropped) — bump `stream_chunk_timeout_secs` in config.json if your model has long reasoning gaps",
                                 t.as_secs(),
-                            ),
+                            )
                         };
+                        yield StreamEvent::Error { error: detail };
                         return;
                     }
                 },
@@ -275,7 +304,7 @@ where
                     } else {
                         let idx = partial.content.len();
                         partial.content.push(new_block);
-                        tool_indices.insert(internal_call_id, idx);
+                        tool_indices.insert(internal_call_id.clone(), idx);
                     }
                     current_text_idx = None;
                     current_thinking_idx = None;
@@ -291,6 +320,11 @@ where
                         partial: partial.clone(),
                         phase: DeltaPhase::ToolCallEnd,
                     };
+                    // Phase-1 #4: clear the open-call marker now
+                    // that the call is finalized. `was_existing`
+                    // means deltas arrived first; either way the
+                    // ToolCallEnd above closes it.
+                    open_tool_calls.remove(&internal_call_id);
                 }
                 Ok(StreamedAssistantContent::ToolCallDelta {
                     id,
@@ -314,6 +348,10 @@ where
                             arguments: serde_json::Value::String(String::new()),
                         });
                         tool_indices.insert(internal_call_id.clone(), i);
+                        // Phase-1 #4: mark this call open so the
+                        // chunk-timeout narrows until ToolCallEnd
+                        // fires.
+                        open_tool_calls.insert(internal_call_id.clone());
                         current_text_idx = None;
                         current_thinking_idx = None;
                         i
@@ -866,6 +904,34 @@ mod tests {
         }))
     }
 
+    /// Stream that yields a partial ToolCallDelta then stalls
+    /// forever. Models the "DeepSeek stalled mid-tool-call"
+    /// failure that Phase-1 item #4 targets.
+    fn tool_call_delta_then_stall() -> Pin<
+        Box<
+            dyn Stream<Item = Result<StreamedAssistantContent<TestResponse>, CompletionError>>
+                + Send,
+        >,
+    > {
+        use futures::stream;
+        use rig::streaming::ToolCallDeltaContent;
+        Box::pin(stream::unfold(0u32, |n| async move {
+            if n == 0 {
+                Some((
+                    Ok(StreamedAssistantContent::ToolCallDelta {
+                        id: "call_a".to_string(),
+                        internal_call_id: "ica_a".to_string(),
+                        content: ToolCallDeltaContent::Name("read".to_string()),
+                    }),
+                    1,
+                ))
+            } else {
+                let () = futures::future::pending().await;
+                None
+            }
+        }))
+    }
+
     /// `None` chunk_timeout → no timeout enforcement. Verifies
     /// the disabled-timeout path is identical to the pre-h-3
     /// behavior.
@@ -882,6 +948,44 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StreamEvent::Error { .. }))
         );
+    }
+
+    /// Phase-1 #4: when a tool call is mid-assembly, the chunk
+    /// timeout narrows to the gap-timeout (30s) even if the
+    /// configured `chunk_timeout` is much larger. Without this,
+    /// a provider stalled emitting tool-call deltas would wait
+    /// the full 300s default before erroring.
+    #[tokio::test]
+    async fn tool_call_gap_timeout_fires_within_30s_even_with_large_chunk_timeout() {
+        tokio::time::pause();
+        let raw = tool_call_delta_then_stall();
+        let drain_task = tokio::spawn(async move {
+            drain(wrap_streamed_assistant(
+                raw,
+                Some(Duration::from_secs(300)),
+                None,
+            ))
+            .await
+        });
+        // Advance just past the gap timeout. The broad 300s
+        // timeout would not have fired yet.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let events = drain_task.await.unwrap();
+
+        let last = events.last().expect("must have events");
+        match last {
+            StreamEvent::Error { error } => {
+                assert!(
+                    error.contains("timed out"),
+                    "error must contain 'timed out' for retry routing: {error}"
+                );
+                assert!(
+                    error.contains("tool call was mid-assembly") || error.contains("tool-call"),
+                    "error should explain the tighter tool-call timeout: {error}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     /// Stalled stream + `Some(timeout)` → Error event with
