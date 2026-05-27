@@ -30,9 +30,13 @@ pub mod heal;
 pub mod hooks;
 pub mod inflight;
 pub mod integration;
+#[cfg(test)]
+mod integration_tests;
 pub mod message;
 #[cfg(feature = "plugin")]
 pub mod plugin_hooks;
+#[cfg(all(test, feature = "plugin"))]
+mod plugin_hooks_tests;
 pub mod result;
 pub mod retry;
 pub mod rig_stream;
