@@ -124,9 +124,8 @@ impl Tool for GrepTool {
         // filesystem), so the cache may still go stale for in-
         // place edits within the dir — but the common case
         // (file add/remove/rename) is caught.
-        let stamp = crate::agent::tools::cache::fs_stamp_or_cwd(
-            args.path.as_deref().unwrap_or("."),
-        );
+        let stamp =
+            crate::agent::tools::cache::fs_stamp_or_cwd(args.path.as_deref().unwrap_or("."));
         let cache_key = format!(
             "grep:{}:{}:{}:{}:hidden={}:{}",
             args.pattern,

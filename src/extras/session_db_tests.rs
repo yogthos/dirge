@@ -456,9 +456,7 @@ fn redact_for_fts_strips_vendor_prefix_tokens() {
 
 #[test]
 fn redact_for_fts_strips_url_userinfo() {
-    let r = redact_for_fts(
-        "DATABASE_URL=postgres://admin:hunter2@db.internal:5432/app",
-    );
+    let r = redact_for_fts("DATABASE_URL=postgres://admin:hunter2@db.internal:5432/app");
     assert!(!r.contains("hunter2"), "got: {r}");
     // The whole assignment value gets caught by the env-assign
     // pattern first (DATABASE_URL doesn't trip the AUTH/KEY/TOKEN
@@ -494,7 +492,10 @@ fn redact_for_fts_strips_env_assignment() {
 fn redact_for_fts_strips_jwt() {
     let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
     let r = redact_for_fts(&format!("token = {jwt}"));
-    assert!(!r.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"), "got: {r}");
+    assert!(
+        !r.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"),
+        "got: {r}"
+    );
     assert!(r.contains("<REDACTED>"));
 }
 
@@ -564,8 +565,7 @@ fn fts_index_redacts_secrets_inside_tool_calls() {
     db.insert_session("sess-1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
         .unwrap();
 
-    let tool_calls =
-        r#"[{"name":"bash","args":{"cmd":"curl -H 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789' https://api.example.com"}}]"#;
+    let tool_calls = r#"[{"name":"bash","args":{"cmd":"curl -H 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789' https://api.example.com"}}]"#;
     db.insert_message(
         "sess-1",
         "assistant",

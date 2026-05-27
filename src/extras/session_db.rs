@@ -116,10 +116,7 @@ pub fn redact_for_fts(text: &str) -> String {
     // JWTs (3-part eyJ...) — gate on "eyJ" substring.
     if out.contains("eyJ") {
         let re = JWT_RE.get_or_init(|| {
-            Regex::new(
-                r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_=-]{4,}",
-            )
-            .unwrap()
+            Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_=-]{4,}").unwrap()
         });
         if re.is_match(&out) {
             out = re.replace_all(&out, "<REDACTED>").into_owned().into();
@@ -129,27 +126,19 @@ pub fn redact_for_fts(text: &str) -> String {
     // URLs with userinfo: scheme://user:pass@host
     if out.contains("://") {
         let re = URL_USERINFO_RE.get_or_init(|| {
-            Regex::new(r"([A-Za-z][A-Za-z0-9+.\-]*://)([^/\s:@]*):([^/\s@]+)@")
-                .unwrap()
+            Regex::new(r"([A-Za-z][A-Za-z0-9+.\-]*://)([^/\s:@]*):([^/\s@]+)@").unwrap()
         });
         if re.is_match(&out) {
-            out = re
-                .replace_all(&out, "${1}<REDACTED>@")
-                .into_owned()
-                .into();
+            out = re.replace_all(&out, "${1}<REDACTED>@").into_owned().into();
         }
     }
 
     // Authorization: Bearer <token>
     if out.contains("uthorization") || out.contains("UTHORIZATION") {
-        let re = AUTH_HEADER_RE.get_or_init(|| {
-            Regex::new(r"(?i)(Authorization:\s*Bearer\s+)\S+").unwrap()
-        });
+        let re = AUTH_HEADER_RE
+            .get_or_init(|| Regex::new(r"(?i)(Authorization:\s*Bearer\s+)\S+").unwrap());
         if re.is_match(&out) {
-            out = re
-                .replace_all(&out, "${1}<REDACTED>")
-                .into_owned()
-                .into();
+            out = re.replace_all(&out, "${1}<REDACTED>").into_owned().into();
         }
     }
 
@@ -163,10 +152,7 @@ pub fn redact_for_fts(text: &str) -> String {
             .unwrap()
         });
         if re.is_match(&out) {
-            out = re
-                .replace_all(&out, "${1}<REDACTED>")
-                .into_owned()
-                .into();
+            out = re.replace_all(&out, "${1}<REDACTED>").into_owned().into();
         }
     }
 

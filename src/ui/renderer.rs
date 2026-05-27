@@ -104,9 +104,7 @@ fn format_terminal_title(state: crate::ui::avatar::AvatarState, tool_name: Optio
     // title display.
     let sanitize = |s: &str| -> String {
         s.chars()
-            .filter(|c| {
-                !c.is_control() && *c != '\u{0007}' && *c != '\u{001b}' && *c != '\u{009c}'
-            })
+            .filter(|c| !c.is_control() && *c != '\u{0007}' && *c != '\u{001b}' && *c != '\u{009c}')
             .take(64)
             .collect()
     };

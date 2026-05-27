@@ -15,9 +15,8 @@ use crate::ui::events::sanitize_output;
 use crate::ui::run_handlers::RunCtx;
 use crate::ui::theme;
 use crate::ui::tool_display::{
-    chamber_bottom, chamber_row, chamber_row_with_bg, chamber_widths,
-    close_tool_chamber_passive, fit_banner_header, format_tool_banner_value,
-    render_tool_output,
+    chamber_bottom, chamber_row, chamber_row_with_bg, chamber_widths, close_tool_chamber_passive,
+    fit_banner_header, format_tool_banner_value, render_tool_output,
 };
 
 pub(crate) async fn handle_tool_result(
@@ -60,10 +59,7 @@ pub(crate) async fn handle_tool_result(
     // of completion order. The id-matches case (the
     // common sequential path) falls through to the
     // existing render paths below.
-    if !id.is_empty()
-        && ctx.last_tool_call_id.as_deref() != Some(id.as_str())
-        && show_details
-    {
+    if !id.is_empty() && ctx.last_tool_call_id.as_deref() != Some(id.as_str()) && show_details {
         // Close whatever chamber is on screen first,
         // then paint a fresh TOP for this id. We
         // don't reuse the ToolCall handler's TOP-

@@ -107,7 +107,8 @@ pub(super) async fn cmd_mode(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::
                     p.lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .set_mode(SecurityMode::Standard);
-                    ctx.renderer.write_line("security mode: standard", c_agent())?;
+                    ctx.renderer
+                        .write_line("security mode: standard", c_agent())?;
                 } else {
                     ctx.renderer
                         .write_line("permission system not active", c_error())?;
@@ -130,10 +131,8 @@ pub(super) async fn cmd_mode(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::
                     p.lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .set_mode(SecurityMode::Accept);
-                    ctx.renderer.write_line(
-                        "security mode: accept (auto-allow within CWD)",
-                        c_agent(),
-                    )?;
+                    ctx.renderer
+                        .write_line("security mode: accept (auto-allow within CWD)", c_agent())?;
                 } else {
                     ctx.renderer
                         .write_line("permission system not active", c_error())?;
@@ -144,10 +143,8 @@ pub(super) async fn cmd_mode(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::
                     p.lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .set_mode(SecurityMode::Yolo);
-                    ctx.renderer.write_line(
-                        "security mode: YOLO (all operations allowed)",
-                        c_agent(),
-                    )?;
+                    ctx.renderer
+                        .write_line("security mode: YOLO (all operations allowed)", c_agent())?;
                 } else {
                     ctx.renderer
                         .write_line("permission system not active", c_error())?;

@@ -77,13 +77,13 @@ pub(crate) async fn handle_done(
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
     agent_interject: &mut Option<mpsc::Sender<()>>,
-    interjection_queue: &std::sync::Arc<
-        std::sync::Mutex<std::collections::VecDeque<String>>,
-    >,
+    interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
-    #[cfg(feature = "plugin")] plugin_manager: Option<&std::sync::Arc<std::sync::Mutex<PluginManager>>>,
+    #[cfg(feature = "plugin")] plugin_manager: Option<
+        &std::sync::Arc<std::sync::Mutex<PluginManager>>,
+    >,
     #[cfg(feature = "loop")] loop_bits: LoopBits<'_>,
     #[cfg(feature = "git-worktree")] worktree_bits: WorktreeBits<'_>,
 ) -> anyhow::Result<()> {
@@ -196,10 +196,8 @@ pub(crate) async fn handle_done(
         match mgr.dispatch("prepare-next-run", "@{}") {
             Ok(_) => {}
             Err(e) => {
-                ctx.renderer.write_line(
-                    &format!("[plugin] prepare-next-run error: {e}"),
-                    c_error(),
-                )?;
+                ctx.renderer
+                    .write_line(&format!("[plugin] prepare-next-run error: {e}"), c_error())?;
             }
         }
         if let Some(next_model) = mgr.take_pending_next_model() {
@@ -308,7 +306,9 @@ pub(crate) async fn handle_done(
 
     if !loop_running
         && ctx.cfg.resolve_compact_enabled()
-        && ctx.session.needs_compaction(ctx.cfg.resolve_reserve_tokens())
+        && ctx
+            .session
+            .needs_compaction(ctx.cfg.resolve_reserve_tokens())
         && !ctx.cli.no_session
     {
         // Auto-compact failure used to render as a
@@ -372,8 +372,10 @@ pub(crate) async fn handle_done(
             )?;
             ctx.renderer
                 .write_line("│ hitting context-length errors. Try /compress", c_error())?;
-            ctx.renderer
-                .write_line("│ manually, /clear to start fresh, or restart with", c_error())?;
+            ctx.renderer.write_line(
+                "│ manually, /clear to start fresh, or restart with",
+                c_error(),
+            )?;
             ctx.renderer
                 .write_line("│ a larger context_window in config.", c_error())?;
             ctx.renderer.write_line(
@@ -386,8 +388,10 @@ pub(crate) async fn handle_done(
     if !ctx.cli.no_session
         && let Err(e) = crate::session::storage::save_session(ctx.session)
     {
-        ctx.renderer
-            .write_line(&format!("warning: failed to save session: {}", e), c_error())?;
+        ctx.renderer.write_line(
+            &format!("warning: failed to save session: {}", e),
+            c_error(),
+        )?;
     }
     *is_running = false;
     if let Some(h) = agent_abort.take() {
@@ -433,21 +437,20 @@ pub(crate) async fn handle_done(
             *agent_interject = Some(runner.interject_tx);
             *is_running = true;
         }
-        crate::plugin::PostDoneAction::LoopStop => {
+        crate::plugin::PostDoneAction::LoopStop =>
+        {
             #[cfg(feature = "loop")]
             if let Some(ls) = loop_bits.state.as_mut() {
                 ctx.renderer.write_line(
-                    &format!(
-                        "[loop] max iterations ({}) reached, stopping",
-                        ls.iteration
-                    ),
+                    &format!("[loop] max iterations ({}) reached, stopping", ls.iteration),
                     c_agent(),
                 )?;
                 ls.active = false;
                 *loop_bits.label = None;
             }
         }
-        crate::plugin::PostDoneAction::LoopIter => {
+        crate::plugin::PostDoneAction::LoopIter =>
+        {
             #[cfg(feature = "loop")]
             if let Some(ls) = loop_bits.state.as_mut() {
                 let summary: String = response.chars().take(200).collect();

@@ -62,11 +62,11 @@ use crate::sandbox::Sandbox;
 use crate::semantic::SemanticManager;
 use crate::session::{MessageRole, PermissionAllowEntry, Session};
 use crate::shell;
+#[cfg(feature = "plugin")]
+use crate::ui::agent_io::render_plugin_entry;
 use crate::ui::agent_io::{
     apply_subagent_panel_event, capture_partial_on_abort, persist_turn_to_db, render_agent_stream,
 };
-#[cfg(feature = "plugin")]
-use crate::ui::agent_io::render_plugin_entry;
 use crate::ui::chat_state::{ChatUiState, load_chat_ui_state, save_chat_ui_state};
 use crate::ui::colors::{c_agent, c_error, c_perm, c_tool, resolve_color};
 use crate::ui::events::{render_session, sanitize_output};
@@ -401,28 +401,30 @@ pub async fn run_interactive(
     // the closure approach would need to capture every field
     // by-mut-ref simultaneously, which the borrow checker would
     // (correctly) reject.
-    macro_rules! make_run_ctx { () => {
-        run_handlers::RunCtx {
-            renderer: &mut renderer,
-            session,
-            response_buf: &mut response_buf,
-            response_start_line: &mut response_start_line,
-            reasoning_buf: &mut reasoning_buf,
-            reasoning_start_line: &mut reasoning_start_line,
-            agent_line_started: &mut agent_line_started,
-            last_tool_name: &mut last_tool_name,
-            last_tool_call_id: &mut last_tool_call_id,
-            tool_chamber_open: &mut tool_chamber_open,
-            chamber_top_start: &mut chamber_top_start,
-            chamber_top_end: &mut chamber_top_end,
-            tool_calls_buf: &mut tool_calls_buf,
-            tool_calls_this_run: &mut tool_calls_this_run,
-            last_collapsed: &mut _last_collapsed,
-            last_user_prompt: &mut last_user_prompt,
-            cli,
-            cfg,
-        }
-    }; }
+    macro_rules! make_run_ctx {
+        () => {
+            run_handlers::RunCtx {
+                renderer: &mut renderer,
+                session,
+                response_buf: &mut response_buf,
+                response_start_line: &mut response_start_line,
+                reasoning_buf: &mut reasoning_buf,
+                reasoning_start_line: &mut reasoning_start_line,
+                agent_line_started: &mut agent_line_started,
+                last_tool_name: &mut last_tool_name,
+                last_tool_call_id: &mut last_tool_call_id,
+                tool_chamber_open: &mut tool_chamber_open,
+                chamber_top_start: &mut chamber_top_start,
+                chamber_top_end: &mut chamber_top_end,
+                tool_calls_buf: &mut tool_calls_buf,
+                tool_calls_this_run: &mut tool_calls_this_run,
+                last_collapsed: &mut _last_collapsed,
+                last_user_prompt: &mut last_user_prompt,
+                cli,
+                cfg,
+            }
+        };
+    }
 
     render_session(&mut renderer, session, cli, cfg, context)?;
     renderer.draw_bottom(

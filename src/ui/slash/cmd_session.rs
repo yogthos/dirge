@@ -13,10 +13,8 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
         if sessions.is_empty() {
             ctx.renderer.write_line("no saved sessions", c_agent())?;
         } else {
-            ctx.renderer.write_line(
-                &format!("recent sessions ({}):", sessions.len()),
-                c_agent(),
-            )?;
+            ctx.renderer
+                .write_line(&format!("recent sessions ({}):", sessions.len()), c_agent())?;
             for s in &sessions {
                 let last = s
                     .messages
@@ -220,10 +218,8 @@ pub(super) async fn cmd_tree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::
                         .write_line(&format!("switch failed: {}", e), c_error())?;
                 } else {
                     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
-                    ctx.renderer.write_line(
-                        &format!("switched to leaf {}", short_id(&id)),
-                        c_agent(),
-                    )?;
+                    ctx.renderer
+                        .write_line(&format!("switched to leaf {}", short_id(&id)), c_agent())?;
                 }
             }
             Err(e) => ctx
@@ -289,10 +285,8 @@ pub(super) async fn cmd_clone(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
             Ok(id) => match ctx.session.clone_at(&id) {
                 Ok(()) => {
                     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
-                    ctx.renderer.write_line(
-                        &format!("cloned path through {}", short_id(&id)),
-                        c_agent(),
-                    )?;
+                    ctx.renderer
+                        .write_line(&format!("cloned path through {}", short_id(&id)), c_agent())?;
                 }
                 Err(e) => ctx
                     .renderer

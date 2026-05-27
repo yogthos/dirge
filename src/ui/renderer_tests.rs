@@ -713,7 +713,11 @@ fn osc_set_title_uses_st_terminator() {
     let bytes = super::osc_set_title("hello");
     // OSC introducer `\x1b]0;` + payload + ST terminator `\x1b\\`
     assert_eq!(bytes, b"\x1b]0;hello\x1b\\");
-    assert!(!bytes.contains(&0x07), "BEL should not be used: {:?}", bytes);
+    assert!(
+        !bytes.contains(&0x07),
+        "BEL should not be used: {:?}",
+        bytes
+    );
 }
 
 #[cfg(feature = "experimental-ui-terminal-tab")]

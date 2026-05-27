@@ -218,7 +218,11 @@ async fn prepare_tool_call(
             // multi-MB tool-call args are unusual but possible.
             let original_args = serde_json::to_string(&prepared_args).unwrap_or_default();
             let original_truncated: String = if original_args.len() > 4096 {
-                format!("{}... ({} bytes truncated)", &original_args[..4096], original_args.len() - 4096)
+                format!(
+                    "{}... ({} bytes truncated)",
+                    &original_args[..4096],
+                    original_args.len() - 4096
+                )
             } else {
                 original_args
             };
@@ -846,4 +850,3 @@ pub fn extract_tool_calls(msg: &AssistantMessage) -> Vec<ToolCall> {
 #[cfg(test)]
 #[path = "tools_tests.rs"]
 mod tests;
-

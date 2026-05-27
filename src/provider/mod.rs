@@ -192,10 +192,7 @@ fn validate_custom_provider(
     // a public-looking host with allow_insecure gets a LOUD stderr
     // warning every session so a misconfigured production setup
     // doesn't silently leak conversation content.
-    if allow_insecure
-        && base_url.starts_with("http://")
-        && !looks_like_local_host(base_url)
-    {
+    if allow_insecure && base_url.starts_with("http://") && !looks_like_local_host(base_url) {
         eprintln!(
             "  ⚠️  WARNING: custom provider '{}' is using http:// over a NON-LOCAL host: {}\n  Every prompt, file content, and tool result is sent in plaintext.\n  This is allowed because allow_insecure: true is set in config.json,\n  but you should verify this is intentional — the typical allow_insecure\n  use case is loopback (127.0.0.1 / localhost) endpoints like ollama.",
             name, base_url,
@@ -241,9 +238,7 @@ fn looks_like_local_host(base_url: &str) -> bool {
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local()
-            }
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
             std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
         };
     }

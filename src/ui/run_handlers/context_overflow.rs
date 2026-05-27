@@ -53,9 +53,7 @@ pub(crate) async fn handle_context_overflow(
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
     agent_interject: &mut Option<mpsc::Sender<()>>,
-    interjection_queue: &std::sync::Arc<
-        std::sync::Mutex<std::collections::VecDeque<String>>,
-    >,
+    interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
@@ -158,9 +156,11 @@ pub(crate) async fn handle_context_overflow(
                 &prompt_owned,
                 bg_store.as_ref(),
             );
-            let runner = agent
-                .clone()
-                .spawn_runner(prepared_prompt, history, Some(interjection_queue.clone()));
+            let runner = agent.clone().spawn_runner(
+                prepared_prompt,
+                history,
+                Some(interjection_queue.clone()),
+            );
             *agent_rx = Some(runner.event_rx);
             *agent_abort = Some(runner.task);
             *agent_interject = Some(runner.interject_tx);

@@ -29,5 +29,8 @@ pub(crate) async fn run_shell_command(cmd: &str, sandbox: &Sandbox) -> anyhow::R
     // and other terminal controls that `write_line` would pass
     // straight to ratatui's buffer — and from there to the
     // terminal emulator.
-    Ok(ansi::strip_escapes(&result, ansi::StripPolicy::KEEP_NEWLINE))
+    Ok(ansi::strip_escapes(
+        &result,
+        ansi::StripPolicy::KEEP_NEWLINE,
+    ))
 }

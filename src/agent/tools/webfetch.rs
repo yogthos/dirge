@@ -162,8 +162,7 @@ impl reqwest::dns::Resolve for ValidatingResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let allow_private =
-                std::env::var("DIRGE_WEBFETCH_ALLOW_PRIVATE").as_deref() == Ok("1");
+            let allow_private = std::env::var("DIRGE_WEBFETCH_ALLOW_PRIVATE").as_deref() == Ok("1");
             // System resolver via tokio. Use port 0 — reqwest
             // overrides the port at connect time; we only care
             // about the IP for validation.
@@ -189,7 +188,8 @@ impl reqwest::dns::Resolve for ValidatingResolver {
                         "all resolved addresses for {host:?} are blocked by SSRF guard \
                          (private/loopback/link-local); set DIRGE_WEBFETCH_ALLOW_PRIVATE=1 to allow"
                     ),
-                )) as Box<dyn std::error::Error + Send + Sync>);
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
             }
             let boxed: reqwest::dns::Addrs = Box::new(filtered.into_iter());
             Ok(boxed)

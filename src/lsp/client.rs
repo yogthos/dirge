@@ -881,12 +881,8 @@ mod tests {
 
         let path_for_a = path.clone();
         let client_for_a = client.clone();
-        let t_a = tokio::spawn(async move {
-            client_for_a.notify_open(&path_for_a).await.unwrap()
-        });
-        let t_b = tokio::spawn(async move {
-            client_for_b.notify_open(&path_for_b).await.unwrap()
-        });
+        let t_a = tokio::spawn(async move { client_for_a.notify_open(&path_for_a).await.unwrap() });
+        let t_b = tokio::spawn(async move { client_for_b.notify_open(&path_for_b).await.unwrap() });
 
         let (va, vb) = tokio::join!(t_a, t_b);
         let va = va.unwrap();
@@ -912,8 +908,7 @@ mod tests {
         for f in [&f1, &f2] {
             assert_eq!(f["method"], "textDocument/didChange");
             assert_eq!(
-                f["params"]["contentChanges"][0]["text"],
-                "second contents\n",
+                f["params"]["contentChanges"][0]["text"], "second contents\n",
                 "frame must reflect on-disk contents at call time: {f}"
             );
         }

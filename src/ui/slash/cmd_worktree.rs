@@ -10,7 +10,8 @@ use crate::ui::events::render_session;
 
 pub(super) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        ctx.renderer.write_line("usage: /worktree <name>", c_error())?;
+        ctx.renderer
+            .write_line("usage: /worktree <name>", c_error())?;
         return Ok(());
     }
     let name = parts[1].trim();

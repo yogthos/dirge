@@ -343,9 +343,7 @@ mod tests {
     fn is_sensitive_env_value_catches_db_userinfo() {
         // PERM-11: name passes the denylist, but the VALUE carries
         // a credential. Catch it.
-        assert!(is_sensitive_env_value(
-            "postgres://user:pass@host:5432/db"
-        ));
+        assert!(is_sensitive_env_value("postgres://user:pass@host:5432/db"));
         assert!(is_sensitive_env_value("mysql://root:hunter2@db/app"));
         assert!(is_sensitive_env_value(
             "mongodb+srv://admin:secret@cluster.example.com/test"
@@ -415,9 +413,9 @@ mod tests {
     fn is_sensitive_env_value_short_prefix_lookalikes_not_flagged() {
         // Prefix lookalikes that are TOO short / wrong char class to
         // be real tokens shouldn't trip the regex.
-        assert!(!is_sensitive_env_value("AKIA"));            // bare prefix
-        assert!(!is_sensitive_env_value("ghp_short"));       // not enough chars after prefix
-        assert!(!is_sensitive_env_value("sk-"));             // bare prefix
+        assert!(!is_sensitive_env_value("AKIA")); // bare prefix
+        assert!(!is_sensitive_env_value("ghp_short")); // not enough chars after prefix
+        assert!(!is_sensitive_env_value("sk-")); // bare prefix
         // Bare "eyJ..." without a payload+signature must NOT match
         // the 3-part JWT pattern. (2-part JWTs are intentionally
         // excluded from the value-shape scan — too noisy.)

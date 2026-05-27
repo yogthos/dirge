@@ -231,11 +231,8 @@ impl SymbolIndex {
         // a method or function-shape callable, prepare a call-site
         // refinement regex that looks like `(.|::)?name\s*\(` —
         // common across all supported languages.
-        let call_site_re = regex::Regex::new(&format!(
-            r"(?:[.:]|::)?\b{}\b\s*\(",
-            regex::escape(name)
-        ))
-        .ok();
+        let call_site_re =
+            regex::Regex::new(&format!(r"(?:[.:]|::)?\b{}\b\s*\(", regex::escape(name))).ok();
         let target_is_callable = {
             let cache = self.cache_lock();
             let mut callable_count = 0usize;

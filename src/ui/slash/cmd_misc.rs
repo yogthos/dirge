@@ -29,10 +29,8 @@ pub(super) async fn cmd_mcp(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::R
                     )?;
                 }
                 Err(e) => {
-                    ctx.renderer.write_line(
-                        &format!("  {} (error: {})", server_name, e),
-                        c_error(),
-                    )?;
+                    ctx.renderer
+                        .write_line(&format!("  {} (error: {})", server_name, e), c_error())?;
                 }
             }
         }
@@ -42,19 +40,15 @@ pub(super) async fn cmd_mcp(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::R
             match crate::extras::mcp::client::list_tools(conn).await {
                 Ok(tools) => {
                     if tools.is_empty() {
-                        ctx.renderer.write_line(
-                            &format!("server '{}' has no tools", name),
-                            c_agent(),
-                        )?;
+                        ctx.renderer
+                            .write_line(&format!("server '{}' has no tools", name), c_agent())?;
                     } else {
                         ctx.renderer
                             .write_line(&format!("tools on '{}':", name), c_agent())?;
                         for tool in &tools {
                             let desc = tool.description.as_deref().unwrap_or("");
-                            ctx.renderer.write_line(
-                                &format!("  {}  {}", tool.name, desc),
-                                c_result(),
-                            )?;
+                            ctx.renderer
+                                .write_line(&format!("  {}  {}", tool.name, desc), c_result())?;
                         }
                     }
                 }
@@ -117,8 +111,7 @@ pub(super) async fn cmd_cd(ctx: &mut SlashCtx<'_>, text: &str) -> anyhow::Result
     match std::env::set_current_dir(&path) {
         Ok(()) => {
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            ctx.session.working_dir =
-                compact_str::CompactString::new(canonical.to_string_lossy());
+            ctx.session.working_dir = compact_str::CompactString::new(canonical.to_string_lossy());
             if let Some(perm) = ctx.permission {
                 if let Ok(mut guard) = perm.lock() {
                     guard.set_working_dir(&ctx.session.working_dir);
@@ -326,16 +319,12 @@ pub(super) async fn cmd_allow(
                     ctx.session
                         .permission_allowlist
                         .retain(|e| !(e.tool == tool && e.pattern == pat));
-                    ctx.renderer.write_line(
-                        &format!("removed [{}]: {} {}", idx, tool, pat),
-                        c_agent(),
-                    )?;
+                    ctx.renderer
+                        .write_line(&format!("removed [{}]: {} {}", idx, tool, pat), c_agent())?;
                 }
                 None => {
-                    ctx.renderer.write_line(
-                        &format!("no allowlist entry at index {}", idx),
-                        c_error(),
-                    )?;
+                    ctx.renderer
+                        .write_line(&format!("no allowlist entry at index {}", idx), c_error())?;
                 }
             }
         }
@@ -429,12 +418,7 @@ pub(super) async fn cmd_loop(
                 return Ok(());
             }
             let plan_file = std::path::PathBuf::from("LOOP_PLAN.md");
-            let ls = crate::extras::r#loop::LoopState::new(
-                prompt,
-                plan_file,
-                max_iterations,
-                None,
-            );
+            let ls = crate::extras::r#loop::LoopState::new(prompt, plan_file, max_iterations, None);
             *ctx.loop_state = Some(ls);
             let cap_msg = match max_iterations {
                 Some(n) => format!("loop started (max {n} iterations) — iteration 1 will run after this message"),

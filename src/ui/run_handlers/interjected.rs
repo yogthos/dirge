@@ -31,9 +31,7 @@ pub(crate) async fn handle_interjected(
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
     agent_interject: &mut Option<mpsc::Sender<()>>,
-    interjection_queue: &std::sync::Arc<
-        std::sync::Mutex<std::collections::VecDeque<String>>,
-    >,
+    interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     bg_store: &Option<BackgroundStore>,
 ) -> anyhow::Result<()> {
     *was_reasoning = false;
@@ -44,14 +42,10 @@ pub(crate) async fn handle_interjected(
     // not a phantom turn that "never happened".
     if !ctx.response_buf.is_empty() {
         let max_width = ctx.renderer.content_width().saturating_sub(9); // 8-col handle + space
-        let mut styled = crate::ui::markdown::markdown_to_styled(
-            ctx.response_buf,
-            max_width,
-            c_agent(),
-        );
+        let mut styled =
+            crate::ui::markdown::markdown_to_styled(ctx.response_buf, max_width, c_agent());
         if !styled.is_empty() {
-            styled[0].text =
-                CompactString::from(format!("<dirge> {}", styled[0].text));
+            styled[0].text = CompactString::from(format!("<dirge> {}", styled[0].text));
         }
         if let Some(start) = *ctx.response_start_line {
             ctx.renderer.replace_from(start, styled);

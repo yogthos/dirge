@@ -140,11 +140,10 @@ async fn run_compaction_pass_with_focus(
             let middle: Vec<serde_json::Value> = current_context.messages[start..end].to_vec();
             // Carry forward any previous summary body for iterative
             // re-compression (Hermes _find_latest_context_summary).
-            let prev = compression::find_previous_summary(&current_context.messages)
-                .map(|(_, body)| body);
-            let budget = compression::summary_budget(
-                compression::estimate_messages_tokens(&middle),
-            );
+            let prev =
+                compression::find_previous_summary(&current_context.messages).map(|(_, body)| body);
+            let budget =
+                compression::summary_budget(compression::estimate_messages_tokens(&middle));
             let prompt = compression::build_summary_prompt(
                 &middle,
                 budget,
@@ -153,14 +152,11 @@ async fn run_compaction_pass_with_focus(
             );
             match sfn(prompt).await {
                 Ok(summary) if compression::validate_summary(&summary) => {
-                    let new_msgs = compression::apply_summary(
-                        &current_context.messages,
-                        &summary,
-                        start,
-                        end,
-                    );
+                    let new_msgs =
+                        compression::apply_summary(&current_context.messages, &summary, start, end);
                     current_context.messages = new_msgs;
-                    after_summary = compression::estimate_messages_tokens(&current_context.messages);
+                    after_summary =
+                        compression::estimate_messages_tokens(&current_context.messages);
                     applied_summary = summary;
                     // After apply_summary, the head (0..start) is
                     // preserved, then a single summary message
@@ -255,7 +251,16 @@ pub async fn run_agent_loop_with_summarizer(
             .await;
     }
 
-    run_loop_with_summarizer(context, new_messages, config, signal, emit, stream_fn, summarize_fn).await
+    run_loop_with_summarizer(
+        context,
+        new_messages,
+        config,
+        signal,
+        emit,
+        stream_fn,
+        summarize_fn,
+    )
+    .await
 }
 
 /// The actual loop. Faithful port of pi `runLoop` (agent-loop.ts:155-269).
@@ -271,7 +276,16 @@ pub async fn run_loop(
     emit: &mpsc::Sender<LoopEvent>,
     stream_fn: &StreamFn,
 ) -> Vec<LoopMessage> {
-    run_loop_with_summarizer(current_context, new_messages, config, signal, emit, stream_fn, None).await
+    run_loop_with_summarizer(
+        current_context,
+        new_messages,
+        config,
+        signal,
+        emit,
+        stream_fn,
+        None,
+    )
+    .await
 }
 
 /// LOOP-9 variant: identical to `run_loop` plus an optional
@@ -816,4 +830,3 @@ fn tool_result_to_value(t: &ToolResultMessage) -> Value {
 #[cfg(test)]
 #[path = "run_tests.rs"]
 mod tests;
-

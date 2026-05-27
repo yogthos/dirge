@@ -688,8 +688,7 @@ fn compress_records_branch_summary_for_pruned_siblings() {
     assert_eq!(summary.message_count, 2);
     // Preview pulls from the root sibling's content + label.
     assert!(
-        summary.preview.contains("explore-alt")
-            || summary.preview.contains("different approach"),
+        summary.preview.contains("explore-alt") || summary.preview.contains("different approach"),
         "preview missing branch info: {:?}",
         summary.preview,
     );
