@@ -1618,6 +1618,7 @@ mod tests {
                 provider_type: "openai".to_string(),
                 base_url: "http://plugin-test.invalid/v1".to_string(),
                 api_key_env: Some("PLUGIN_TEST_KEY".to_string()),
+                allow_insecure: true,
                 stream_chunk_timeout_secs: None,
             },
         );
@@ -1656,6 +1657,7 @@ mod tests {
                 provider_type: "openai".to_string(),
                 base_url: "http://from-config".to_string(),
                 api_key_env: None,
+                allow_insecure: true,
                 stream_chunk_timeout_secs: None,
             },
         );
