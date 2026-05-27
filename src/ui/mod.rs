@@ -187,6 +187,12 @@ pub async fn run_interactive(
     // the runner is mid-call get coalesced — only the first wakeup
     // matters since the runner drains via try_recv() after waking.
     let mut agent_interject: Option<mpsc::Sender<()>> = None;
+    // Cooperative hard-cancel channel. Paired with `agent_abort`'s
+    // task-level abort in the Ctrl+C handler: cancel gives the
+    // retry loop and rig stream a chance to observe `is_cancelled()`
+    // and surface a clean "cancelled" event before the task is
+    // killed at its next `.await`.
+    let mut agent_cancel: Option<mpsc::Sender<()>> = None;
     let mut agent_line_started = false;
     let mut response_buf = String::new();
     // Count of `AgentEvent::ToolCall` events observed during the
@@ -768,6 +774,15 @@ pub async fn run_interactive(
                             }
                             if is_running {
                                 is_running = false;
+                                // Cooperative cancel first: lets the
+                                // retry loop and rig stream observe
+                                // `signal.is_cancelled()` and exit
+                                // through their clean paths before
+                                // the JoinHandle::abort() below
+                                // kills the task at its next .await.
+                                if let Some(tx) = agent_cancel.take() {
+                                    let _ = tx.try_send(());
+                                }
                                 if let Some(h) = agent_abort.take() { h.abort(); }
                                 agent_rx = None;
                                 agent_interject = None;
@@ -838,6 +853,9 @@ pub async fn run_interactive(
 
                         if key.code == KeyCode::Esc && is_running {
                             is_running = false;
+                            if let Some(tx) = agent_cancel.take() {
+                                let _ = tx.try_send(());
+                            }
                             if let Some(h) = agent_abort.take() { h.abort(); }
                             agent_rx = None;
                             agent_interject = None;
@@ -1181,6 +1199,7 @@ pub async fn run_interactive(
                                                 agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                                 agent_interject = Some(runner.interject_tx);
+                                                agent_cancel = Some(runner.cancel_tx);
                                                 is_running = true;
                                             }
                                             Err(e) => {
@@ -1330,6 +1349,7 @@ pub async fn run_interactive(
                                             agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                                 agent_interject = Some(runner.interject_tx);
+                                                agent_cancel = Some(runner.cancel_tx);
                                             is_running = true;
                                             wt_return_path = Some(main_path);
                                         }
@@ -1398,6 +1418,7 @@ pub async fn run_interactive(
                                             agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                                 agent_interject = Some(runner.interject_tx);
+                                                agent_cancel = Some(runner.cancel_tx);
                                             is_running = true;
                                             loop_label = Some(ls.iteration_label());
                                         }
@@ -1563,6 +1584,7 @@ pub async fn run_interactive(
                                 agent_rx = Some(runner.event_rx);
                                                 agent_abort = Some(runner.task);
                                                 agent_interject = Some(runner.interject_tx);
+                                                agent_cancel = Some(runner.cancel_tx);
                                 is_running = true;
 
                                 session.add_message(MessageRole::User, &text);
@@ -1809,6 +1831,7 @@ pub async fn run_interactive(
                             &mut agent_rx,
                             &mut agent_abort,
                             &mut agent_interject,
+                            &mut agent_cancel,
                             &interjection_queue,
                             #[cfg(feature = "mcp")]
                             mcp_manager,
@@ -1868,6 +1891,7 @@ pub async fn run_interactive(
                             &mut agent_rx,
                             &mut agent_abort,
                             &mut agent_interject,
+                            &mut agent_cancel,
                             &interjection_queue,
                             &bg_store,
                         ).await?;
@@ -1892,6 +1916,7 @@ pub async fn run_interactive(
                             &mut agent_rx,
                             &mut agent_abort,
                             &mut agent_interject,
+                            &mut agent_cancel,
                             &interjection_queue,
                             #[cfg(feature = "mcp")]
                             mcp_manager,
@@ -1933,6 +1958,9 @@ pub async fn run_interactive(
                         }
 
                         is_running = false;
+                        if let Some(tx) = agent_cancel.take() {
+                            let _ = tx.try_send(());
+                        }
                         if let Some(h) = agent_abort.take() { h.abort(); }
                         agent_rx = None;
                         agent_interject = None;
@@ -2859,6 +2887,7 @@ pub async fn run_interactive(
                     agent_rx = Some(runner.event_rx);
                     agent_abort = Some(runner.task);
                     agent_interject = Some(runner.interject_tx);
+                    agent_cancel = Some(runner.cancel_tx);
                     is_running = true;
                     renderer.draw_bottom(
                         &input,

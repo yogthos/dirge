@@ -77,6 +77,7 @@ pub(crate) async fn handle_done(
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
     agent_interject: &mut Option<mpsc::Sender<()>>,
+    agent_cancel: &mut Option<mpsc::Sender<()>>,
     interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -399,6 +400,7 @@ pub(crate) async fn handle_done(
     }
     *agent_rx = None;
     *agent_interject = None;
+    *agent_cancel = None;
 
     #[cfg(feature = "plugin")]
     let followup_for_decision = plugin_followup.clone();
@@ -435,6 +437,7 @@ pub(crate) async fn handle_done(
             *agent_rx = Some(runner.event_rx);
             *agent_abort = Some(runner.task);
             *agent_interject = Some(runner.interject_tx);
+            *agent_cancel = Some(runner.cancel_tx);
             *is_running = true;
         }
         crate::plugin::PostDoneAction::LoopStop =>
@@ -469,6 +472,7 @@ pub(crate) async fn handle_done(
                 *agent_rx = Some(runner.event_rx);
                 *agent_abort = Some(runner.task);
                 *agent_interject = Some(runner.interject_tx);
+                *agent_cancel = Some(runner.cancel_tx);
                 *is_running = true;
                 *loop_bits.label = Some(ls.iteration_label());
                 ctx.renderer.write_line(
@@ -595,6 +599,7 @@ pub(crate) async fn handle_done(
         *agent_rx = Some(runner.event_rx);
         *agent_abort = Some(runner.task);
         *agent_interject = Some(runner.interject_tx);
+        *agent_cancel = Some(runner.cancel_tx);
         *is_running = true;
     }
     Ok(())

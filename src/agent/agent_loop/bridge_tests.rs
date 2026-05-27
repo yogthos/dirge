@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::agent::agent_loop::message::{
     AssistantMessage, ContentBlock, StopReason, ToolResultMessage, UserMessage,

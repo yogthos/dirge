@@ -80,37 +80,12 @@ pub const PROTECT_TAIL_DEFAULT: usize = 5;
 
 // ── Public API ───────────────────────────────────────────
 
-/// Compression outcome with metadata.
-#[derive(Debug, Clone)]
-pub struct CompressionResult {
-    /// The generated summary text.
-    pub summary: String,
-    /// New session id after rotation.
-    pub new_session_id: String,
-    /// Previous session id (parent_session_id).
-    pub parent_session_id: String,
-    /// Approximate token count before compression.
-    pub tokens_before: u64,
-    /// Approximate token count after compression.
-    pub tokens_after: u64,
-    /// Number of tool results pruned.
-    pub pruned_count: usize,
-    /// Number of messages in the compressed middle section.
-    pub compressed_messages: usize,
-}
-
 /// Should compression be attempted?
 /// True when prompt_tokens exceeds 75% of context_window.
 /// Port of Hermes's threshold check.
 pub fn should_compress(prompt_tokens: u64, context_window: u64) -> bool {
     let threshold = (0.75 * context_window as f64) as u64;
     prompt_tokens > threshold
-}
-
-/// Approximate token count from total character length.
-/// 4 chars ≈ 1 token (rough, model-independent).
-pub fn approx_tokens(text: &str) -> u64 {
-    (text.len() as u64).div_ceil(CHARS_PER_TOKEN)
 }
 
 /// Estimate tokens for a slice of messages by summing content

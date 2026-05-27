@@ -42,6 +42,14 @@ pub struct AgentRunner {
     /// the channel is full, `try_send` silently no-ops (we already
     /// have one queued).
     pub interject_tx: mpsc::Sender<()>,
+    /// Trigger cooperative hard-cancellation. Sending `()` here flips
+    /// the inner `AbortSignal.cancel()` flag so the retry loop and
+    /// rig stream see `is_cancelled()` and bail at their next check.
+    /// The UI's Ctrl+C handler combines this with `JoinHandle::abort()`
+    /// — abort kills the task at the next `.await`, cancel gives in-
+    /// flight cooperative consumers a chance to surface a clean
+    /// "cancelled" event first. Bounded to match `interject_tx`.
+    pub cancel_tx: mpsc::Sender<()>,
 }
 
 pub fn convert_history(session: &Session) -> Vec<Message> {

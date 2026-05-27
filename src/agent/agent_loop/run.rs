@@ -202,23 +202,13 @@ async fn run_compaction_pass_with_focus(
 /// `message_end` for each prompt, THEN enters `run_loop`. Returns
 /// the full list of messages produced by this run (prompts + every
 /// assistant turn + every tool result).
+///
+/// `summarize_fn` is an optional LOOP-9 context-compaction callback.
+/// When `Some`, the compaction path runs a structured summarization
+/// pass after the cheap `prune_tool_outputs` pre-pass — see
+/// `crate::agent::compression::SummarizeFn` for the contract. Pass
+/// `None` to disable LLM-summary compaction.
 pub async fn run_agent_loop(
-    prompts: Vec<LoopMessage>,
-    context: Context,
-    config: LoopConfig,
-    signal: AbortSignal,
-    emit: &mpsc::Sender<LoopEvent>,
-    stream_fn: &StreamFn,
-) -> Vec<LoopMessage> {
-    run_agent_loop_with_summarizer(prompts, context, config, signal, emit, stream_fn, None).await
-}
-
-/// Like `run_agent_loop` but accepts an optional summarizer callback
-/// for LOOP-9 context compaction. When `Some`, the loop's compaction
-/// path runs a structured summarization pass after the cheap
-/// `prune_tool_outputs` pre-pass — see
-/// `crate::agent::compression::SummarizeFn` for the contract.
-pub async fn run_agent_loop_with_summarizer(
     prompts: Vec<LoopMessage>,
     mut context: Context,
     config: LoopConfig,
@@ -251,7 +241,7 @@ pub async fn run_agent_loop_with_summarizer(
             .await;
     }
 
-    run_loop_with_summarizer(
+    run_loop(
         context,
         new_messages,
         config,
@@ -263,34 +253,14 @@ pub async fn run_agent_loop_with_summarizer(
     .await
 }
 
-/// The actual loop. Faithful port of pi `runLoop` (agent-loop.ts:155-269).
+/// The actual loop. Faithful port of pi `runLoop` (agent-loop.ts:155-269)
+/// plus the LOOP-9 `summarize_fn` callback for context-compaction's
+/// structured-summary pass. Pass `None` to disable LLM compaction.
 ///
 /// Owns `current_context`, `new_messages`, `config` — pi mutates
 /// these as the run proceeds; in Rust we own them by value and
 /// return `new_messages` at the end.
 pub async fn run_loop(
-    current_context: Context,
-    new_messages: Vec<LoopMessage>,
-    config: LoopConfig,
-    signal: AbortSignal,
-    emit: &mpsc::Sender<LoopEvent>,
-    stream_fn: &StreamFn,
-) -> Vec<LoopMessage> {
-    run_loop_with_summarizer(
-        current_context,
-        new_messages,
-        config,
-        signal,
-        emit,
-        stream_fn,
-        None,
-    )
-    .await
-}
-
-/// LOOP-9 variant: identical to `run_loop` plus an optional
-/// `summarize_fn` callback for context compaction's second pass.
-pub async fn run_loop_with_summarizer(
     mut current_context: Context,
     mut new_messages: Vec<LoopMessage>,
     // `config` is `mut` even though phase 4 only reads it. Pi

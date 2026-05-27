@@ -69,7 +69,7 @@ use crate::event::AgentEvent;
 use super::bridge::EventBridge;
 use super::heal;
 use super::message::{LoopMessage, UserMessage};
-use super::run::run_agent_loop_with_summarizer;
+use super::run::run_agent_loop;
 use super::steering::steering_from_queue;
 use super::stream::StreamFn;
 use super::tool::{AbortSignal, LoopTool};
@@ -107,25 +107,36 @@ impl LoopRunner {
     /// long runs and bounded prevents an unbounded queue.
     pub fn into_agent_runner(self) -> crate::agent::runner::AgentRunner {
         let (interject_tx, mut interject_rx) = mpsc::channel::<()>(64);
-        let signal_for_bridge = self.signal.clone();
-        // Spawn a small bridge: first interject signal triggers
-        // a GRACEFUL interjection (LOOP-4). The loop stops at
-        // the next turn boundary; in-flight tools complete
-        // normally. Hard cancellation (Ctrl+C) uses signal.cancel()
-        // directly and is NOT routed through this channel.
+        let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(64);
+        let signal_for_interject = self.signal.clone();
+        let signal_for_cancel = self.signal.clone();
+        // First interject signal → GRACEFUL interjection (LOOP-4).
+        // The loop stops at the next turn boundary; in-flight tools
+        // complete normally.
         tokio::spawn(async move {
             if interject_rx.recv().await.is_some() {
-                signal_for_bridge.interject();
+                signal_for_interject.interject();
                 // Drain remaining signals so the UI's bounded
-                // channel doesn't backpressure on the second
-                // press.
+                // channel doesn't backpressure on the second press.
                 while interject_rx.try_recv().is_ok() {}
+            }
+        });
+        // First cancel signal → HARD cancellation. The UI pairs
+        // this with `JoinHandle::abort()` for a belt-and-suspenders
+        // shutdown: abort kills the task, cancel gives the retry
+        // loop and rig stream a chance to observe `is_cancelled()`
+        // and exit through their clean-error paths first.
+        tokio::spawn(async move {
+            if cancel_rx.recv().await.is_some() {
+                signal_for_cancel.cancel();
+                while cancel_rx.try_recv().is_ok() {}
             }
         });
         crate::agent::runner::AgentRunner {
             event_rx: self.event_rx,
             task: self.task,
             interject_tx,
+            cancel_tx,
         }
     }
 }
@@ -496,7 +507,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         // killing both. Tools that poll the AbortSignal still
         // observe the cancellation cooperatively.
         let loop_future = async move {
-            let _final_messages = run_agent_loop_with_summarizer(
+            let _final_messages = run_agent_loop(
                 prompts,
                 context,
                 loop_config,

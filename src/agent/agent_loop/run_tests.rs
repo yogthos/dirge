@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::agent::agent_loop::hooks::{
     AfterToolCallContext, AfterToolCallFn, GetSteeringMessagesFn, PrepareNextTurnFn,
@@ -343,6 +342,7 @@ async fn test_emits_full_agent_loop_event_sequence() {
         AbortSignal::new(),
         &tx,
         &factory,
+        None,
     )
     .await;
     drop(tx);
@@ -388,6 +388,7 @@ async fn test_full_loop_with_tool_then_final_text() {
         AbortSignal::new(),
         &tx,
         &factory,
+        None,
     )
     .await;
     drop(tx);
@@ -469,6 +470,7 @@ async fn test_prepare_next_turn_snapshot_applied() {
         AbortSignal::new(),
         &tx,
         &factory,
+        None,
     )
     .await;
 
@@ -513,6 +515,7 @@ async fn test_should_stop_after_turn_stops_loop() {
         AbortSignal::new(),
         &tx,
         &factory_counted,
+        None,
     )
     .await;
     drop(tx);
@@ -555,6 +558,7 @@ async fn test_terminate_stops_loop_after_tool_batch() {
         AbortSignal::new(),
         &tx,
         &factory,
+        None,
     )
     .await;
 
@@ -606,6 +610,7 @@ async fn test_after_tool_call_terminate_stops_loop() {
         AbortSignal::new(),
         &tx,
         &factory,
+        None,
     )
     .await;
 
@@ -646,6 +651,7 @@ async fn test_continue_when_not_all_terminate() {
         AbortSignal::new(),
         &tx,
         &factory,
+        None,
     )
     .await;
 
@@ -728,6 +734,7 @@ async fn test_steering_messages_injected_after_tool_calls() {
         AbortSignal::new(),
         &tx,
         &factory,
+        None,
     )
     .await;
     drop(tx);
@@ -866,6 +873,7 @@ async fn loop_preserves_history_across_turns() {
         AbortSignal::new(),
         &tx,
         &factory,
+        None,
     )
     .await;
 
@@ -962,7 +970,16 @@ async fn full_signal_chain_exits_cleanly() {
     // Spawn the loop in a task; cancel signal after a small
     // yield so the tool has started.
     let task = tokio::spawn(async move {
-        run_agent_loop(vec![user("start")], ctx, cfg, signal_clone, &tx, &factory).await
+        run_agent_loop(
+            vec![user("start")],
+            ctx,
+            cfg,
+            signal_clone,
+            &tx,
+            &factory,
+            None,
+        )
+        .await
     });
     // Yield twice so the loop reaches the tool dispatch
     // before we cancel.

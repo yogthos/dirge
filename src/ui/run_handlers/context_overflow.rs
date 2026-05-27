@@ -53,6 +53,7 @@ pub(crate) async fn handle_context_overflow(
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
     agent_interject: &mut Option<mpsc::Sender<()>>,
+    agent_cancel: &mut Option<mpsc::Sender<()>>,
     interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -83,6 +84,7 @@ pub(crate) async fn handle_context_overflow(
     }
     *agent_rx = None;
     *agent_interject = None;
+    *agent_cancel = None;
     *ctx.agent_line_started = false;
     ctx.response_buf.clear();
     *ctx.response_start_line = None;
@@ -164,6 +166,7 @@ pub(crate) async fn handle_context_overflow(
             *agent_rx = Some(runner.event_rx);
             *agent_abort = Some(runner.task);
             *agent_interject = Some(runner.interject_tx);
+            *agent_cancel = Some(runner.cancel_tx);
             *is_running = true;
             // Review #4: collapsed result from the
             // failed run is stale — the user will

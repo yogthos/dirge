@@ -31,6 +31,7 @@ pub(crate) async fn handle_interjected(
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
     agent_interject: &mut Option<mpsc::Sender<()>>,
+    agent_cancel: &mut Option<mpsc::Sender<()>>,
     interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     bg_store: &Option<BackgroundStore>,
 ) -> anyhow::Result<()> {
@@ -118,6 +119,7 @@ pub(crate) async fn handle_interjected(
     }
     *agent_rx = None;
     *agent_interject = None;
+    *agent_cancel = None;
 
     // Drain the queue immediately — it's guaranteed to be
     // non-empty here since the runner only emits this
@@ -145,6 +147,7 @@ pub(crate) async fn handle_interjected(
         *agent_rx = Some(runner.event_rx);
         *agent_abort = Some(runner.task);
         *agent_interject = Some(runner.interject_tx);
+        *agent_cancel = Some(runner.cancel_tx);
         *is_running = true;
     }
     Ok(())

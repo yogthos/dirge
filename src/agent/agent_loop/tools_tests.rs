@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::agent::agent_loop::hooks::{BeforeToolCallFn, BeforeToolCallReturn};
 use crate::agent::agent_loop::message::{ContentBlock, StopReason};

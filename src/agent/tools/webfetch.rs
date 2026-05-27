@@ -335,9 +335,10 @@ fn is_private_ipv4(octets: [u8; 4]) -> bool {
         [169, 254, _, _] => true,
         // Unspecified
         [0, 0, 0, 0] => true,
-        // Class E + multicast (240+)
+        // Class E + multicast (240+) — also serves as the
+        // exhaustive catch-all: anything not matched above
+        // returns false here when the first octet is < 240.
         [a, _, _, _] => a >= 240,
-        _ => false,
     }
 }
 

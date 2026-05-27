@@ -388,6 +388,7 @@ mod tests {
             AbortSignal::new(),
             &tx,
             &factory,
+            None,
         )
         .await;
 
