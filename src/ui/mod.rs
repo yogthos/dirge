@@ -2244,6 +2244,8 @@ pub async fn run_interactive(
                         // preserved in the message text).
                         tool_calls_this_run = tool_calls_this_run.saturating_add(1);
                         renderer.set_avatar_state(avatar::AvatarState::from_tool_name(&name));
+                        #[cfg(feature = "experimental-ui-terminal-tab")]
+                        renderer.set_last_tool_name(&name);
                         // If a previous tool's chamber never closed
                         // (errored without a ToolResult, etc.), close
                         // it before opening the new one. Without this
@@ -2659,6 +2661,8 @@ pub async fn run_interactive(
                         }
                         last_tool_name = None;
                         renderer.set_avatar_state(avatar::AvatarState::Done);
+                        #[cfg(feature = "experimental-ui-terminal-tab")]
+                        renderer.set_last_tool_name("");
 
                         #[allow(unused_mut, unused_variables)]
                         let mut plugin_followup: Option<String> = None;
@@ -3441,6 +3445,8 @@ pub async fn run_interactive(
                     AgentEvent::Error(e) => {
                         was_reasoning = false;
                         renderer.set_avatar_state(avatar::AvatarState::Error);
+                        #[cfg(feature = "experimental-ui-terminal-tab")]
+                        renderer.set_last_tool_name("");
                         close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
                         let safe = sanitize_output(&e);
                         renderer.write_line(&format!("error: {}", safe), c_error())?;
@@ -3725,6 +3731,8 @@ pub async fn run_interactive(
                 renderer.write_line("", Color::White)?;
 
                 renderer.set_avatar_state(avatar::AvatarState::Alert);
+                #[cfg(feature = "experimental-ui-terminal-tab")]
+                renderer.set_last_tool_name("");
                 // Force a bottom-row repaint so the avatar updates to
                 // the Alert face immediately, before the user reads
                 // the prompt and reaches for a key. Without this, the

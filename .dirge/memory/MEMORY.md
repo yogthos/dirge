@@ -22,3 +22,5 @@ LOOP-4: `AbortSignal` in `tool.rs` has two `Arc<AtomicBool>`: `cancelled` (hard 
 ## Doom-loop: HashMap per-key counter + FIFO ring, window 32, check-before-track (threshold 2)
 
 checker.rs: `repeat_counts: HashMap<String, u32>` keyed `"{tool}\x00{input}"`. track_doom_loop bumps counter + pushes FIFO; eviction pops front + decrements. is_doom_loop checks count >= 2 BEFORE tracking (counter reflects previous only, not current). Window 32 (was 16) defeats 14-call decoy-gap. `repeat_counts.clear()` on set_working_dir.
+§
+Terminal tab title: OSC 0 escape `\x1b]0;{title}\x07` written to `terminal.backend_mut()` after frame draw in `tui_redraw()`. Dirty-check against cached title to skip redundant writes. See `experimental-ui-terminal-tab` feature.

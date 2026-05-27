@@ -91,6 +91,25 @@ pub const CHAT_FRAME_ROWS: u16 = 2;
 /// margin for the AGENT STATUS / SYSTEM gutters.
 const PANEL_AUTO_MIN_COLS: u16 = 100;
 
+#[cfg(feature = "experimental-ui-terminal-tab")]
+fn format_terminal_title(state: crate::ui::avatar::AvatarState, tool_name: Option<&str>) -> String {
+    use crate::ui::avatar::AvatarState;
+    match state {
+        AvatarState::Idle | AvatarState::Done => "● dirge".to_string(),
+        AvatarState::Thinking => "● dirge: thinking".to_string(),
+        AvatarState::Speaking => "● dirge: responding".to_string(),
+        AvatarState::Reading | AvatarState::Writing | AvatarState::Bash => {
+            if let Some(name) = tool_name {
+                format!("◌ dirge: {}", name)
+            } else {
+                "◌ dirge: working".to_string()
+            }
+        }
+        AvatarState::Alert => "✗ dirge: needs input".to_string(),
+        AvatarState::Error => "✗ dirge: ERROR".to_string(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelMode {
     /// Show panel when terminal width >= PANEL_AUTO_MIN_COLS.
@@ -241,6 +260,11 @@ pub struct Renderer {
     /// matches "no drag is possible because there's nothing on
     /// screen yet").
     cached_chat_rect: Option<ratatui::layout::Rect>,
+
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    cached_terminal_title: String,
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    last_tool_name: Option<String>,
 }
 
 impl Renderer {
@@ -287,6 +311,11 @@ impl Renderer {
             cached_is_running: false,
             cached_completion_preview: String::new(),
             cached_chat_rect: None,
+
+            #[cfg(feature = "experimental-ui-terminal-tab")]
+            cached_terminal_title: String::new(),
+            #[cfg(feature = "experimental-ui-terminal-tab")]
+            last_tool_name: None,
         })
     }
 
@@ -301,6 +330,12 @@ impl Renderer {
         use crate::ui::avatar;
         use crate::ui::tui::bottom::{AvatarSpec, BottomBody};
         use crate::ui::tui::scene::{Scene, render_frame};
+
+        #[cfg(feature = "experimental-ui-terminal-tab")]
+        let new_title = {
+            let tool = self.last_tool_name.as_deref();
+            format_terminal_title(self.avatar_state, tool)
+        };
 
         // panel_visible() borrows &self via terminal_size, so compute
         // it BEFORE we take the split mutable borrow on tui_terminal.
@@ -446,6 +481,16 @@ impl Renderer {
             let _ = stdout.execute(EndSynchronizedUpdate);
         }
         draw_result?;
+
+        #[cfg(feature = "experimental-ui-terminal-tab")]
+        {
+            if new_title != self.cached_terminal_title {
+                self.cached_terminal_title.clone_from(&new_title);
+                let osc = format!("\x1b]0;{}\x07", new_title);
+                let _ = terminal.backend_mut().write_all(osc.as_bytes());
+            }
+        }
+
         Ok(())
     }
 
@@ -625,6 +670,15 @@ impl Renderer {
         if self.avatar_state != state {
             self.avatar_state = state;
         }
+    }
+
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    pub fn set_last_tool_name(&mut self, name: &str) {
+        self.last_tool_name = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        };
     }
 
     pub fn set_panel_mode(&mut self, mode: PanelMode) {
@@ -2139,5 +2193,40 @@ mod tests {
         let (rows, cr, cc) = wrap_input(&lines(&["abc"]), 0, 2, 1);
         assert_eq!(rows.len(), 3);
         assert_eq!((cr, cc), (2, 0));
+    }
+
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    #[test]
+    fn terminal_title_idle_and_done_show_simple_title() {
+        use crate::ui::avatar::AvatarState;
+        let t = super::format_terminal_title(AvatarState::Idle, None);
+        assert_eq!(t, "● dirge");
+        let t = super::format_terminal_title(AvatarState::Done, Some("bash"));
+        assert_eq!(t, "● dirge");
+    }
+
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    #[test]
+    fn terminal_title_shows_tool_name_for_working_states() {
+        use crate::ui::avatar::AvatarState;
+        let t = super::format_terminal_title(AvatarState::Reading, Some("grep"));
+        assert!(t.contains("grep"), "title should contain tool name: {t:?}");
+        assert!(t.contains("◌"), "working states should use yellow dot marker: {t:?}");
+        let t = super::format_terminal_title(AvatarState::Writing, Some("edit"));
+        assert!(t.contains("edit"), "title should contain tool name: {t:?}");
+        let t = super::format_terminal_title(AvatarState::Bash, Some("bash"));
+        assert!(t.contains("bash"), "title should contain tool name: {t:?}");
+    }
+
+    #[cfg(feature = "experimental-ui-terminal-tab")]
+    #[test]
+    fn terminal_title_error_and_alert_show_warning_marker() {
+        use crate::ui::avatar::AvatarState;
+        let t = super::format_terminal_title(AvatarState::Error, None);
+        assert!(t.contains("ERROR"));
+        assert!(t.contains("✗"), "error states should use red dot marker: {t:?}");
+        let t = super::format_terminal_title(AvatarState::Alert, None);
+        assert!(t.contains("needs input"));
+        assert!(t.contains("✗"), "alert states should use red dot marker: {t:?}");
     }
 }
