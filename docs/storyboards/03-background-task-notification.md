@@ -165,15 +165,17 @@ That looked like "session state got printed along with my input."
 Two additional UI paths drain queued interjections (when the user
 typed while the agent was running) and spawn a new run:
 
-- Idle drain (`src/ui/mod.rs:3144`) — at the bottom of the main
-  loop, when not running and the queue is non-empty
-- Runner-event drain (`src/ui/mod.rs:3285`) — after the runner
-  emits its `InterjectionStop` event
+- Idle/post-done drain (`src/ui/run_handlers/done.rs:570`) —
+  inside `handle_done`, drains queued interjections after the
+  current turn finishes and respawns the runner
+- Runner-event drain (`src/ui/run_handlers/interjected.rs:133`)
+  — after the runner emits its `InterjectionStop` event,
+  `handle_interjected` drains the queue and respawns
 
-Both paths previously called `write_user_lines` directly, which would
-have duplicated the loop's `UserMessage` render. They now rely on
-the loop bridge as the single render point, with the wrapper-strip
-applied uniformly.
+Both paths previously called `write_user_lines` directly, which
+would have duplicated the loop's `UserMessage` render. They now
+rely on the loop bridge as the single render point, with the
+wrapper-strip applied uniformly.
 
 ## Edge cases verified
 

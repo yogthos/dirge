@@ -44,7 +44,7 @@ the recent tail of original turns; older turns are gone.
 
 ### Step 1 — Slash command parses the focus argument
 
-- `src/ui/slash.rs:778`:
+- `src/ui/slash/mod.rs:402`:
   ```rust
   "/compress" | "/compact" => {
       let instructions = if parts.len() > 1 {
@@ -64,7 +64,7 @@ the recent tail of original turns; older turns are gone.
 
 ### Step 2 — `handle_compress` builds the prompt
 
-- `handle_compress` (`src/ui/slash.rs:117`) is the OLD per-session
+- `handle_compress` (`src/ui/slash/mod.rs:151`) is the OLD per-session
   flow. It selects `messages_to_summarize` (everything below the
   tail that fits in `keep_recent_tokens`) and calls
   `client.compress_messages(model, msgs, prev_summary, Some("permission layer refactor"))`.
@@ -130,7 +130,7 @@ The slash command's text-after-the-command is treated as the focus.
 - `agent::compression::tests::full_compaction_wire_with_mock_summarizer`
   exercises the agent-loop path with a mock summarizer.
 - The slash-command path is tested via the existing
-  `handle_compress` integration tests in `src/ui/slash.rs`.
+  `handle_compress` integration tests in `src/ui/slash/mod.rs`.
 
 ## Edge cases verified
 
