@@ -588,7 +588,10 @@ pub fn default_convert_to_llm() -> super::types::ConvertToLlmFn {
             .iter()
             .filter(|m| {
                 let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                matches!(role, "user" | "assistant" | "tool" | "toolResult" | "system")
+                matches!(
+                    role,
+                    "user" | "assistant" | "tool" | "toolResult" | "system"
+                )
             })
             .cloned()
             .collect()

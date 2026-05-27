@@ -400,14 +400,8 @@ mod tests {
     fn loop_assistant_msg(tool_calls: &[Value]) -> Value {
         let mut content: Vec<Value> = Vec::new();
         for tc in tool_calls {
-            let id = tc
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let name = tc
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = tc
                 .get("arguments")
                 .cloned()
@@ -455,7 +449,11 @@ mod tests {
             user_msg("next question"),
         ];
         let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
-        assert_eq!(out.len(), 2, "should keep user messages but drop assistant with unpaired tool calls");
+        assert_eq!(
+            out.len(),
+            2,
+            "should keep user messages but drop assistant with unpaired tool calls"
+        );
         assert_eq!(dropped_a, 1);
         assert_eq!(dropped_t, 0);
         // Verify the assistant was dropped (only user messages remain)
