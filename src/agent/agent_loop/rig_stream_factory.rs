@@ -241,29 +241,38 @@ pub fn value_to_rig_message(value: &Value) -> Option<Message> {
             let content = OneOrMany::many(assistant_contents).ok()?;
             Some(Message::Assistant { id: None, content })
         }
-        "toolResult" => {
-            let tool_call_id = value.get("toolCallId").and_then(|c| c.as_str())?;
-            // Flatten content blocks into a single text body —
-            // rig's helper takes `impl Into<String>`. Multi-block
-            // tool results are rare; joining with newlines
-            // preserves readability.
+        "tool" | "toolResult" => {
+            // Dual convention: loop uses toolCallId, legacy uses
+            // tool_call_id. Try both.
+            let tool_call_id = value
+                .get("toolCallId")
+                .or_else(|| value.get("tool_call_id"))
+                .and_then(|c| c.as_str())?;
+            // Content may be a plain string (legacy `tool` shape)
+            // or an array of content blocks (loop `toolResult` shape).
             let text = value
                 .get("content")
-                .and_then(|c| c.as_array())
-                .map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter_map(|b| {
-                            b.as_object().and_then(|o| {
-                                if o.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    o.get("text").and_then(|t| t.as_str()).map(String::from)
-                                } else {
-                                    None
-                                }
+                .and_then(|c| {
+                    if let Some(s) = c.as_str() {
+                        Some(s.to_string())
+                    } else if let Some(blocks) = c.as_array() {
+                        let joined = blocks
+                            .iter()
+                            .filter_map(|b| {
+                                b.as_object().and_then(|o| {
+                                    if o.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        o.get("text").and_then(|t| t.as_str()).map(String::from)
+                                    } else {
+                                        None
+                                    }
+                                })
                             })
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        Some(joined)
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or_default();
             Some(Message::tool_result(tool_call_id, text))
@@ -594,6 +603,28 @@ mod tests {
                 _ => panic!("expected ToolResult"),
             },
             _ => panic!("expected User"),
+        }
+    }
+
+    /// Tool role (snake_case) with tool_call_id → rig ToolResult.
+    /// Dual convention: loop uses `toolResult`/`toolCallId`; legacy
+    /// session data uses `tool`/`tool_call_id`. Both must convert.
+    #[test]
+    fn tool_role_snake_case_converts() {
+        let v = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_abc",
+            "content": "tool output text",
+        });
+        let msg = value_to_rig_message(&v).expect("must convert");
+        match msg {
+            Message::User { content } => match content.first() {
+                UserContent::ToolResult(tr) => {
+                    assert_eq!(tr.id, "call_abc");
+                }
+                other => panic!("expected ToolResult, got {other:?}"),
+            },
+            other => panic!("expected User, got {other:?}"),
         }
     }
 

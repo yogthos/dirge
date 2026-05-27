@@ -102,6 +102,48 @@ fn truncate_for_model(content: &str, max_chars: usize) -> String {
 // Port of `fixToolCallPairing` (healing.ts:13-59)
 // ================================================================
 
+/// Extract tool call IDs from an assistant message Value.
+///
+/// Recognizes two formats:
+/// 1. Legacy: `{"tool_calls": [{"id": "c1", ...}, ...]}` top-level field
+/// 2. Loop transcript: `{"content": [{"type": "toolCall", "id": "c1", ...}, ...]}` content blocks
+///
+/// Returns a set of IDs that need matching tool results to follow.
+fn extract_tool_call_ids(msg: &Value) -> Option<std::collections::HashSet<String>> {
+    // Legacy format: top-level tool_calls array
+    if let Some(calls) = msg.get("tool_calls").and_then(|c| c.as_array()) {
+        if !calls.is_empty() {
+            let ids: std::collections::HashSet<String> = calls
+                .iter()
+                .filter_map(|c| c.get("id").and_then(|id| id.as_str()).map(String::from))
+                .collect();
+            if !ids.is_empty() {
+                return Some(ids);
+            }
+        }
+    }
+
+    // Loop transcript format: content blocks with type: "toolCall"
+    if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+        let ids: std::collections::HashSet<String> = blocks
+            .iter()
+            .filter_map(|b| {
+                let obj = b.as_object()?;
+                if obj.get("type").and_then(|t| t.as_str()) == Some("toolCall") {
+                    obj.get("id").and_then(|id| id.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+    }
+
+    None
+}
+
 /// Drop unpaired assistant.tool_calls and stray tool messages.
 /// DeepSeek 400s on either mismatch.
 pub fn fix_tool_call_pairing(messages: &[Value]) -> (Vec<Value>, usize, usize) {
@@ -115,42 +157,38 @@ pub fn fix_tool_call_pairing(messages: &[Value]) -> (Vec<Value>, usize, usize) {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
         if role == "assistant" {
-            if let Some(calls) = msg.get("tool_calls").and_then(|c| c.as_array()) {
-                if !calls.is_empty() {
-                    let mut needed: std::collections::HashSet<String> = calls
-                        .iter()
-                        .filter_map(|c| c.get("id").and_then(|id| id.as_str()).map(String::from))
-                        .collect();
-                    let mut candidates: Vec<Value> = Vec::new();
-                    let mut j = i + 1;
-                    while j < messages.len() && !needed.is_empty() {
-                        let nxt = &messages[j];
-                        if nxt.get("role").and_then(|r| r.as_str()) != Some("tool") {
-                            break;
-                        }
-                        let id = nxt
-                            .get("tool_call_id")
-                            .and_then(|id| id.as_str())
-                            .unwrap_or("");
-                        if !needed.contains(id) {
-                            break;
-                        }
-                        needed.remove(id);
-                        candidates.push(nxt.clone());
-                        j += 1;
+            if let Some(mut needed) = extract_tool_call_ids(msg) {
+                let mut candidates: Vec<Value> = Vec::new();
+                let mut j = i + 1;
+                while j < messages.len() && !needed.is_empty() {
+                    let nxt = &messages[j];
+                    let nxt_role = nxt.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if nxt_role != "tool" && nxt_role != "toolResult" {
+                        break;
                     }
-                    if needed.is_empty() {
-                        out.push(msg.clone());
-                        out.extend(candidates);
-                        i = j - 1;
-                    } else {
-                        dropped_assistant_calls += 1;
-                        dropped_stray_tools += candidates.len();
-                        i = j - 1;
+                    let id = nxt
+                        .get("tool_call_id")
+                        .or_else(|| nxt.get("toolCallId"))
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("");
+                    if !needed.contains(id) {
+                        break;
                     }
-                    i += 1;
-                    continue;
+                    needed.remove(id);
+                    candidates.push(nxt.clone());
+                    j += 1;
                 }
+                if needed.is_empty() {
+                    out.push(msg.clone());
+                    out.extend(candidates);
+                    i = j - 1;
+                } else {
+                    dropped_assistant_calls += 1;
+                    dropped_stray_tools += candidates.len();
+                    i = j - 1;
+                }
+                i += 1;
+                continue;
             }
             out.push(msg.clone());
         } else if role == "tool" || role == "toolResult" {
@@ -190,6 +228,15 @@ mod tests {
             "role": "tool",
             "tool_call_id": call_id,
             "content": content,
+        })
+    }
+
+    fn tool_result_msg(content: &str, call_id: &str, tool_name: &str) -> Value {
+        serde_json::json!({
+            "role": "toolResult",
+            "toolCallId": call_id,
+            "toolName": tool_name,
+            "content": [{"type": "text", "text": content}],
         })
     }
 
@@ -271,6 +318,50 @@ mod tests {
     }
 
     #[test]
+    fn pairing_keeps_valid_tool_result_sequence() {
+        let msgs = vec![
+            assistant_msg(
+                "calling",
+                &[serde_json::json!({"id": "c1", "name": "echo"})],
+            ),
+            tool_result_msg("result", "c1", "echo"),
+        ];
+        let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(dropped_a, 0);
+        assert_eq!(dropped_t, 0);
+    }
+
+    #[test]
+    fn pairing_drops_stray_tool_result_messages() {
+        let msgs = vec![tool_result_msg("orphan", "c1", "echo")];
+        let (out, _, dropped_t) = fix_tool_call_pairing(&msgs);
+        assert_eq!(out.len(), 0);
+        assert_eq!(dropped_t, 1);
+    }
+
+    #[test]
+    fn pairing_handles_mixed_tool_and_tool_result() {
+        // Mix of legacy tool and loop-transcript toolResult — both
+        // should pair with the assistant tool_calls.
+        let msgs = vec![
+            assistant_msg(
+                "calling",
+                &[
+                    serde_json::json!({"id": "c1", "name": "bash"}),
+                    serde_json::json!({"id": "c2", "name": "read"}),
+                ],
+            ),
+            tool_msg("bash result", "c1"),
+            tool_result_msg("read result", "c2", "read"),
+        ];
+        let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(dropped_a, 0);
+        assert_eq!(dropped_t, 0);
+    }
+
+    #[test]
     fn pairing_handles_missing_id_on_tool_call() {
         // Assistant calls but the tool_call has no id — still
         // try to match with tool results.
@@ -302,5 +393,111 @@ mod tests {
             "should have saved at least {} chars from the long tool result",
             long.len() - 40_000
         );
+    }
+
+    // --- Loop transcript format (content-block tool calls) ---
+
+    fn loop_assistant_msg(tool_calls: &[Value]) -> Value {
+        let mut content: Vec<Value> = Vec::new();
+        for tc in tool_calls {
+            let id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let name = tc
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args = tc
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            content.push(serde_json::json!({
+                "type": "toolCall",
+                "id": id,
+                "name": name,
+                "arguments": args,
+            }));
+        }
+        serde_json::json!({
+            "role": "assistant",
+            "content": content,
+        })
+    }
+
+    #[test]
+    fn pairing_keeps_loop_transcript_assistant_with_tool_results() {
+        let msgs = vec![
+            loop_assistant_msg(&[serde_json::json!({
+                "id": "c1",
+                "name": "bash",
+                "arguments": {"cmd": "ls"}
+            })]),
+            tool_result_msg("bash output", "c1", "bash"),
+        ];
+        let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
+        assert_eq!(out.len(), 2, "should keep assistant and tool result");
+        assert_eq!(dropped_a, 0);
+        assert_eq!(dropped_t, 0);
+    }
+
+    #[test]
+    fn pairing_drops_unpaired_loop_transcript_assistant() {
+        // Simulates Error/Abort path: assistant emitted toolCalls in
+        // content blocks, but tool execution never ran → no results.
+        let msgs = vec![
+            user_msg("run a command"),
+            loop_assistant_msg(&[serde_json::json!({
+                "id": "call_abc",
+                "name": "bash",
+                "arguments": {"cmd": "ls"}
+            })]),
+            user_msg("next question"),
+        ];
+        let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
+        assert_eq!(out.len(), 2, "should keep user messages but drop assistant with unpaired tool calls");
+        assert_eq!(dropped_a, 1);
+        assert_eq!(dropped_t, 0);
+        // Verify the assistant was dropped (only user messages remain)
+        for msg in &out {
+            assert_eq!(msg["role"], "user");
+        }
+    }
+
+    #[test]
+    fn pairing_handles_mixed_tool_call_sources() {
+        // Loop transcript assistant format with toolResult follow-ups.
+        // The heal recognizes toolCall blocks in content and pairs them.
+        let msgs = vec![
+            loop_assistant_msg(&[
+                serde_json::json!({"id": "c1", "name": "bash", "arguments": {"cmd": "ls"}}),
+                serde_json::json!({"id": "c2", "name": "read", "arguments": {"path": "/tmp"}}),
+            ]),
+            tool_result_msg("bash result", "c1", "bash"),
+            tool_result_msg("read result", "c2", "read"),
+        ];
+        let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(dropped_a, 0);
+        assert_eq!(dropped_t, 0);
+    }
+
+    #[test]
+    fn pairing_handles_partially_paired_loop_assistant() {
+        // Two tool calls, only one has a result → drop the assistant.
+        let msgs = vec![
+            loop_assistant_msg(&[
+                serde_json::json!({"id": "c1", "name": "bash", "arguments": {}}),
+                serde_json::json!({"id": "c2", "name": "read", "arguments": {}}),
+            ]),
+            tool_result_msg("only c1 result", "c1", "bash"),
+            user_msg("next"),
+        ];
+        let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
+        assert_eq!(dropped_a, 1, "should drop assistant: c2 is unpaired");
+        assert_eq!(dropped_t, 1, "should count the stray c1 toolResult");
+        // Only the user message should remain
+        assert_eq!(out.len(), 1, "only user message should survive");
+        assert_eq!(out[0]["role"], "user");
     }
 }

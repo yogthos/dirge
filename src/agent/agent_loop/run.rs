@@ -710,7 +710,7 @@ mod tests {
                 .iter()
                 .filter(|m| {
                     let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    matches!(role, "user" | "assistant" | "toolResult")
+                    matches!(role, "user" | "assistant" | "tool" | "toolResult")
                 })
                 .cloned()
                 .collect()
