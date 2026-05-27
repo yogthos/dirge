@@ -2211,7 +2211,10 @@ mod tests {
         use crate::ui::avatar::AvatarState;
         let t = super::format_terminal_title(AvatarState::Reading, Some("grep"));
         assert!(t.contains("grep"), "title should contain tool name: {t:?}");
-        assert!(t.contains("◌"), "working states should use yellow dot marker: {t:?}");
+        assert!(
+            t.contains("◌"),
+            "working states should use yellow dot marker: {t:?}"
+        );
         let t = super::format_terminal_title(AvatarState::Writing, Some("edit"));
         assert!(t.contains("edit"), "title should contain tool name: {t:?}");
         let t = super::format_terminal_title(AvatarState::Bash, Some("bash"));
@@ -2224,9 +2227,15 @@ mod tests {
         use crate::ui::avatar::AvatarState;
         let t = super::format_terminal_title(AvatarState::Error, None);
         assert!(t.contains("ERROR"));
-        assert!(t.contains("✗"), "error states should use red dot marker: {t:?}");
+        assert!(
+            t.contains("✗"),
+            "error states should use red dot marker: {t:?}"
+        );
         let t = super::format_terminal_title(AvatarState::Alert, None);
         assert!(t.contains("needs input"));
-        assert!(t.contains("✗"), "alert states should use red dot marker: {t:?}");
+        assert!(
+            t.contains("✗"),
+            "alert states should use red dot marker: {t:?}"
+        );
     }
 }
