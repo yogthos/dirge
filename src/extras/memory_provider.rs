@@ -73,6 +73,29 @@ pub trait MemoryProvider: Send + Sync {
     /// summarization. `transcript` is the full conversation text.
     fn on_session_end(&self, _transcript: &str) {}
 
+    /// Notify the provider that the session id is changing
+    /// mid-process. Ported from hermes
+    /// `MemoryProvider.on_session_switch` (memory_provider.py:162-194).
+    ///
+    /// Fires on dirge events that reassign `session.id` without
+    /// tearing the provider down — currently the compaction-driven
+    /// rotation (every successful auto-compact creates a new session
+    /// id whose `parent_session_id` is the pre-compact id).
+    ///
+    /// Providers that cache per-session state in their backend
+    /// (document ids, accumulated buffers, counters) should update
+    /// or reset it here so subsequent writes land in the correct
+    /// session's record.
+    ///
+    /// `new_session_id` — the id the agent just switched to.
+    /// `parent_session_id` — the previous id, empty when no
+    /// lineage applies.
+    /// `reset` — `true` when this is a fresh conversation (not a
+    /// continuation). Compaction rotation is a continuation, so
+    /// dirge passes `false`. Reserved for future `/reset`-style
+    /// commands.
+    fn on_session_switch(&self, _new_session_id: &str, _parent_session_id: &str, _reset: bool) {}
+
     /// Notify the provider that messages are about to be discarded
     /// during context compression. The provider may return a brief
     /// summary string that the compression pass will fold into the

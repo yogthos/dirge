@@ -357,6 +357,23 @@ pub fn maybe_fire_session_end(
     provider.on_session_end(&transcript);
 }
 
+/// dirge-5gn6 — fire `on_session_switch` when the live session id
+/// is changing mid-process. Compaction is the only path today that
+/// rotates the id (the post-compact session gets a fresh id with
+/// `parent_session_id` set to the pre-compact id). `reset=false`
+/// since compaction is a logical continuation, not a fresh chat.
+pub fn maybe_fire_session_switch(
+    agent: &crate::provider::AnyAgent,
+    new_session_id: &str,
+    parent_session_id: &str,
+    reset: bool,
+) {
+    let Some(provider) = agent.memory_provider() else {
+        return;
+    };
+    provider.on_session_switch(new_session_id, parent_session_id, reset);
+}
+
 /// Build a human-readable transcript from session messages for
 /// background review. Includes user text, assistant text, tool
 /// call names+args, and tool results. Compaction summaries are
@@ -507,6 +524,86 @@ mod tests {
             provider.ends.lock().unwrap().is_empty(),
             "empty session must not fire the hook"
         );
+    }
+
+    /// dirge-5gn6 — `maybe_fire_session_switch` propagates the
+    /// new/parent ids and `reset` flag to the provider's
+    /// `on_session_switch` hook verbatim.
+    #[test]
+    fn maybe_fire_session_switch_propagates_ids_and_reset_flag() {
+        #[derive(Default)]
+        struct RecordingSwitchProvider {
+            switches: Mutex<Vec<(String, String, bool)>>,
+        }
+        impl MemoryProvider for RecordingSwitchProvider {
+            fn name(&self) -> &str {
+                "recording-switch"
+            }
+            fn view(&self, _: &str) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn on_session_switch(&self, new_id: &str, parent_id: &str, reset: bool) {
+                self.switches
+                    .lock()
+                    .unwrap()
+                    .push((new_id.into(), parent_id.into(), reset));
+            }
+        }
+
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+        let client = openai::Client::new("test-key").unwrap().completions_api();
+        let model = client.completion_model("gpt-4o");
+        let inner_agent = rig::agent::AgentBuilder::new(model).build();
+        let provider = Arc::new(RecordingSwitchProvider::default());
+        let provider_dyn: Arc<dyn MemoryProvider> = provider.clone();
+        let agent = AnyAgent::new(
+            AnyAgentInner::OpenAI(inner_agent),
+            ToolCache::new(),
+            std::time::Duration::from_secs(300),
+            Vec::new(),
+            String::new(),
+            "gpt-4o".to_string(),
+        )
+        .with_memory_provider(provider_dyn);
+
+        maybe_fire_session_switch(&agent, "new-id", "parent-id", false);
+
+        let switches = provider.switches.lock().unwrap();
+        assert_eq!(switches.len(), 1);
+        assert_eq!(
+            switches[0],
+            ("new-id".into(), "parent-id".into(), false),
+            "ids + reset flag must propagate verbatim"
+        );
+    }
+
+    #[test]
+    fn maybe_fire_session_switch_noop_without_provider() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+        let client = openai::Client::new("test-key").unwrap().completions_api();
+        let model = client.completion_model("gpt-4o");
+        let inner_agent = rig::agent::AgentBuilder::new(model).build();
+        let agent = AnyAgent::new(
+            AnyAgentInner::OpenAI(inner_agent),
+            ToolCache::new(),
+            std::time::Duration::from_secs(300),
+            Vec::new(),
+            String::new(),
+            "gpt-4o".to_string(),
+        );
+        // Must not panic.
+        maybe_fire_session_switch(&agent, "n", "p", false);
     }
 
     #[test]

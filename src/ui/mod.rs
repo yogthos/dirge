@@ -2227,6 +2227,18 @@ pub async fn run_interactive(
                                 token_savings,
                             );
                         }
+                        // dirge-5gn6: fire on_session_switch BEFORE
+                        // rewriting session.id so plugin providers
+                        // see both ids in a single hook call.
+                        // `reset=false` because compaction is a
+                        // continuation, not a fresh chat.
+                        let parent_id = session.id.to_string();
+                        crate::agent::review::maybe_fire_session_switch(
+                            &agent,
+                            new_session_id,
+                            &parent_id,
+                            false,
+                        );
                         session.id = compact_str::CompactString::new(
                             new_session_id.as_str(),
                         );
