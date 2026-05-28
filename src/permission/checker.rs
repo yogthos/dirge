@@ -159,6 +159,14 @@ impl PermissionChecker {
             "write_todo_list", // Internal-only TODO tracking; no side effects
             "task_status",     // Read-only status query for background tasks
             "question",        // Interactive by definition; gating it just adds friction
+            // dirge-sm9w: memory writes are scoped to `~/.dirge/memories/`
+            // (no arbitrary filesystem access) and the tool can only
+            // add/edit/delete its own entries. The per-action prompt
+            // is friction without security value in Standard/Accept
+            // modes. Restrictive mode still demotes this back to Ask
+            // in the mode switch below — its contract is "every
+            // action confirms".
+            "memory",
         ] {
             rules
                 .entry(tool.to_string())
@@ -428,7 +436,13 @@ impl PermissionChecker {
         let last_pat = matched.last().map(|(_, p)| p.clone());
         let action = match self.mode {
             SecurityMode::Restrictive => {
-                if matched.is_empty() && self.default_action == Action::Allow {
+                // dirge-sm9w: memory has a builtin `Allow` rule for
+                // Standard/Accept. Restrictive's contract is "every
+                // action confirms", so demote any non-Deny outcome
+                // back to Ask. An explicit user `deny` still denies.
+                if tool == "memory" && base != Action::Deny {
+                    Action::Ask
+                } else if matched.is_empty() && self.default_action == Action::Allow {
                     Action::Ask
                 } else {
                     base

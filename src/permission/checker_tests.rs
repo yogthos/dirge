@@ -91,6 +91,9 @@ fn m4_defaults_allow_safe_ask_dangerous() {
         "write_todo_list",
         "task_status",
         "question",
+        // dirge-sm9w: memory is auto-allowed in Standard/Accept
+        // (scoped to ~/.dirge/memories/, no arbitrary FS access).
+        "memory",
     ] {
         let result = checker.check_path(tool, "/tmp/anything.rs");
         assert!(
@@ -108,7 +111,6 @@ fn m4_defaults_allow_safe_ask_dangerous() {
         "websearch",
         "task",
         "skill",
-        "memory",
     ] {
         // Path is OUTSIDE working_dir (/tmp) so the CWD-scoped
         // allow installer does not apply.
@@ -844,6 +846,68 @@ fn default_bash_rules_keep_high_risk_gated() {
         assert!(
             matches!(result, CheckResult::Denied(_)),
             "{cmd:?} must remain hard-denied; got {result:?}",
+        );
+    }
+}
+
+/// dirge-sm9w: memory tool is auto-approved in Standard mode for
+/// all four actions. Writes are scoped to `~/.dirge/memories/`
+/// (no arbitrary filesystem access); the agent can only add /
+/// replace / remove its own entries. The per-action prompt was
+/// friction without security value.
+#[test]
+fn memory_tool_standard_mode_auto_approved() {
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    for action in ["view", "add", "replace", "remove"] {
+        let result = checker.check("memory", action);
+        assert!(
+            matches!(result, CheckResult::Allowed),
+            "memory.{action} must auto-allow in Standard; got {result:?}",
+        );
+    }
+}
+
+/// dirge-sm9w: Restrictive mode (`-R`) still prompts for memory.
+/// Restrictive's contract is "every action confirms" — the
+/// builtin Allow rule installed for Standard/Accept must be
+/// demoted back to Ask here.
+#[test]
+fn memory_tool_restrictive_mode_still_prompts() {
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Restrictive,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    for action in ["view", "add", "replace", "remove"] {
+        let result = checker.check("memory", action);
+        assert!(
+            matches!(result, CheckResult::Ask),
+            "memory.{action} must Ask in Restrictive; got {result:?}",
+        );
+    }
+}
+
+/// dirge-sm9w (regression): Yolo mode short-circuits the entire
+/// permission stack — memory must Allow without consulting any
+/// rule. This already worked before sm9w; pinned here so the
+/// new builtin-allow + Restrictive demotion can't accidentally
+/// break it.
+#[test]
+fn memory_tool_yolo_short_circuits() {
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Yolo,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    for action in ["view", "add", "replace", "remove"] {
+        let result = checker.check("memory", action);
+        assert!(
+            matches!(result, CheckResult::Allowed),
+            "memory.{action} must Allow in Yolo; got {result:?}",
         );
     }
 }
