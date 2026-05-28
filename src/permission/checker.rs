@@ -455,17 +455,16 @@ impl PermissionChecker {
         let last_pat = matched.last().map(|(_, p)| p.clone());
         let action = match self.mode {
             SecurityMode::Restrictive => {
-                // dirge-sm9w: memory has a builtin `Allow` rule for
-                // Standard/Accept. Restrictive's contract is "every
-                // action confirms", so demote any non-Deny outcome
-                // back to Ask. An explicit user `deny` still denies.
-                if tool == "memory" && base != Action::Deny {
-                    Action::Ask
-                } else if matched.is_empty() && self.default_action == Action::Allow {
-                    Action::Ask
-                } else {
-                    base
-                }
+                // Restrictive contract: "every action confirms".
+                // Demote any builtin-allow outcome back to Ask —
+                // both the dirge-sm9w memory case (`memory` has a
+                // builtin Allow rule for Standard/Accept) and the
+                // generic "no rule matched but default is Allow"
+                // case fall under this. Explicit user `deny` still
+                // denies.
+                let demote_to_ask = (tool == "memory" && base != Action::Deny)
+                    || (matched.is_empty() && self.default_action == Action::Allow);
+                if demote_to_ask { Action::Ask } else { base }
             }
             SecurityMode::Accept => match base {
                 Action::Ask => {
@@ -992,7 +991,7 @@ fn register_with_canonical_variant(
 ///     disk and `working_dir` itself is bogus).
 fn canonicalize_path_pattern(pattern_str: &str, working_dir: &str) -> Option<String> {
     let split_idx = pattern_str
-        .find(|c: char| matches!(c, '*' | '?' | '[' | '{'))
+        .find(['*', '?', '[', '{'])
         .unwrap_or(pattern_str.len());
     if split_idx == 0 {
         return None;
