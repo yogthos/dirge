@@ -216,12 +216,32 @@ pub async fn handle_compress(
     let messages_to_summarize = &session.messages[..cut_idx];
     let previous_summary = session.compactions.last().map(|c| c.summary.as_str());
 
+    // dirge-7tvq: give the memory provider a chance to inject
+    // provider-extracted insights into the compression prompt before
+    // the to-be-discarded messages are summarized. Returns an empty
+    // string for providers that don't override the hook.
+    let provider_insights = agent.memory_provider().map(|p| {
+        let pre_compress_transcript =
+            crate::agent::review::build_transcript_from_slice(messages_to_summarize);
+        p.on_pre_compress(&pre_compress_transcript)
+    });
+    let augmented_instructions: Option<String> = match (instructions, provider_insights) {
+        (Some(user), Some(extra)) if !extra.trim().is_empty() => {
+            Some(format!("{}\n\nProvider insights:\n{}", user, extra))
+        }
+        (None, Some(extra)) if !extra.trim().is_empty() => {
+            Some(format!("Provider insights:\n{}", extra))
+        }
+        (Some(user), _) => Some(user.to_string()),
+        _ => None,
+    };
+
     let summary = client
         .compress_messages(
             &session.model,
             messages_to_summarize,
             previous_summary,
-            instructions,
+            augmented_instructions.as_deref(),
         )
         .await?;
 

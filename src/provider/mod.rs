@@ -808,6 +808,12 @@ pub struct AnyAgent {
     /// was supplied (tests, `--no-tools`); the followup path stays
     /// disabled in that case (legacy behaviour byte-identical).
     bg_store: Option<crate::agent::tools::background::BackgroundStore>,
+    /// dirge-7tvq: memory provider held alongside the agent so
+    /// session-lifecycle hooks (`on_session_end`, `on_pre_compress`)
+    /// can dispatch through the trait. `None` when no provider was
+    /// built (test agents, --no-tools, build failure). The provider
+    /// is shared with `MemoryTool` via `Arc` — same instance.
+    memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
 }
 
 #[derive(Clone)]
@@ -848,7 +854,31 @@ impl AnyAgent {
             review_provider_name: None,
             review_model_name: None,
             bg_store: None,
+            memory_provider: None,
         }
+    }
+
+    /// dirge-7tvq: install the `MemoryProvider` used for this session
+    /// so lifecycle hooks (`on_session_end`, `on_pre_compress`) can
+    /// dispatch through the trait. Called by `build_agent` once the
+    /// provider has been constructed. Idempotent — repeated calls
+    /// replace the held Arc.
+    pub fn with_memory_provider(
+        mut self,
+        provider: std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>,
+    ) -> Self {
+        self.memory_provider = Some(provider);
+        self
+    }
+
+    /// dirge-7tvq: accessor for the held memory provider. Used by
+    /// lifecycle call sites (session swap, compaction) to fire the
+    /// trait hooks. Returns `None` for test agents and `--no-tools`
+    /// runs where no provider was constructed.
+    pub fn memory_provider(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>> {
+        self.memory_provider.as_ref()
     }
 
     /// dirge-9tfq: install the per-session background-task store so
@@ -1506,7 +1536,7 @@ pub async fn build_agent(
             #[cfg(feature = "lsp")]
             let lsp_for_loop = lsp_manager.clone();
 
-            let (agent, cache) = builder::build_agent_inner(
+            let (agent, cache, memory_provider) = builder::build_agent_inner(
                 $m,
                 cli,
                 cfg,
@@ -1574,7 +1604,7 @@ pub async fn build_agent(
                 preamble.push_str(crate::agent::prompt::DYNAMIC_TOOL_SEARCH_PROMPT);
             }
 
-            let agent = AnyAgent::new(
+            let mut agent = AnyAgent::new(
                 AnyAgentInner::$variant(agent),
                 cache,
                 chunk_timeout,
@@ -1582,6 +1612,11 @@ pub async fn build_agent(
                 preamble,
                 model_name.clone(),
             );
+            // dirge-7tvq: attach the memory provider so session-end
+            // and pre-compress hooks can dispatch through the trait.
+            if let Some(provider) = memory_provider {
+                agent = agent.with_memory_provider(provider);
+            }
             if let Some(filter) = tool_def_filter {
                 agent.with_dynamic_tool_search(filter)
             } else {

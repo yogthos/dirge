@@ -96,6 +96,16 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                 if let Some(store) = ctx.bg_store.as_ref() {
                     store.cancel_all();
                 }
+                // dirge-7tvq: fire the outgoing session's
+                // on_session_end provider hook BEFORE we replace
+                // `*ctx.session` — at this point the old agent
+                // still holds the provider keyed to the leaving
+                // session. Build a transcript from the live
+                // session and dispatch.
+                if let Some(provider) = ctx.agent.memory_provider() {
+                    let transcript = crate::agent::review::build_transcript(ctx.session);
+                    provider.on_session_end(&transcript);
+                }
                 *ctx.session = s;
                 let restored = ctx.session.current_prompt_name.clone();
                 if let Some(name) = restored.as_deref()

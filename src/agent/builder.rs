@@ -34,6 +34,11 @@ pub(crate) fn append_memory_to_preamble(
     preamble: &mut String,
     provider: &std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>,
 ) {
+    tracing::debug!(
+        target: "dirge::memory",
+        provider = provider.name(),
+        "Injecting memory provider prompt block"
+    );
     let block = provider.format_for_system_prompt();
     if !block.is_empty() {
         preamble.push_str(&block);
@@ -119,7 +124,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // turns. `None` is only correct for one-shot non-session runs.
     // See dirge-502b.
     session_id: Option<String>,
-) -> (Agent<M>, ToolCache) {
+) -> (
+    Agent<M>,
+    ToolCache,
+    // dirge-7tvq: surface the constructed MemoryProvider so the
+    // caller (provider::build_agent) can attach it to AnyAgent for
+    // session-lifecycle hook dispatch. `None` when load failed.
+    Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let skills: Arc<[Skill]> = Arc::from(
         tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
@@ -331,7 +343,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     );
 
     if cli.resolve_no_tools(cfg) {
-        (builder.build(), ToolCache::new())
+        (builder.build(), ToolCache::new(), memory_store)
     } else {
         let cache = ToolCache::new();
 
@@ -593,7 +605,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             }
         }
 
-        (builder.build(), cache)
+        (builder.build(), cache, memory_store)
     }
 }
 

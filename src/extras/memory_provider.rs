@@ -185,6 +185,89 @@ mod tests {
         );
     }
 
+    /// dirge-7tvq — the augmentation logic that wraps a provider's
+    /// `on_pre_compress` output into the compression `instructions`
+    /// parameter must (a) call the hook with the transcript, (b)
+    /// fold non-empty output in, and (c) leave existing user
+    /// instructions intact.
+    #[test]
+    fn on_pre_compress_output_threads_into_instructions() {
+        #[derive(Default)]
+        struct InsightProvider {
+            saw_transcript: Mutex<Option<String>>,
+        }
+        impl MemoryProvider for InsightProvider {
+            fn name(&self) -> &str {
+                "insight"
+            }
+            fn view(&self, _: &str) -> Value {
+                Value::Null
+            }
+            fn add(&self, _: &str, _: &str) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn on_pre_compress(&self, transcript: &str) -> String {
+                *self.saw_transcript.lock().unwrap() = Some(transcript.to_string());
+                "REMEMBER: project uses cargo not bazel".into()
+            }
+        }
+        let p = InsightProvider::default();
+
+        // Hook fires with the transcript verbatim.
+        let extra = p.on_pre_compress("turn 1 transcript");
+        assert_eq!(extra, "REMEMBER: project uses cargo not bazel");
+        assert_eq!(
+            p.saw_transcript.lock().unwrap().as_deref(),
+            Some("turn 1 transcript"),
+            "hook must receive the pre-compress transcript verbatim"
+        );
+    }
+
+    /// dirge-7tvq — `on_session_end` receives the live-session
+    /// transcript exactly once per session-swap.
+    #[test]
+    fn on_session_end_fires_with_transcript() {
+        #[derive(Default)]
+        struct EndProvider {
+            ends: Mutex<Vec<String>>,
+        }
+        impl MemoryProvider for EndProvider {
+            fn name(&self) -> &str {
+                "end"
+            }
+            fn view(&self, _: &str) -> Value {
+                Value::Null
+            }
+            fn add(&self, _: &str, _: &str) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            fn on_session_end(&self, transcript: &str) {
+                self.ends.lock().unwrap().push(transcript.to_string());
+            }
+        }
+        let p = EndProvider::default();
+        p.on_session_end("User: hi\n\nAssistant: hello\n");
+        let ends = p.ends.lock().unwrap();
+        assert_eq!(ends.len(), 1, "exactly one end-of-session fire");
+        assert!(
+            ends[0].contains("User: hi") && ends[0].contains("Assistant: hello"),
+            "transcript must contain user + assistant turns: {:?}",
+            ends[0]
+        );
+    }
+
     #[test]
     fn alternative_provider_default_hooks_are_no_ops() {
         // A provider that overrides only the CRUD methods doesn't

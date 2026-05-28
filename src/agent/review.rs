@@ -289,8 +289,15 @@ pub fn spawn_curator_review(agent: AnyAgent, candidate_list: String) {
 /// call names+args, and tool results. Compaction summaries are
 /// included as system context.
 pub fn build_transcript(session: &crate::session::Session) -> String {
+    build_transcript_from_slice(&session.messages)
+}
+
+/// Same as [`build_transcript`] but operates on an explicit message
+/// slice. Used by the pre-compress hook (dirge-7tvq) which only sees
+/// the soon-to-be-discarded prefix, not a full `Session`.
+pub fn build_transcript_from_slice(messages: &[crate::session::SessionMessage]) -> String {
     let mut out = String::new();
-    for msg in &session.messages {
+    for msg in messages {
         match msg.role {
             crate::session::MessageRole::User => {
                 out.push_str(&format!("User: {}\n\n", msg.content));
