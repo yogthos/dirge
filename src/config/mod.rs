@@ -595,6 +595,7 @@ pub fn load() -> Config {
                     McpServerConfig::Url {
                         url: "https://mcp.exa.ai/mcp".to_string(),
                         headers,
+                        allow_external_paths: false,
                     },
                 );
                 cfg.mcp_servers = Some(defaults);

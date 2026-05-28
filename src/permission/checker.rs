@@ -790,7 +790,7 @@ impl PermissionChecker {
         is_path_tool_name(tool)
     }
 
-    fn is_external_path(&self, path_str: &str) -> bool {
+    pub fn is_external_path(&self, path_str: &str) -> bool {
         // F18: previously `!is_absolute → return false`, which
         // treated `../../etc/passwd` as "internal" (not external).
         // In Accept mode that bypassed external_directory rules:

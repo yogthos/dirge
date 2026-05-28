@@ -153,6 +153,11 @@ servers:
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
       "env": {}
     },
+    "semantic-index": {
+      "command": "my-indexer",
+      "args": ["--repo", "/work/other-project"],
+      "allow_external_paths": true
+    },
     "remote-search": {
       "url": "https://example.com/mcp",
       "headers": {
@@ -167,6 +172,48 @@ If `mcp_servers` is omitted (`null`) and the `mcp` feature is enabled, dirge
 adds a default Exa Web Search MCP server at `https://mcp.exa.ai/mcp` with the
 `x-api-key` header set to `EXA_API_KEY` when that environment variable is set.
 Set `"mcp_servers": {}` to disable all MCP servers.
+
+### Per-server external-path opt-in (`allow_external_paths`)
+
+By default an MCP tool call whose JSON arguments name a path resolving outside
+the working directory is refused with a clear error — matching the trust model
+of dirge's built-in file tools (`read` / `write` / `edit` anchored to cwd).
+The check scans top-level args fields named `path`, `file_path`, `file`,
+`directory`, `dir`, `cwd`, and the `paths` array.
+
+Some MCP servers legitimately need broader scope: a semantic indexer pointed
+at a sibling repo, a project-wide search tool, a backup utility. Set
+`"allow_external_paths": true` on that one server's config (both `Command` and
+`Url` variants accept it; default `false`) to skip the cwd guard for tools
+from THAT server only.
+
+The flag is path-scoped and narrow:
+
+- It only bypasses the cwd-external-path check.
+- It does NOT bypass `mcp_tool` deny rules, prompt `deny_tools` frontmatter,
+  doom-loop detection, the sandbox, or `--yolo`/`--restrictive` mode logic —
+  every other gate runs unchanged.
+- It applies per-server: enabling it on `semantic-index` does not affect
+  `filesystem` or any other server in the same config.
+
+Pair it with a tight `mcp_tool` rule for layered control, e.g.:
+
+```json
+{
+  "mcp_servers": {
+    "semantic-index": {
+      "command": "indexer",
+      "allow_external_paths": true
+    }
+  },
+  "permission": {
+    "mcp_tool": {
+      "mcp_tool:semantic-index:*":          "allow",
+      "mcp_tool:semantic-index:write_file": "deny"
+    }
+  }
+}
+```
 
 ### MCP tools and prompt deny-lists
 

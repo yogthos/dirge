@@ -199,6 +199,35 @@ impl ToolDyn for McpTool {
                     }
                 }
             };
+
+            // dirge-mgub: per-server cwd guard. By default MCP tool
+            // calls whose JSON args name paths outside the working
+            // directory are refused — this matches the trust model
+            // of the built-in file tools (read/write/edit anchored to
+            // cwd). Set `allow_external_paths: true` on the server's
+            // config to opt out for that ONE server; deny rules,
+            // doom-loop, and prompt deny-lists still apply because
+            // they ran BEFORE this check.
+            //
+            // Heuristic: scan top-level args fields named `path` /
+            // `file_path` / `file` / `directory` / `dir` / `cwd`
+            // (scalar), or `paths` (array) — same key set used by the
+            // context-depth tracker. Anything resolving outside the
+            // working directory blocks the call with a clear message.
+            let allow_external = config
+                .as_ref()
+                .map(|c| c.allow_external_paths())
+                .unwrap_or(false);
+            if let Some(perm) = permission.as_ref()
+                && let Some(args_obj) = arguments.as_ref()
+                && let Some(p) = first_external_path(perm, args_obj, allow_external)
+            {
+                return Err(ToolError::ToolCallError(Box::new(McpToolError(format!(
+                    "MCP tool {server_name}::{tool_name} refused: path {p:?} is outside the working directory. \
+                     Set `allow_external_paths: true` on the `{server_name}` server config to permit external paths for this server."
+                )))));
+            }
+
             let params = arguments
                 .map(|a| CallToolRequestParams::new(tool_name.clone()).with_arguments(a))
                 .unwrap_or_else(|| CallToolRequestParams::new(tool_name.clone()));
@@ -471,6 +500,68 @@ async fn call_once(
     }
 }
 
+/// Per-server cwd-external-path guard (dirge-mgub).
+///
+/// Returns `Some(path)` for the FIRST path-shaped argument that
+/// resolves outside the working directory when external paths are NOT
+/// allowed; `None` otherwise (either the server opted into external
+/// paths, or every extracted path stays inside cwd, or no paths were
+/// extracted at all).
+///
+/// Pulled out of `McpTool::call` so the guard can be unit-tested
+/// without standing up a live MCP server.
+pub(crate) fn first_external_path(
+    perm: &PermCheck,
+    args: &JsonObject,
+    allow_external: bool,
+) -> Option<String> {
+    if allow_external {
+        return None;
+    }
+    let paths = extract_arg_paths(args);
+    if paths.is_empty() {
+        return None;
+    }
+    let guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+    paths.into_iter().find(|p| guard.is_external_path(p))
+}
+
+/// Best-effort extraction of path-shaped arguments from an MCP tool
+/// call's JSON object. Used by the cwd-external-path guard
+/// (dirge-mgub) to decide whether the call wants to touch the
+/// filesystem outside the working directory.
+///
+/// Scans the TOP LEVEL of the args object for:
+///   - scalar fields named `path`, `file_path`, `file`, `directory`,
+///     `dir`, `cwd` → one path each
+///   - the array field `paths` → one path per string element
+///
+/// Returns paths in declaration order; duplicates are preserved
+/// (the caller short-circuits on the first external hit anyway).
+/// Empty strings are filtered out — they're never a legitimate
+/// filesystem reference and would canonicalize to `working_dir`
+/// itself, falsely classifying as internal.
+fn extract_arg_paths(args: &JsonObject) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in ["path", "file_path", "file", "directory", "dir", "cwd"] {
+        if let Some(s) = args.get(key).and_then(|v| v.as_str())
+            && !s.is_empty()
+        {
+            out.push(s.to_string());
+        }
+    }
+    if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str()
+                && !s.is_empty()
+            {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +607,164 @@ mod tests {
         std::thread::sleep(Duration::from_millis(110));
         let r2 = remaining_budget(now, total);
         assert_eq!(r2, Duration::ZERO);
+    }
+
+    // ── dirge-mgub: per-server external-path guard ────────────────
+
+    use crate::agent::tools::check_perm;
+    use crate::permission::{
+        Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Build a PermissionChecker anchored at a temporary directory
+    /// the test fully controls. `extra_rules` lets a caller install
+    /// per-tool rules (e.g. a `mcp_tool` deny) on top of the default
+    /// config. Returns `(perm, cwd_string)` so tests can craft path
+    /// arguments relative to (or escaping) the cwd.
+    fn mk_perm(extra_rules: PermissionConfig) -> (PermCheck, String) {
+        let cwd = std::env::temp_dir().join(format!(
+            "dirge-mgub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&cwd).expect("create temp cwd");
+        let checker =
+            PermissionChecker::new(&extra_rules, SecurityMode::Standard, Some(cwd.clone()));
+        let perm: PermCheck = Arc::new(StdMutex::new(checker));
+        (perm, cwd.to_string_lossy().into_owned())
+    }
+
+    /// dirge-mgub test 1: default behavior (`allow_external_paths=
+    /// false`) refuses MCP tool args naming a path outside the
+    /// working directory. The guard returns `Some(path)` so the
+    /// caller surfaces a refusal error.
+    #[test]
+    fn mcp_allow_external_paths_default_false_blocks_external() {
+        let (perm, _cwd) = mk_perm(PermissionConfig::default());
+        // An absolute path that is NOT inside the temp cwd. `/etc`
+        // is sufficiently far outside any reasonable temp root.
+        let args: JsonObject =
+            serde_json::from_str(r#"{"path": "/etc/passwd"}"#).expect("parse args");
+
+        let hit = first_external_path(&perm, &args, false);
+        assert_eq!(
+            hit.as_deref(),
+            Some("/etc/passwd"),
+            "default config must flag an external path; got {hit:?}",
+        );
+    }
+
+    /// dirge-mgub test 2: opting into `allow_external_paths=true`
+    /// permits the same call by skipping the cwd-external-path check
+    /// entirely. The guard returns `None` regardless of how far the
+    /// path sits outside cwd.
+    #[test]
+    fn mcp_allow_external_paths_true_permits_external() {
+        let (perm, _cwd) = mk_perm(PermissionConfig::default());
+        let args: JsonObject =
+            serde_json::from_str(r#"{"path": "/etc/passwd", "paths": ["/var/log/system.log"]}"#)
+                .expect("parse args");
+
+        let hit = first_external_path(&perm, &args, true);
+        assert!(
+            hit.is_none(),
+            "allow_external_paths=true must skip the cwd guard; got {hit:?}",
+        );
+    }
+
+    /// dirge-mgub test 3: `allow_external_paths=true` ONLY toggles
+    /// the cwd guard — it does NOT bypass deny rules. A `mcp_tool`
+    /// rule that denies the qualified call still fires through the
+    /// normal `check_perm` path (which runs BEFORE the guard in
+    /// `McpTool::call`), so a deny rule + `allow_external_paths`
+    /// + an external path still results in refusal.
+    #[tokio::test]
+    async fn mcp_allow_external_paths_does_not_bypass_deny_rules() {
+        // Install a deny rule that matches the qualified MCP key
+        // `mcp_tool:indexer:scan`.
+        let mut mcp_rules: HashMap<String, Action> = HashMap::new();
+        mcp_rules.insert("mcp_tool:indexer:*".to_string(), Action::Deny);
+        let config = PermissionConfig {
+            mcp_tool: Some(ToolPerm::Granular(mcp_rules)),
+            ..Default::default()
+        };
+        let (perm, _cwd) = mk_perm(config);
+        let args: JsonObject =
+            serde_json::from_str(r#"{"path": "/etc/passwd"}"#).expect("parse args");
+
+        // First arm: deny rule fires through check_perm regardless
+        // of the external-path flag. McpTool::call routes through
+        // check_perm("mcp_tool", "mcp_tool:indexer:scan") BEFORE
+        // the path guard; a deny here aborts the call before the
+        // guard ever runs.
+        let perm_key = "mcp_tool:indexer:scan".to_string();
+        let result = check_perm(&Some(perm.clone()), &None, "mcp_tool", &perm_key).await;
+        assert!(
+            result.is_err(),
+            "deny rule must block the call even when allow_external_paths=true",
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("denied") || msg.contains("Deny") || msg.contains("Blocked"),
+            "expected deny message, got {msg:?}",
+        );
+
+        // Second arm: confirm the guard ITSELF still respects the
+        // allow_external_paths=true opt-out. (Defense in depth —
+        // both checks must agree the flag is path-scoped only.)
+        let guard_hit = first_external_path(&perm, &args, true);
+        assert!(
+            guard_hit.is_none(),
+            "guard must skip cwd-check on allow_external_paths=true; got {guard_hit:?}",
+        );
+    }
+
+    /// Empty / no-path arg objects do not produce false positives.
+    /// MCP tools without filesystem args (e.g. a search query) must
+    /// pass the guard even with `allow_external_paths=false`.
+    #[test]
+    fn mcp_external_path_guard_skips_argless_calls() {
+        let (perm, _cwd) = mk_perm(PermissionConfig::default());
+        let args: JsonObject = serde_json::from_str(r#"{"query": "needle"}"#).expect("parse args");
+        assert!(first_external_path(&perm, &args, false).is_none());
+    }
+
+    /// In-cwd paths (relative or absolute) pass the guard. Only
+    /// paths that resolve OUTSIDE cwd should trigger refusal.
+    #[test]
+    fn mcp_external_path_guard_permits_in_cwd_paths() {
+        let (perm, cwd) = mk_perm(PermissionConfig::default());
+        let abs_in = format!("{cwd}/inside.txt");
+        let args = serde_json::json!({
+            "path": abs_in,
+            "paths": ["./relative-inside.rs"],
+        });
+        let obj = args.as_object().unwrap().clone();
+        assert!(first_external_path(&perm, &obj, false).is_none());
+    }
+
+    /// `allow_external_paths` is round-trip-deserializable on both
+    /// `Command` and `Url` variants of `McpServerConfig`, and
+    /// defaults to `false` when omitted.
+    #[test]
+    fn mcp_server_config_allow_external_paths_round_trip() {
+        let cmd_default: McpServerConfig = serde_json::from_str(r#"{"command": "x"}"#).unwrap();
+        assert!(!cmd_default.allow_external_paths());
+
+        let cmd_true: McpServerConfig =
+            serde_json::from_str(r#"{"command": "x", "allow_external_paths": true}"#).unwrap();
+        assert!(cmd_true.allow_external_paths());
+
+        let url_default: McpServerConfig = serde_json::from_str(r#"{"url": "https://x"}"#).unwrap();
+        assert!(!url_default.allow_external_paths());
+
+        let url_true: McpServerConfig =
+            serde_json::from_str(r#"{"url": "https://x", "allow_external_paths": true}"#).unwrap();
+        assert!(url_true.allow_external_paths());
     }
 }
