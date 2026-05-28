@@ -13,7 +13,7 @@
 //! - Provenance filter: only agent-created skills are curator-managed
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::extras::dirge_paths::ProjectPaths;
 
@@ -90,30 +90,7 @@ impl UsageStore {
     pub fn load(paths: &ProjectPaths) -> Result<Self, String> {
         let path = paths.skills_dir().join(".usage.json");
         let lock_path = paths.skills_dir().join(".usage.json.lock");
-
-        let data = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-                    tracing::debug!(
-                        target: "dirge::skills::usage",
-                        error = %e,
-                        "Corrupt .usage.json — starting fresh"
-                    );
-                    HashMap::new()
-                }),
-                Err(e) => {
-                    tracing::debug!(
-                        target: "dirge::skills::usage",
-                        error = %e,
-                        "Cannot read .usage.json — starting fresh"
-                    );
-                    HashMap::new()
-                }
-            }
-        } else {
-            HashMap::new()
-        };
-
+        let data = read_usage_data(&path);
         Ok(UsageStore {
             path,
             lock_path,
@@ -121,11 +98,11 @@ impl UsageStore {
         })
     }
 
-    /// Serialize and write atomically. Acquires an exclusive file lock
-    /// before writing to prevent corruption from concurrent processes.
-    /// Best-effort: failures are logged and silently dropped.
-    pub fn save(&self) -> Result<(), String> {
-        let _lock = acquire_usage_lock(&self.lock_path)?;
+    /// Write `self.data` to disk atomically WITHOUT acquiring the
+    /// lock — the caller (`mutate_locked`) must already hold it.
+    /// `acquire_usage_lock` is create-exclusive and NOT reentrant, so
+    /// re-acquiring it here would self-deadlock.
+    fn write_data(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create usage directory: {e}"))?;
@@ -136,57 +113,85 @@ impl UsageStore {
             .map_err(|e| format!("Failed to write usage: {e}"))
     }
 
-    fn now_iso() -> String {
-        chrono::Utc::now().to_rfc3339()
-    }
-
-    fn get_or_create(&mut self, name: &str, created_by: Option<&str>) -> &mut SkillUsage {
-        self.data
-            .entry(name.to_string())
-            .or_insert_with(|| SkillUsage::new(created_by))
+    /// dirge-szgc: apply a mutation as one atomic read-modify-write
+    /// critical section. Holds the file lock across a fresh reload
+    /// from disk, the mutation, and the write — so concurrent
+    /// mutations (the curator's `set_state` batch vs a live
+    /// skill-tool `record_use` from another turn, or a second
+    /// process) can't lose each other's updates.
+    ///
+    /// Before this, `load` (unlocked) → mutate in-memory → `save`
+    /// (locked write) let two handles each start from a stale
+    /// snapshot and clobber one another (last writer wins). Now the
+    /// mutation always applies to the latest on-disk state.
+    /// `self.data` is left holding the just-written state.
+    fn mutate_locked<F>(&mut self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut HashMap<String, SkillUsage>),
+    {
+        let _lock = acquire_usage_lock(&self.lock_path)?;
+        // Reload under the lock so the delta lands on the freshest
+        // on-disk state, not the (possibly stale) in-memory snapshot.
+        self.data = read_usage_data(&self.path);
+        f(&mut self.data);
+        self.write_data()
     }
 
     /// Record a skill creation event.
     pub fn record_create(&mut self, name: &str, created_by: &str) {
-        let entry = self
-            .data
-            .entry(name.to_string())
-            .or_insert_with(|| SkillUsage::new(Some(created_by)));
-        // If the entry already existed, don't overwrite created_by.
-        if entry.created_by.is_none() {
-            entry.created_by = Some(created_by.to_string());
-        }
-        if let Err(e) = self.save() {
+        let name = name.to_string();
+        let created_by = created_by.to_string();
+        if let Err(e) = self.mutate_locked(|data| {
+            let entry = data
+                .entry(name.clone())
+                .or_insert_with(|| SkillUsage::new(Some(&created_by)));
+            // If the entry already existed, don't overwrite created_by.
+            if entry.created_by.is_none() {
+                entry.created_by = Some(created_by.clone());
+            }
+        }) {
             tracing::debug!(target: "dirge::skills::usage", error = %e, "record_create save failed");
         }
     }
 
     /// Record a skill use (agent invoked the skill).
     pub fn record_use(&mut self, name: &str) {
-        let entry = self.get_or_create(name, None);
-        entry.use_count = entry.use_count.saturating_add(1);
-        entry.last_used_at = Some(Self::now_iso());
-        if let Err(e) = self.save() {
+        let name = name.to_string();
+        if let Err(e) = self.mutate_locked(|data| {
+            let entry = data
+                .entry(name.clone())
+                .or_insert_with(|| SkillUsage::new(None));
+            entry.use_count = entry.use_count.saturating_add(1);
+            entry.last_used_at = Some(now_iso());
+        }) {
             tracing::debug!(target: "dirge::skills::usage", error = %e, "record_use save failed");
         }
     }
 
     /// Record a skill view (read the skill content).
     pub fn record_view(&mut self, name: &str) {
-        let entry = self.get_or_create(name, None);
-        entry.view_count = entry.view_count.saturating_add(1);
-        entry.last_viewed_at = Some(Self::now_iso());
-        if let Err(e) = self.save() {
+        let name = name.to_string();
+        if let Err(e) = self.mutate_locked(|data| {
+            let entry = data
+                .entry(name.clone())
+                .or_insert_with(|| SkillUsage::new(None));
+            entry.view_count = entry.view_count.saturating_add(1);
+            entry.last_viewed_at = Some(now_iso());
+        }) {
             tracing::debug!(target: "dirge::skills::usage", error = %e, "record_view save failed");
         }
     }
 
     /// Record a skill patch (content was modified).
     pub fn record_patch(&mut self, name: &str) {
-        let entry = self.get_or_create(name, None);
-        entry.patch_count = entry.patch_count.saturating_add(1);
-        entry.last_patched_at = Some(Self::now_iso());
-        if let Err(e) = self.save() {
+        let name = name.to_string();
+        if let Err(e) = self.mutate_locked(|data| {
+            let entry = data
+                .entry(name.clone())
+                .or_insert_with(|| SkillUsage::new(None));
+            entry.patch_count = entry.patch_count.saturating_add(1);
+            entry.last_patched_at = Some(now_iso());
+        }) {
             tracing::debug!(target: "dirge::skills::usage", error = %e, "record_patch save failed");
         }
     }
@@ -194,20 +199,28 @@ impl UsageStore {
     /// Set the pinned flag. Pinned skills are exempt from curator transitions.
     #[allow(dead_code)]
     pub fn set_pinned(&mut self, name: &str, pinned: bool) -> Result<(), String> {
-        let entry = self.get_or_create(name, None);
-        entry.pinned = pinned;
-        self.save()
+        let name = name.to_string();
+        self.mutate_locked(|data| {
+            let entry = data
+                .entry(name.clone())
+                .or_insert_with(|| SkillUsage::new(None));
+            entry.pinned = pinned;
+        })
     }
 
     /// Set the lifecycle state.
     pub fn set_state(&mut self, name: &str, state: SkillState) -> Result<(), String> {
-        let entry = self.get_or_create(name, None);
-        let is_archived = state == SkillState::Archived;
-        entry.state = state;
-        if is_archived {
-            entry.archived_at = Some(Self::now_iso());
-        }
-        self.save()
+        let name = name.to_string();
+        self.mutate_locked(|data| {
+            let entry = data
+                .entry(name.clone())
+                .or_insert_with(|| SkillUsage::new(None));
+            let is_archived = state == SkillState::Archived;
+            entry.state = state;
+            if is_archived {
+                entry.archived_at = Some(now_iso());
+            }
+        })
     }
 
     /// Provenance filter: only skills created by the agent are
@@ -249,6 +262,37 @@ impl UsageStore {
     #[allow(dead_code)]
     pub fn skill_names(&self) -> impl Iterator<Item = &String> {
         self.data.keys()
+    }
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Read the usage sidecar from disk into a map. Missing file → empty;
+/// corrupt JSON → empty (best-effort, never blocks skill ops). Pure
+/// (no lock); callers that need atomicity hold the lock around it.
+fn read_usage_data(path: &Path) -> HashMap<String, SkillUsage> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            tracing::debug!(
+                target: "dirge::skills::usage",
+                error = %e,
+                "Corrupt .usage.json — starting fresh"
+            );
+            HashMap::new()
+        }),
+        Err(e) => {
+            tracing::debug!(
+                target: "dirge::skills::usage",
+                error = %e,
+                "Cannot read .usage.json — starting fresh"
+            );
+            HashMap::new()
+        }
     }
 }
 
@@ -426,11 +470,11 @@ mod tests {
         let (paths, _dir) = temp_project();
         {
             let mut store = UsageStore::load(&paths).unwrap();
+            // Each mutation persists atomically (mutate_locked) — no
+            // explicit save needed.
             store.record_create("test-skill", "agent");
             store.record_use("test-skill");
             store.record_patch("test-skill");
-            // Explicit save.
-            store.save().unwrap();
         }
         // Reload from disk.
         let store2 = UsageStore::load(&paths).unwrap();
@@ -438,6 +482,46 @@ mod tests {
         assert_eq!(entry.created_by.as_deref(), Some("agent"));
         assert_eq!(entry.use_count, 1);
         assert_eq!(entry.patch_count, 1);
+    }
+
+    /// dirge-szgc regression: a mutation through one handle must NOT
+    /// clobber a concurrent mutation made through another handle that
+    /// started from a stale snapshot. This is the lost-update TOCTOU
+    /// — simulated deterministically with two store handles rather
+    /// than real threads.
+    #[test]
+    fn concurrent_mutations_do_not_lose_updates() {
+        let (paths, _dir) = temp_project();
+
+        // Handle A creates the skill and bumps use_count to 1.
+        let mut a = UsageStore::load(&paths).unwrap();
+        a.record_create("x", "agent");
+        a.record_use("x"); // disk: use_count=1
+
+        // Handle B loads a snapshot now (sees use_count=1, view_count=0).
+        let mut b = UsageStore::load(&paths).unwrap();
+        assert_eq!(b.get("x").unwrap().use_count, 1);
+
+        // Meanwhile, handle A bumps use_count again → disk use_count=2.
+        a.record_use("x");
+
+        // Handle B, still holding its stale snapshot (use_count=1),
+        // records a VIEW. Pre-fix, B would write its snapshot and
+        // clobber A's second bump (use_count back to 1). Post-fix,
+        // record_view reloads under the lock and sees use_count=2.
+        b.record_view("x");
+
+        // Fresh read from disk: BOTH A's bumps AND B's view survived.
+        let c = UsageStore::load(&paths).unwrap();
+        let entry = c.get("x").unwrap();
+        assert_eq!(
+            entry.use_count, 2,
+            "handle A's second use bump must not be lost by handle B's write",
+        );
+        assert_eq!(
+            entry.view_count, 1,
+            "handle B's view must be recorded on top of the latest state",
+        );
     }
 
     #[test]
