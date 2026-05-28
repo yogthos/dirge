@@ -1,27 +1,31 @@
 //! Memory entry lifecycle curator. Periodic background pass that
 //! tracks MEMORY.md / PITFALLS.md entries via the usage sidecar,
-//! identifies stale candidates, and writes an audit report.
+//! identifies stale candidates, runs an LLM consolidation pass
+//! over them, and writes audit reports for both stages.
 //!
-//! dirge-mo0w (audit finding B), PR-1 of 2: mechanical pass only.
-//! No LLM call yet — that lands in the follow-up PR with the
-//! `MEMORY_CURATOR_PROMPT` analog of `dirge-odv3`. This PR builds
-//! the infrastructure (state, telemetry reconciliation, audit
-//! report, trigger gate) so the LLM pass has somewhere to plug
-//! into.
+//! dirge-mo0w (audit finding B). Closed across two PRs:
+//! - PR-1: mechanical pass — telemetry + state + stale-candidate
+//!   identification + `REPORT.md` writer.
+//! - PR-2: LLM consolidation pass — `MEMORY_CURATOR_PROMPT`
+//!   + memory-only forked runner via
+//!   `AnyAgent::spawn_memory_curator_runner` + `LLM_REPORT.md`
+//!   writer.
 //!
 //! Parallel structure to `extras::skills::curator`:
 //! - `.dirge/memory/.curator_state` — scheduler state
-//! - `.dirge/memory/.curator_reports/{YYYYMMDD-HHMMSS}/REPORT.md`
+//! - `.dirge/memory/.curator_reports/{ts}/REPORT.md` — mechanical
+//! - `.dirge/memory/.curator_reports/{ts}/LLM_REPORT.md` — LLM
 //! - 7-day interval gate, first-run defer
 //! - 30-day stale, 90-day archive-candidate thresholds
 //!
 //! Differences from the skills curator:
 //! - Entries aren't named — they're keyed by FNV-1a hash of
 //!   content via `memory_usage::MemoryUsageStore`.
-//! - PR-1 only IDENTIFIES archive candidates; it doesn't move
-//!   them. Actual archival waits for the LLM consolidation pass
-//!   in PR-2, where the model can judge whether stale entries
-//!   are also obsolete (some old facts are still load-bearing).
+//! - LLM pass biases toward KEEPING (skill curator biases toward
+//!   restructuring into umbrella classes); a 90-day-old fact may
+//!   still be load-bearing.
+//! - LLM pass uses a memory-only allow-list — model literally
+//!   cannot reach skill-write tools even if its prompt slips.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -29,6 +33,54 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::extras::dirge_paths::ProjectPaths;
 use crate::extras::memory_usage::{MemoryUsageStore, ReconcileReport, entry_id};
+
+/// dirge-mo0w PR-2: prompt for the memory curator's LLM
+/// consolidation pass. Analog of `skills/curator::CURATOR_PROMPT`
+/// (dirge-odv3) but adapted for memory entries — the model has
+/// only the `memory` tool available (enforced at the registry
+/// level via `spawn_memory_curator_runner`'s `&["memory"]`
+/// allow-list, not just the prompt).
+///
+/// Differences from the skills prompt:
+/// - Memory entries are facts/pitfalls, not procedural skills.
+///   The right action is usually merge (consolidate overlapping
+///   facts) or remove (obsolete), not "create umbrella class".
+/// - Bias is toward KEEPING entries. A 90-day-old fact may
+///   still be load-bearing; the model must show its work for
+///   removals.
+/// - No `pinned` concept yet — every entry is in scope.
+pub const MEMORY_CURATOR_PROMPT: &str = "You are running as dirge's background memory CURATOR. Your job is to consolidate \
+the project's MEMORY.md and PITFALLS.md so they stay accurate and compact, NOT to add new facts. \
+You have ONLY the `memory` tool available — no read/write/edit/bash/skill tools are loaded. \
+\n\n\
+The mechanical pass below identified stale candidates: entries first observed ≥ 30 days ago. \
+Stale ≠ obsolete; many old facts are still load-bearing. Read each candidate carefully against \
+the rest of the memory store before acting. \
+\n\n\
+Preference order — prefer the earliest that fits:\n\
+  1. KEEP. Most entries should be kept untouched. \"Old\" is not a reason to act.\n\
+  2. CONSOLIDATE. If two or more entries cover the same fact, merge them into one \
+clearer entry using `memory(action='replace', ...)` then `memory(action='remove', ...)` for \
+the redundant copies.\n\
+  3. RESTRUCTURE. If one entry mixed unrelated concerns, split it via \
+`memory(action='replace', ...)` to the cleaner of the two facts, then `memory(action='add', ...)` \
+the other. This is rare — only do it when the entry is genuinely two facts wearing one coat.\n\
+  4. REMOVE. Only if the entry is clearly obsolete (refers to a deleted file, a renamed binary, \
+a long-superseded approach the project no longer uses). Show your reasoning in your thinking before \
+removing.\n\
+\n\
+Do NOT:\n\
+  • Add new facts. The curator is for consolidation, not capture. Background review handles capture.\n\
+  • Reword for style. Only change wording when consolidating duplicates or fixing a fact that's \
+now wrong.\n\
+  • Remove pitfalls eagerly. A pitfall surviving 90 days probably caught someone.\n\
+\n\
+Target shape: the memory file at the end of your pass should have STRICTLY FEWER OR EQUAL entries \
+to the start, each one carrying a fact that's still true. \"Nothing to consolidate.\" is a valid \
+outcome and is often the right answer.\n\
+\n\
+Below is the current memory store and the stale candidates the mechanical pass flagged. \
+Operate on these only.";
 
 /// Days since `first_seen_at` before an entry counts as stale.
 const STALE_AFTER_DAYS: u64 = 30;
@@ -295,6 +347,131 @@ impl MechanicalReport {
     }
 }
 
+/// dirge-mo0w PR-2: per-LLM-pass audit record. Parallel to
+/// `skills::curator::CuratorReport`. The mechanical pass returns
+/// `MechanicalReport`; the LLM pass returns this one. They're
+/// written to disk separately so the operator can see which
+/// stage produced which change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmCuratorReport {
+    pub started_at_iso: String,
+    pub elapsed_secs: f64,
+    /// Stale candidates the mechanical pass handed to the LLM.
+    /// Same data as `MechanicalReport.stale_candidates` for the
+    /// run; copied here so a single report file fully describes
+    /// the LLM session.
+    pub stale_candidates: Vec<StaleCandidate>,
+    /// Sequence of memory-tool actions the LLM fired. Duplicates
+    /// preserved.
+    pub tool_actions: Vec<String>,
+    /// Captured error message if the agent stream surfaced one.
+    pub error: Option<String>,
+}
+
+impl LlmCuratorReport {
+    pub fn to_markdown(&self) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "# Memory curator — LLM consolidation pass\n");
+        let _ = writeln!(out, "- Started: {}", self.started_at_iso);
+        let _ = writeln!(out, "- Elapsed: {:.2}s", self.elapsed_secs);
+        let _ = writeln!(
+            out,
+            "- Outcome: {}",
+            if self.error.is_some() {
+                "error"
+            } else if self.tool_actions.is_empty() {
+                "no-op (LLM chose to keep all candidates)"
+            } else {
+                "modified memory entries"
+            }
+        );
+        if let Some(err) = &self.error {
+            let _ = writeln!(out, "- Error: `{err}`");
+        }
+
+        let mut histogram: BTreeMap<&str, usize> = BTreeMap::new();
+        for action in &self.tool_actions {
+            *histogram.entry(action.as_str()).or_insert(0) += 1;
+        }
+        if !histogram.is_empty() {
+            let _ = writeln!(out, "\n## Tool calls\n");
+            for (name, count) in &histogram {
+                let _ = writeln!(out, "- `{name}` × {count}");
+            }
+        }
+
+        if !self.stale_candidates.is_empty() {
+            let _ = writeln!(out, "\n## Stale candidates given to the LLM\n");
+            let _ = writeln!(out, "| Target | Age (days) | Entry ID | Preview |");
+            let _ = writeln!(out, "|---|---|---|---|");
+            for c in &self.stale_candidates {
+                let _ = writeln!(
+                    out,
+                    "| `{}` | {} | `{}` | {} |",
+                    c.target,
+                    c.age_days,
+                    c.entry_id,
+                    c.preview.replace('|', "\\|"),
+                );
+            }
+        }
+
+        out
+    }
+}
+
+/// Render the input the LLM curator sees: current MEMORY.md /
+/// PITFALLS.md (full text) followed by the stale-candidate
+/// table from the mechanical pass. This is concatenated AFTER
+/// `MEMORY_CURATOR_PROMPT` and handed to the runner.
+pub fn render_curator_input(
+    report: &MechanicalReport,
+    memory_md: &str,
+    pitfalls_md: &str,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "\n## Current MEMORY.md\n");
+    if memory_md.trim().is_empty() {
+        let _ = writeln!(out, "_(empty)_");
+    } else {
+        let _ = writeln!(out, "{}", memory_md.trim_end());
+    }
+    let _ = writeln!(out, "\n## Current PITFALLS.md\n");
+    if pitfalls_md.trim().is_empty() {
+        let _ = writeln!(out, "_(empty)_");
+    } else {
+        let _ = writeln!(out, "{}", pitfalls_md.trim_end());
+    }
+    let _ = writeln!(
+        out,
+        "\n## Stale candidates flagged by mechanical pass ({})\n",
+        report.stale_candidates.len(),
+    );
+    if report.stale_candidates.is_empty() {
+        let _ = writeln!(
+            out,
+            "_None. The mechanical pass found no entries ≥ {STALE_AFTER_DAYS} days old._"
+        );
+    } else {
+        let _ = writeln!(out, "| Target | Age (days) | Entry ID | Preview |");
+        let _ = writeln!(out, "|---|---|---|---|");
+        for c in &report.stale_candidates {
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | `{}` | {} |",
+                c.target,
+                c.age_days,
+                c.entry_id,
+                c.preview.replace('|', "\\|"),
+            );
+        }
+    }
+    out
+}
+
 // ── Helpers ───────────────────────────────────────────
 
 fn now_secs() -> u64 {
@@ -531,6 +708,108 @@ mod tests {
             md.contains("no entries archived"),
             "PR-1 must disclaim mechanical-only scope: {md}",
         );
+    }
+
+    // ── PR-2: render_curator_input + LlmCuratorReport ──
+
+    fn make_report(stale: Vec<StaleCandidate>) -> MechanicalReport {
+        MechanicalReport {
+            started_at_iso: "2026-05-28T12:00:00Z".to_string(),
+            total_entries: stale.len(),
+            reconcile: ReconcileReport::default(),
+            stale_candidates: stale,
+        }
+    }
+
+    /// Render shows current memory + pitfalls verbatim, then a
+    /// table of stale candidates. The LLM sees this and decides
+    /// what to consolidate / remove.
+    #[test]
+    fn render_curator_input_includes_memory_pitfalls_and_stale_table() {
+        let report = make_report(vec![StaleCandidate {
+            target: "memory".to_string(),
+            entry_id: "abc123".to_string(),
+            preview: "old fact".to_string(),
+            age_days: 45,
+        }]);
+        let out = render_curator_input(&report, "fact A\n§\nfact B", "pitfall X");
+        assert!(out.contains("## Current MEMORY.md"));
+        assert!(out.contains("fact A"));
+        assert!(out.contains("## Current PITFALLS.md"));
+        assert!(out.contains("pitfall X"));
+        assert!(out.contains("## Stale candidates"));
+        assert!(out.contains("abc123"));
+        assert!(out.contains("old fact"));
+        assert!(out.contains("45"));
+    }
+
+    /// Empty memory store renders the `_(empty)_` sentinel
+    /// instead of leaving the section blank — keeps the prompt
+    /// readable when the project hasn't accumulated facts yet.
+    #[test]
+    fn render_curator_input_marks_empty_stores_explicitly() {
+        let report = make_report(vec![]);
+        let out = render_curator_input(&report, "", "");
+        assert!(out.contains("## Current MEMORY.md"));
+        assert!(out.contains("_(empty)_"));
+        assert!(out.contains("## Current PITFALLS.md"));
+        assert!(out.contains("None. The mechanical pass found no entries"));
+    }
+
+    /// LLM report markdown captures elapsed, tool actions
+    /// histogram, and the stale candidate table the LLM was
+    /// given.
+    #[test]
+    fn llm_curator_report_markdown_includes_actions_and_candidates() {
+        let r = LlmCuratorReport {
+            started_at_iso: "2026-05-28T12:00:00Z".to_string(),
+            elapsed_secs: 4.2,
+            stale_candidates: vec![StaleCandidate {
+                target: "pitfalls".to_string(),
+                entry_id: "deadbeef00000000".to_string(),
+                preview: "stale pitfall".to_string(),
+                age_days: 100,
+            }],
+            tool_actions: vec!["memory".to_string(), "memory".to_string()],
+            error: None,
+        };
+        let md = r.to_markdown();
+        assert!(md.contains("# Memory curator — LLM consolidation pass"));
+        assert!(md.contains("Outcome: modified memory entries"));
+        assert!(md.contains("`memory` × 2"));
+        assert!(md.contains("deadbeef00000000"));
+        assert!(md.contains("stale pitfall"));
+    }
+
+    /// LLM report flags no-op runs distinctly so the operator
+    /// can tell "LLM chose to keep everything" from "LLM crashed."
+    #[test]
+    fn llm_curator_report_markdown_flags_noop_outcome() {
+        let r = LlmCuratorReport {
+            started_at_iso: "2026-05-28T12:00:00Z".to_string(),
+            elapsed_secs: 0.5,
+            stale_candidates: vec![],
+            tool_actions: vec![],
+            error: None,
+        };
+        let md = r.to_markdown();
+        assert!(md.contains("no-op (LLM chose to keep all candidates)"));
+    }
+
+    /// LLM report markdown surfaces error messages so failures
+    /// are visible in the audit trail without scraping logs.
+    #[test]
+    fn llm_curator_report_markdown_surfaces_errors() {
+        let r = LlmCuratorReport {
+            started_at_iso: "2026-05-28T12:00:00Z".to_string(),
+            elapsed_secs: 0.1,
+            stale_candidates: vec![],
+            tool_actions: vec![],
+            error: Some("model timed out".to_string()),
+        };
+        let md = r.to_markdown();
+        assert!(md.contains("Outcome: error"));
+        assert!(md.contains("model timed out"));
     }
 
     /// Preview helper: short entries pass through verbatim;

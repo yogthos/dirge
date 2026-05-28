@@ -565,58 +565,70 @@ pub(crate) async fn handle_done(
             }
         });
 
-        // dirge-mo0w PR-1: memory curator mechanical pass.
-        // Parallel to the skills curator above — same 7-day gate,
-        // same fire-and-forget pattern. Reconciles the
-        // .dirge/memory/.usage.json sidecar against current
-        // MEMORY.md / PITFALLS.md entries, identifies stale
-        // candidates (≥30 days), writes an audit report under
-        // .dirge/memory/.curator_reports/. Does NOT archive
-        // anything in PR-1 — that waits for the LLM
-        // consolidation pass in PR-2 where the model can judge
-        // whether stale entries are also obsolete.
+        // dirge-mo0w: memory curator. PR-1 added the mechanical
+        // pass; PR-2 adds the LLM consolidation pass that fires
+        // when the mechanical pass surfaces stale candidates.
+        // Same fire-and-forget pattern as the skills curator
+        // above. The mechanical pass is fast (disk IO + hash);
+        // the LLM pass is gated on `!report.stale_candidates.is_empty()`
+        // so a session with nothing stale doesn't pay for an
+        // LLM call.
         let memory_curator_paths = paths.clone();
+        let memory_curator_agent = agent.clone();
         tokio::spawn(async move {
-            tokio::task::spawn_blocking(move || {
-                let mut curator = match crate::extras::memory_curator::MemoryCurator::new(
-                    &memory_curator_paths,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "dirge::memory_curator",
-                            error = %e,
-                            "Failed to construct memory curator — skipping run",
-                        );
-                        return;
+            let mechanical_report = tokio::task::spawn_blocking({
+                let paths = memory_curator_paths.clone();
+                move || {
+                    let mut curator =
+                        match crate::extras::memory_curator::MemoryCurator::new(&paths) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::debug!(
+                                    target: "dirge::memory_curator",
+                                    error = %e,
+                                    "Failed to construct memory curator — skipping run",
+                                );
+                                return None;
+                            }
+                        };
+                    if !curator.should_run_now() {
+                        return None;
                     }
-                };
-                if !curator.should_run_now() {
-                    return;
-                }
-                match curator.run_mechanical_pass() {
-                    Ok(report) => {
-                        tracing::info!(
-                            target: "dirge::memory_curator",
-                            total = %report.total_entries,
-                            added = %report.reconcile.added,
-                            retained = %report.reconcile.retained,
-                            dropped = %report.reconcile.dropped,
-                            stale = %report.stale_candidates.len(),
-                            "memory curator mechanical pass complete",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "dirge::memory_curator",
-                            error = %e,
-                            "memory curator mechanical pass failed",
-                        );
+                    match curator.run_mechanical_pass() {
+                        Ok(report) => {
+                            tracing::info!(
+                                target: "dirge::memory_curator",
+                                total = %report.total_entries,
+                                added = %report.reconcile.added,
+                                retained = %report.reconcile.retained,
+                                dropped = %report.reconcile.dropped,
+                                stale = %report.stale_candidates.len(),
+                                "memory curator mechanical pass complete",
+                            );
+                            Some(report)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "dirge::memory_curator",
+                                error = %e,
+                                "memory curator mechanical pass failed",
+                            );
+                            None
+                        }
                     }
                 }
             })
             .await
-            .ok();
+            .ok()
+            .flatten();
+
+            if let Some(report) = mechanical_report {
+                crate::agent::review::spawn_memory_curator_review(
+                    memory_curator_agent,
+                    memory_curator_paths,
+                    report,
+                );
+            }
         });
     }
 

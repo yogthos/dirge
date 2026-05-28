@@ -1324,6 +1324,27 @@ impl AnyAgent {
         runner
     }
 
+    /// dirge-mo0w PR-2: memory-only forked runner for the memory
+    /// curator's LLM consolidation pass. Inverse of
+    /// `spawn_curator_runner` — same forked-runner pattern, but
+    /// the tool allow-list is `&["memory"]` so the consolidation
+    /// pass can ONLY add/replace/remove memory entries, not write
+    /// skills. The model literally cannot reach skill-write tools
+    /// even if the prompt-level guard slips.
+    pub fn spawn_memory_curator_runner(
+        &self,
+        prompt: String,
+        transcript: String,
+    ) -> crate::agent::runner::AgentRunner {
+        let (runner, _isolated_cache) = self.spawn_filtered_runner_with_cache(
+            prompt,
+            transcript,
+            ToolCache::new(),
+            &["memory"],
+        );
+        runner
+    }
+
     /// Internal review-runner constructor with an explicit
     /// caller-supplied cache. Returns the cache alongside the
     /// runner so tests can assert cache isolation via

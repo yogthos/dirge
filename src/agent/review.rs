@@ -335,6 +335,131 @@ pub fn spawn_curator_review(
     });
 }
 
+/// dirge-mo0w PR-2: spawn the memory curator's LLM
+/// consolidation pass. Fire-and-forget. Mirror of
+/// `spawn_curator_review` but routes through
+/// `spawn_memory_curator_runner` (memory-only allow-list) so
+/// the model literally cannot write skills even if the prompt
+/// guard slips.
+///
+/// Skips entirely when `report.stale_candidates` is empty — no
+/// LLM call when there's nothing to consolidate. The mechanical
+/// pass still produced an audit report in PR-1; the LLM is only
+/// useful when there are decisions to make.
+///
+/// Writes its own `LLM_REPORT.md` under
+/// `.dirge/memory/.curator_reports/{ts}/` so the audit trail is
+/// preserved separately from the mechanical pass.
+pub fn spawn_memory_curator_review(
+    agent: AnyAgent,
+    paths: crate::extras::dirge_paths::ProjectPaths,
+    report: crate::extras::memory_curator::MechanicalReport,
+) {
+    if report.stale_candidates.is_empty() {
+        tracing::debug!(
+            target: "dirge::memory_curator",
+            "Skipping LLM consolidation pass — no stale candidates",
+        );
+        return;
+    }
+
+    // Read current MEMORY.md / PITFALLS.md verbatim. These are
+    // the inputs the LLM sees alongside the stale candidate
+    // table.
+    let memory_md = std::fs::read_to_string(paths.memory_file("MEMORY.md")).unwrap_or_default();
+    let pitfalls_md = std::fs::read_to_string(paths.memory_file("PITFALLS.md")).unwrap_or_default();
+    let input =
+        crate::extras::memory_curator::render_curator_input(&report, &memory_md, &pitfalls_md);
+    let prompt = format!(
+        "{}\n\n{}",
+        crate::extras::memory_curator::MEMORY_CURATOR_PROMPT,
+        input
+    );
+
+    let started = std::time::SystemTime::now();
+    let started_iso = chrono::Utc::now().to_rfc3339();
+    let started_filename = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let report_for_writer = report.clone();
+
+    tokio::spawn(async move {
+        // Memory-only runner — same forked-runner pattern as
+        // `spawn_curator_runner` but inverse allow-list.
+        let runner = agent.spawn_memory_curator_runner(prompt, String::new());
+        let mut rx = runner.event_rx;
+        let mut tool_actions: Vec<String> = Vec::new();
+        let mut error_msg: Option<String> = None;
+        while let Some(event) = rx.recv().await {
+            use crate::event::AgentEvent;
+            match event {
+                AgentEvent::Error(msg) => {
+                    tracing::warn!(
+                        target: "dirge::memory_curator",
+                        error = %msg,
+                        "Memory curator LLM pass encountered an error",
+                    );
+                    error_msg.get_or_insert_with(|| msg.to_string());
+                }
+                AgentEvent::ToolCall { name, .. } => {
+                    tool_actions.push(name.to_string());
+                }
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+
+        let elapsed_secs = started.elapsed().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        if error_msg.is_none() {
+            let summary = if tool_actions.is_empty() {
+                "no-op".to_string()
+            } else {
+                tool_actions
+                    .iter()
+                    .fold(Vec::<&str>::new(), |mut acc, a| {
+                        if !acc.contains(&a.as_str()) {
+                            acc.push(a.as_str());
+                        }
+                        acc
+                    })
+                    .join(" · ")
+            };
+            tracing::info!(
+                target: "dirge::memory_curator",
+                actions = %summary,
+                elapsed = %elapsed_secs,
+                "🗂  Memory curator LLM pass: {summary}",
+            );
+        }
+
+        let llm_report = crate::extras::memory_curator::LlmCuratorReport {
+            started_at_iso: started_iso,
+            elapsed_secs,
+            stale_candidates: report_for_writer.stale_candidates,
+            tool_actions,
+            error: error_msg,
+        };
+        let report_dir = paths
+            .memory_dir()
+            .join(".curator_reports")
+            .join(&started_filename);
+        if let Err(e) = std::fs::create_dir_all(&report_dir) {
+            tracing::warn!(
+                target: "dirge::memory_curator",
+                error = %e,
+                "Failed to create LLM report directory",
+            );
+            return;
+        }
+        let report_path = report_dir.join("LLM_REPORT.md");
+        if let Err(e) = std::fs::write(&report_path, llm_report.to_markdown()) {
+            tracing::warn!(
+                target: "dirge::memory_curator",
+                error = %e,
+                "Failed to write LLM report",
+            );
+        }
+    });
+}
+
 /// dirge-5cm9 / dirge-5gn6 / dirge-bx4g — fire the provider's
 /// `on_session_end` hook when a memory provider is attached. The
 /// hook receives the full transcript built from `session.messages`
