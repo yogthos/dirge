@@ -10,6 +10,13 @@ repository = "https://github.com/yogthos/dirge"
 readme = "README.md"
 keywords = ["ai", "cli", "dev"]
 
+[package.metadata.cargo-machete]
+# rig-core is a direct dep solely to pin feature flags (reqwest,
+# derive, rustls) — the actual `use rig_core::…` imports come
+# through rig's re-exports. cargo-machete can't detect feature-flag
+# deps, so it falsely reports rig-core as unused.
+ignored = ["rig-core"]
+
 [features]
 default = ['loop', 'git-worktree', 'mcp', 'lsp']
 loop = []
@@ -45,7 +52,33 @@ experimental-ui-terminal-tab = []
 libc = "0.2"
 
 [dependencies]
-rig = { version = "0.37", features = ["rmcp"] }
+# CVE-2026 audit (2026-05-27): rig's default features pull a
+# sprawling transitive tree:
+#
+#   default → rustls → rig-bedrock → aws-config → aws-smithy-runtime
+#     → aws-smithy-http-client → hyper-rustls 0.24.2 → rustls 0.21.12
+#     → rustls-webpki 0.101.7   ← RUSTSEC-2026-0098/0099/0104
+#
+#   default → rustls → rig-fastembed → fastembed → hf-hub → indicatif
+#     → number_prefix 0.4.0  ← RUSTSEC-2025-0119 (unmaintained)
+#
+#   default → rig-lancedb → lance → tantivy → lru 0.12.5
+#     ← RUSTSEC-2026-0002 (unsound)
+#
+# Dirge only uses rig's MCP transport (`rmcp` feature) and the core
+# provider/agent/completion APIs. By disabling default features we
+# drop ~370 transitive crates (881→508 deps) and eliminate all 6
+# cargo-audit findings. The `rustls` feature on rig-core ensures the
+# reqwest TLS backend stays on the modern rustls 0.23 → webpki 0.103
+# stack rather than the legacy 0.21 pathway.
+rig = { version = "0.37", default-features = false, features = ["rmcp"] }
+# Explicit dep to pin feature flags. Without this, rig (our only
+# dep on rig-core) enables `derive` and `reqwest` via its own
+# feature resolution, but we want `rustls` explicitly declared so
+# future readers understand the TLS backend choice is deliberate.
+# cargo-machete reports this as unused — the package.metadata
+# block at the top of this file suppresses that false positive.
+rig-core = { version = "0.37", default-features = false, features = ["reqwest", "derive", "rustls"] }
 # Macros for emitting `Stream<Item = …>` from async generator-style
 # code blocks. Used by `agent_loop::rig_stream` to wrap rig's
 # `StreamingCompletionResponse` into our pi-style `StreamEvent`
@@ -86,10 +119,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 futures = "0.3"
 reqwest = "0.13"
-# Fuzzy matcher for Ctrl-F search (dirge-bfd). Same crate maki uses for
-# its scrollback fuzzy search; matches by score with smart-case +
-# Unicode normalization, no need to roll our own ranking.
-nucleo-matcher = "0.3"
 # UI-redesign branch: system CPU / MEM gauges for the [SYSTEM LOAD]
 # sub-panel. `default-features = false` + only the modules we use
 # keeps the dep small (no disks / networks / processes — just CPU
@@ -130,6 +159,13 @@ yaml-rust2 = "0.11"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# Fuzzy matcher for Ctrl-F search (dirge-bfd). Currently only used
+# via `#[cfg(test)]` (search_rewind::update_search) — the Ctrl-F
+# interactive feature isn't wired into the UI yet, so update_search
+# is test-gated. Once Ctrl-F is wired into the event loop, the
+# #[cfg(test)] gate on update_search should be removed and this
+# dep moved back to [dependencies].
+nucleo-matcher = "0.3"
 
 [profile.release]
 opt-level = "z"
