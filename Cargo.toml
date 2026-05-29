@@ -8,7 +8,7 @@ edition = "2024"
 # edition 2024 was stabilized in Rust 1.85; pin the MSRV so older
 # toolchains get a clear error instead of a cryptic edition failure.
 rust-version = "1.85"
-authors = ["Giuseppe Della Vedova"]
+authors = ["Giuseppe Della Vedova", "Yogthos <yogthos@gmail.com>"]
 description = "Minimalistic coding agent written in Rust, optimized for memory footprint and performance"
 license = "GPL-3.0-only"
 homepage = "https://github.com/dirge-code/dirge"
@@ -45,7 +45,29 @@ path = "src/main.rs"
 ignored = ["rig-core"]
 
 [features]
-default = ['loop', 'git-worktree', 'mcp', 'lsp']
+# Batteries-included by default: `cargo install dirge-agent` and the
+# release binaries get the whole tool (MCP, LSP, ACP, plugins, and every
+# tree-sitter language). The two `experimental-ui-*` flags stay opt-in.
+# To build a leaner binary, use `--no-default-features --features "…"`.
+default = [
+    'loop',
+    'git-worktree',
+    'mcp',
+    'lsp',
+    'acp',
+    'plugin',
+    'semantic-ts',
+    'semantic-python',
+    'semantic-bash',
+    'semantic-clojure',
+    'semantic-go',
+    'semantic-ruby',
+    'semantic-rust',
+    'semantic-java',
+    'semantic-c',
+    'semantic-cpp',
+    'semantic-elixir',
+]
 loop = []
 git-worktree = []
 mcp = [

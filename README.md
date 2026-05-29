@@ -64,17 +64,20 @@ Transient API errors (network, rate limits, Anthropic `overloaded_error`) are au
 > already taken on crates.io). The installed command is still `dirge`.
 
 ```bash
-# Default — MCP, loop, LSP, and git-worktree included
+# Batteries included — MCP, LSP, ACP, plugins, and every tree-sitter
+# language are on by default.
 cargo install dirge-agent
+```
 
-# With semantic code tools (tree-sitter)
-cargo install dirge-agent --features "semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,semantic-java,semantic-c,semantic-cpp"
+Want a leaner binary? Opt out of the defaults and pick only what you need:
 
-# With ACP (Agent Communication Protocol) support for editor integration
-cargo install dirge-agent --features acp
+```bash
+# Minimal: just the core agent + MCP, no semantic tools / plugins / ACP
+cargo install dirge-agent --no-default-features --features "loop,git-worktree,mcp,lsp"
 
-# All features
-cargo install dirge-agent --features "acp,loop,git-worktree,mcp,lsp,semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,semantic-java,semantic-c,semantic-cpp,plugin"
+# Core + only the languages you use
+cargo install dirge-agent --no-default-features \
+  --features "loop,git-worktree,mcp,lsp,semantic-rust,semantic-python"
 ```
 
 Prebuilt binaries for Linux (glibc + static musl), macOS (Intel + Apple
