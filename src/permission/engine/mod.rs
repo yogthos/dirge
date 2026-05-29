@@ -259,8 +259,17 @@ impl Engine {
     /// Allowed/denied requests don't accumulate retry pressure.
     pub fn commit(&mut self, req: &AccessRequest, decision: &Decision) {
         if decision.effect == Effect::Ask {
+            // Bump once per distinct (op, resource) the request carries —
+            // NOT once per claim. A bash request can hold duplicate claims
+            // (e.g. the same path as both a mutation target and a redirect
+            // target); double-counting them would let the loop guard
+            // hard-deny before the real retry threshold.
+            let mut seen = std::collections::HashSet::new();
             for claim in &req.claims {
-                self.ctx.repeat.record(claim.op, claim.resource.match_key());
+                let key = claim.resource.match_key();
+                if seen.insert((claim.op, key)) {
+                    self.ctx.repeat.record(claim.op, key);
+                }
             }
         }
     }

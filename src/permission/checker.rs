@@ -370,7 +370,25 @@ impl PermissionChecker {
     /// removed `(tool, pattern)` on success, or `None` if the
     /// index is out of range. Used by `/allow remove <n>`.
     pub fn remove_session_allowlist_at(&mut self, idx: usize) -> Option<(String, String)> {
-        allowlist::remove_at(&mut self.session_allowlist, idx)
+        let removed = allowlist::remove_at(&mut self.session_allowlist, idx)?;
+        let (tool, pattern_str) = &removed;
+        // Also revoke from the ENGINE allowlist (the runtime source of
+        // truth that SessionAllowlistPolicy reads). The display list and
+        // engine list aren't 1:1, so remove by matched (op, original) —
+        // for both the raw pattern and the canonical-path twin that
+        // `add_session_allowlist` registered for path tools.
+        let op = engine::tool_operation(tool);
+        let canon = if is_path_tool_name(tool) {
+            canonicalize_path_pattern(pattern_str, &self.working_dir).filter(|c| c != pattern_str)
+        } else {
+            None
+        };
+        let al = &mut self.engine.ctx_mut().allowlist;
+        al.remove(op, pattern_str);
+        if let Some(c) = canon {
+            al.remove(op, &c);
+        }
+        Some(removed)
     }
 
     /// Remove ALL allowlist entries. Used by `/allow clear`.

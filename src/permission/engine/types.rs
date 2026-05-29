@@ -17,7 +17,7 @@ use std::path::PathBuf;
 /// policies match on via [`crate::permission::engine::policy::Decider::applies_to`],
 /// so "edit rules apply to Edit operations" is a directly evaluable
 /// fact. Tool names map onto these during request normalization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
     /// Read-only observation of a file (read, grep, list_dir, lsp,
     /// the semantic readers).

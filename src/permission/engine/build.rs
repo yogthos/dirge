@@ -114,12 +114,16 @@ fn op_match(op: crate::permission::OpSpec) -> OpMatch {
 }
 
 /// Glob style for a rule's operation: path-style (`*` = one segment)
-/// for file ops, shell-style for everything else.
+/// for the file ops, shell-style for everything else. `Any` (`op: "*"`)
+/// spans execute/network/mcp resources too, so it uses command-style —
+/// a strict superset of path-style for the same glob (command `*` = `.*`
+/// also matches the `[^/]*` path case), so `{op:"*", match:"git *"}`
+/// covers `git push origin/main` (slash crossed) AND path globs.
 fn pattern_for_op(op: crate::permission::OpSpec, pat: &str) -> crate::permission::pattern::Pattern {
     use crate::permission::OpSpec;
     use crate::permission::pattern::Pattern;
     match op {
-        OpSpec::Read | OpSpec::Edit | OpSpec::Any => Pattern::new(pat),
+        OpSpec::Read | OpSpec::Edit => Pattern::new(pat),
         _ => Pattern::new_command(pat),
     }
 }
@@ -392,5 +396,59 @@ mod tests {
             vec![classify_path("/etc/x", "/proj")],
         ));
         assert_eq!(d.effect, Effect::Ask);
+    }
+
+    #[test]
+    fn any_op_rule_matches_command_across_slash() {
+        use crate::permission::OpSpec;
+        // dirge-z9tz: an `op: "*"` rule must use shell-style globbing
+        // when matched against a command (or MCP key), so a single `*`
+        // crosses slashes. Pre-fix, Any compiled path-style (`*` =
+        // `[^/]*`), so `git *` silently missed `git push origin/main`.
+        let cfg = PermissionConfig {
+            rules: vec![rule(OpSpec::Any, "git *", Action::Allow)],
+            ..Default::default()
+        };
+        let e = Engine::from_config(&cfg);
+        let d = e.authorize(&req(
+            Operation::Execute,
+            "bash",
+            SecurityMode::Standard,
+            vec![Resource::Command {
+                raw: "git push origin/main".into(),
+                head: "git".into(),
+            }],
+        ));
+        assert_eq!(
+            d.effect,
+            Effect::Allow,
+            "an op:* rule `git *` must match a command containing a slash",
+        );
+    }
+
+    #[test]
+    fn commit_records_once_per_request_despite_duplicate_claims() {
+        // dirge-qrto: the loop-guard counter must bump once per PROMPTED
+        // request, not once per claim. A request carrying two identical
+        // (op, resource) claims must increment the counter by exactly 1.
+        let mut e = Engine::from_config(&PermissionConfig::default());
+        let claim = || Resource::Command {
+            raw: "frobnicate x".into(),
+            head: "frobnicate".into(),
+        };
+        let request = req(
+            Operation::Execute,
+            "bash",
+            SecurityMode::Standard,
+            vec![claim(), claim()],
+        );
+        let d = e.authorize(&request);
+        assert_eq!(d.effect, Effect::Ask, "unknown command prompts");
+        e.commit(&request, &d);
+        assert_eq!(
+            e.ctx().repeat.prior(Operation::Execute, "frobnicate x"),
+            1,
+            "duplicate claims in one request must not double-count the loop guard",
+        );
     }
 }

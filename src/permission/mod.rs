@@ -57,6 +57,7 @@ pub enum OpSpec {
 /// { "op": "mcp",     "match": "lattice:*", "effect": "allow" }
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     #[serde(default)]
     pub op: OpSpec,
@@ -74,6 +75,7 @@ pub struct RuleConfig {
 /// (read-only/memory/skill/dev-null/in-cwd-write allows + the curated
 /// safe-bash rules) live in the engine and aren't configured here.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionConfig {
     /// Fallback effect when no rule matches (alias `*`). Defaults to Ask.
     #[serde(rename = "*", alias = "default")]

@@ -108,6 +108,18 @@ impl SessionAllowlist {
         let e = self.entries.remove(idx);
         Some((e.op, e.original))
     }
+
+    /// Remove every grant matching `(op, original)`. Returns how many
+    /// were dropped. Used by `/allow remove <n>`, which identifies the
+    /// grant by its (op, original) rather than by engine index (the
+    /// display list and this list aren't 1:1 — one display grant maps to
+    /// an op-scoped engine entry plus its canonical-path twin).
+    pub fn remove(&mut self, op: Operation, original: &str) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !(e.op == op && e.original == original));
+        before - self.entries.len()
+    }
 }
 
 /// All mutable state the policies consult. Owned by the engine; read

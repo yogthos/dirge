@@ -719,6 +719,70 @@ fn add_session_allowlist_mirrors_write_to_edit() {
     );
 }
 
+// dirge-fdvw: `/allow remove <n>` must revoke the grant from the ENGINE
+// allowlist (the runtime source of truth that SessionAllowlistPolicy
+// reads), not just the display list. Pre-fix, removal left the engine
+// entry intact, so a "revoked" grant kept auto-allowing.
+#[test]
+fn remove_session_allowlist_revokes_engine_grant() {
+    let mut cfg = PermissionConfig::default();
+    cfg.default = Some(Action::Ask);
+    let mut checker = PermissionChecker::new(
+        &cfg,
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/cwd-off-test-axis")),
+    );
+    checker.add_session_allowlist("write".to_string(), "/probe/src/**");
+    assert!(
+        matches!(
+            checker.check_path("write", "/probe/src/main.rs"),
+            CheckResult::Allowed
+        ),
+        "grant should auto-allow before removal"
+    );
+
+    let removed = checker.remove_session_allowlist_at(0);
+    assert!(removed.is_some(), "removal should return the removed entry");
+
+    assert!(
+        !matches!(
+            checker.check_path("write", "/probe/src/main.rs"),
+            CheckResult::Allowed
+        ),
+        "removed grant must NOT still auto-allow via the engine allowlist",
+    );
+    assert!(
+        !checker.is_session_allowed("write", "/probe/src/main.rs"),
+        "engine allowlist must no longer report the grant"
+    );
+}
+
+// dirge-x0l1: the permission config rejects unknown fields so a stale
+// or typo'd config surfaces loudly instead of silently degrading to a
+// permissive default.
+#[test]
+fn permission_config_rejects_unknown_fields() {
+    // A valid op-based config parses.
+    let ok: Result<PermissionConfig, _> =
+        serde_json::from_str(r#"{"*":"ask","rules":[{"op":"edit","match":"**","effect":"deny"}]}"#);
+    assert!(ok.is_ok(), "valid config must parse: {ok:?}");
+
+    // A legacy per-tool key (or any typo) is rejected.
+    let legacy: Result<PermissionConfig, _> = serde_json::from_str(r#"{"edit":{"**":"deny"}}"#);
+    assert!(
+        legacy.is_err(),
+        "legacy/unknown permission key must be rejected, got {legacy:?}"
+    );
+
+    // A rule with an unknown field (`pattern` instead of `match`) is rejected.
+    let bad_rule: Result<PermissionConfig, _> =
+        serde_json::from_str(r#"{"rules":[{"op":"edit","pattern":"**","effect":"deny"}]}"#);
+    assert!(
+        bad_rule.is_err(),
+        "rule with unknown field must be rejected, got {bad_rule:?}"
+    );
+}
+
 // load_session_allowlist roundtrip: persisted patterns from a previous
 // session should match the way they did when saved.
 #[test]

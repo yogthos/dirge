@@ -131,11 +131,21 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
         return Channels::default();
     }
 
-    let perm_config: PermissionConfig = cfg
-        .permission
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let perm_config: PermissionConfig = match cfg.permission.as_ref() {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(c) => c,
+            // Surface the error loudly: falling back to defaults silently
+            // would drop the user's intended rules (and harden nothing).
+            Err(e) => {
+                eprintln!(
+                    "warning: invalid `permission` config ({e}); falling back to \
+                     defaults (all actions Ask). Fix the config to restore your rules."
+                );
+                PermissionConfig::default()
+            }
+        },
+        None => PermissionConfig::default(),
+    };
 
     let mode = resolve_mode(cli, cfg);
     let checker = PermissionChecker::new(&perm_config, mode, None);

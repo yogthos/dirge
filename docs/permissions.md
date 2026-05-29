@@ -115,10 +115,12 @@ to `match`, and the `effect`. Reading top-to-bottom, **last match wins**:
   one operation, so one rule governs all three.
 - **Narrow to a tool** with an optional `"tool": "<name>"` field when a
   rule should apply to a single concrete tool rather than the whole op.
-- **Glob semantics** are inferred from the op: read/edit/`*` use
-  path-style globs (`*` is one path segment, `**` spans directories);
-  execute/network/mcp use shell-style (`*` matches anything, trailing
-  ` *` makes args optional).
+- **Glob semantics** are inferred from the op: read/edit use path-style
+  globs (`*` is one path segment, `**` spans directories);
+  execute/network/mcp use shell-style (`*` matches anything including
+  `/`, trailing ` *` makes args optional). The `*` (any) op uses
+  shell-style too, since it can match commands and MCP keys as well as
+  paths.
 - **Last-match-wins** across the ordered `rules` list — put general
   rules first, specific overrides last.
 - `external_directory` is itself a `rules` list (op defaults to `*`)

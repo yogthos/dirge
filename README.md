@@ -11,7 +11,7 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **Semantic code tools** (tree-sitter): list_symbols, get_symbol_body, find_definition, find_callers, find_callees — supports TypeScript/TSX, Python, Clojure (clj/cljs/cljc/edn/bb), Go, Ruby, Rust, Java, C, and C++
 - **Claude-compatible skills**: discover skills from `.claude/skills/`, `.opencode/skills/`, `.dirge/skills/` directories. Agent can call the `skill` tool to load instructions on demand
 - **Bash permissions** (tree-sitter): parses shell commands to split `&&`/`;`/`|` into individual segments, detects command substitution and complex constructs
-- **Permission system**: four configurable modes with per-tool patterns, session allowlists, and external directory policies
+- **Permission system**: a single decision engine (one Policy Decision Point) with four configurable modes, op-based rules (read/edit/execute/network/mcp/…), session allowlists, external directory policies, and a `/why` decision-trace command
 - **Session management & compaction**: save/load/resume sessions with lineage-aware session search. `/compress` runs an LLM-summarization compaction pass (via the auxiliary `summarization_provider`) that folds the conversation middle into a structured summary. Automatic turn-boundary compaction keeps the runtime within the context window without an LLM call: it caps oversized tool results (per-result token cap) and proactively folds when the context-ratio crosses a high threshold, on top of tool-output pruning.
 - **Terminal UI**: crossterm-based, markdown rendering, soft-wrapping input box, mouse selection/copy, scrollback, reasoning visibility toggle
 - **Info panel**: optional right-hand sidebar showing cwd, MCP/LSP server status, pending todos, and recently-modified files. Auto-shown at ≥100 cols; toggle via `/panel`
@@ -393,16 +393,28 @@ Adding a new language requires writing a Rust `LanguageAdapter` impl (see `src/s
 
 When built with `--features semantic-bash`, dirge uses tree-sitter to parse shell commands and split them by `&&`, `;`, and `|` operators. Each segment is checked individually against permission rules. Complex constructs like command substitution (`$(...)`), subshells (`(...)`), and process substitution (`<(...)`) trigger a full-command permission prompt.
 
-## Permission system
+All authorization flows through **one decision engine** (a Policy Decision
+Point): every tool builds a normalized request and the engine returns a single
+`Decision` with a trace of which policy decided and why. There is no per-tool
+gate logic scattered around the codebase. Rules are **op-based** — they govern
+an operation class (`read`, `edit`, `execute`, `network`, `mcp`, `memory`,
+`skill`, `agent`, `meta`, or `*`), not a tool name; `write`/`edit`/`apply_patch`
+all share the `edit` op, so one rule governs the trio. The `rules` list is
+ordered and **last-match-wins**. See [CONFIG.md](CONFIG.md) for the schema and
+[docs/permissions.md](docs/permissions.md) for the engine design.
 
 Four modes, from safest to most permissive:
 
 1. **restrictive** (`-R`): every tool action prompts for approval
 2. **standard** (default): safe commands auto-approved; writes, `bash`, and MCP tools ask
-3. **accept-all** (`--accept-all`): auto-approves inside working directory; external paths prompt. `bash` and `mcp_tool` still ask in this mode — they execute external code with arbitrary effects, so the "trust the agent inside cwd" rationale doesn't apply
-4. **yolo** (`--yolo`): auto-approves everything without prompting. Skips the rule eval, the per-tool default-ask for `mcp_tool`/`bash`, AND the doom-loop detector. The per-prompt `deny_tools` frontmatter still applies (that gate runs BEFORE the yolo short-circuit by design — opting into a restrictive prompt should survive `--yolo`). Use only when you know exactly what the agent will do
+3. **accept-all** (`--accept-all`): auto-approves inside working directory; external paths prompt. `execute` (bash) and `mcp` tools still ask in this mode — they execute external code with arbitrary effects, so the "trust the agent inside cwd" rationale doesn't apply
+4. **yolo** (`--yolo`): auto-approves everything without prompting. Skips the rule eval, the default-ask for `mcp`/`execute`, AND the doom-loop detector. The per-prompt `deny_tools` frontmatter still applies (that gate runs BEFORE the yolo short-circuit by design — opting into a restrictive prompt should survive `--yolo`). Use only when you know exactly what the agent will do
 
-Session allowlists persist approvals for the session. Doom-loop detection triggers after 3+ identical calls.
+Session allowlists persist approvals for the session (op-scoped, so one "allow
+always" on an edit covers write/edit/apply_patch). The loop guard never gates an
+allowed op — it only hard-denies a true retry loop, when an op that was already
+prompting is re-requested past the threshold (default 3). Run `/why <tool>
+[input]` to dry-run a decision and see the full trace.
 
 ## Configuration
 

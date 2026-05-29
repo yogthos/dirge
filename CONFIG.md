@@ -92,10 +92,12 @@ is an **ordered list** read top-to-bottom; **last match wins**. Each rule has:
   `read`, `edit`, `execute`, `network`, `mcp`, `memory`, `skill`,
   `agent`, `meta`, or `*` (any). `edit` covers write/edit/apply_patch —
   they're one operation, so one rule governs all three.
-- `match` — a glob. Read/edit/`*` use path-style globs (`*` is one path
+- `match` — a glob. Read/edit use path-style globs (`*` is one path
   segment, `**` spans directories); execute/network/mcp use shell-style
-  (`*` matches anything, trailing ` *` makes args optional). MCP patterns
-  match the full key `mcp_tool:{server}:{tool}`.
+  (`*` matches anything including `/`, trailing ` *` makes args optional).
+  The `*` (any) op uses shell-style too, since it can match commands and
+  MCP keys as well as paths. MCP patterns match the full key
+  `mcp_tool:{server}:{tool}`.
 - `effect` — `allow`, `ask`, or `deny`.
 - `tool` *(optional)* — narrow the rule to a single concrete tool name
   (e.g. `"grep"`) instead of the whole op.
