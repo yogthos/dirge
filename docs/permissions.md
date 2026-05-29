@@ -143,9 +143,17 @@ Set with `--standard` (default), `--accept-all`, `--restrictive`, or
 
 Choosing **(a) allow always** at a prompt adds a session-scoped grant
 (op-scoped, so one "allow always" on an edit covers write/edit/apply_patch).
-Manage it with `/allow list`, `/allow remove <n>`, `/allow clear`. Grants
-are dropped when you change the working directory (no privilege
-carry-over between projects).
+Manage it with the `/allow` command:
+
+| Command | Effect |
+|---------|--------|
+| `/allow` or `/allow list` | List the current grants, each with a `[n]` index |
+| `/allow add <tool> <pattern>` | Add a grant manually, e.g. `/allow add bash 'cargo *'` |
+| `/allow remove <n>` | Drop the grant at index `n` (from `/allow list`) |
+| `/allow clear` | Drop all grants |
+
+Bare `/allow` is shorthand for `/allow list`. Grants are dropped when you
+change the working directory (no privilege carry-over between projects).
 
 ## `/why` — explain a decision
 

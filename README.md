@@ -147,7 +147,7 @@ pass openai-key | dirge --provider openai --api-key-stdin
 | `/regen-prompts` | Restore built-in prompts |
 | `/mcp` | List MCP servers and tools |
 | `/panel [on\|off\|auto]` | Toggle the right-hand info panel (cwd, MCP, LSP, todos, modified files). `auto` shows it when the terminal is at least 100 cols wide. |
-| `/allow <list\|add\|remove\|clear>` | Manage the session permission allowlist (see `/help` for argument shapes) |
+| `/allow [list\|add\|remove\|clear]` | Manage the session permission allowlist; bare `/allow` lists it. See [docs/permissions.md](docs/permissions.md#allow-always-and-the-session-allowlist) for argument shapes |
 | `/quit` | Exit dirge |
 | `/retry` | Retry last prompt |
 | `/help` | Show all commands |
