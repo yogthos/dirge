@@ -135,8 +135,10 @@ impl PermissionChecker {
         //   - `/tmp/safe.txt` → only `**` matches → builtin allow ✓
         //
         // Tools NOT in this list (write/edit/apply_patch/bash/webfetch/
-        // websearch/task/skill/memory) fall to the global default Ask
-        // unless the user installs explicit rules.
+        // websearch/task) fall to the global default Ask unless the
+        // user installs explicit rules. NOTE: `memory` and `skill` ARE
+        // in this list (added below, per dirge-sm9w) — auto-allowed in
+        // Standard/Accept and demoted to Ask only in Restrictive.
         //
         // Adapts maki's `BUILTIN_ALLOW_RULES`
         // (`maki-agent/src/permissions.rs:16-24`) for dirge's tool set.

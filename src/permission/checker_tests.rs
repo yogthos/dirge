@@ -1304,6 +1304,44 @@ mod reported_permission_ux_regressions {
         }
     }
 
+    // Issue #5 (ROOT CAUSE): git worktrees are created as SIBLINGS
+    // (`../name`, see git_worktree::create), OUTSIDE the original
+    // repo. When dirge switches into a worktree it MUST call
+    // set_working_dir, or the in-cwd write-allow glob stays anchored
+    // to the original repo and EVERY write inside the worktree is
+    // classified external -> prompts on every edit. This pins the
+    // re-anchoring contract the worktree cwd-change sites must honor
+    // (cmd_worktree create, wt-exit, and merge-return in done.rs).
+    #[test]
+    fn probe_worktree_sibling_switch_reanchors_cwd_allow() {
+        let mut c = checker_in("/repo/main");
+        // Before the switch: a write in the sibling worktree is external.
+        assert!(
+            matches!(
+                c.check_path("write", "/repo/wt/src/foo.rs"),
+                CheckResult::Ask
+            ),
+            "pre-switch: sibling-worktree write should be external/Ask",
+        );
+        // Switching into the worktree (what the fixed UI must do).
+        c.set_working_dir("/repo/wt");
+        assert!(
+            matches!(
+                c.check_path("write", "/repo/wt/src/foo.rs"),
+                CheckResult::Allowed
+            ),
+            "post-switch: in-worktree write must be auto-allowed",
+        );
+        // And the old repo is now external — no privilege carry-over.
+        assert!(
+            matches!(
+                c.check_path("write", "/repo/main/src/x.rs"),
+                CheckResult::Ask
+            ),
+            "post-switch: old-repo write should now be external/Ask",
+        );
+    }
+
     // Issue #5a: reads inside the project folder should not prompt.
     #[test]
     fn probe_read_inside_cwd_allowed() {

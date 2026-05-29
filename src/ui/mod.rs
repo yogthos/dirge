@@ -1441,6 +1441,16 @@ pub async fn run_interactive(
                                             std::env::set_current_dir(main_path)
                                                 .map_err(|e| anyhow::anyhow!("failed to change directory: {}", e))?;
                                             session.working_dir = compact_str::CompactString::new(main_path);
+                                            // Re-anchor the permission checker to the main
+                                            // repo on worktree exit, else the CWD write-allow
+                                            // stays pointed at the (now-removed) worktree and
+                                            // writes in the main repo prompt. Same contract as
+                                            // /cd (cmd_misc.rs) and worktree create.
+                                            if let Some(perm) = &permission
+                                                && let Ok(mut guard) = perm.lock()
+                                            {
+                                                guard.set_working_dir(&session.working_dir);
+                                            }
                                             context.reload();
                                             let model = client.completion_model(session.model.to_string());
                                             agent = crate::provider::build_agent(

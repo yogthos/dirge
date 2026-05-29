@@ -44,6 +44,17 @@ pub(super) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
             std::env::set_current_dir(&path)
                 .map_err(|e| anyhow::anyhow!("failed to change directory: {}", e))?;
             ctx.session.working_dir = compact_str::CompactString::new(path.to_string_lossy());
+            // Re-anchor the permission checker's CWD-scoped write-allow
+            // to the worktree. Worktrees are created as siblings
+            // (`../name`, OUTSIDE the original repo), so without this the
+            // in-cwd allow glob keeps pointing at the old repo and every
+            // write inside the worktree is treated as external -> prompts.
+            // Mirrors the `/cd` handler in cmd_misc.rs.
+            if let Some(perm) = ctx.permission
+                && let Ok(mut guard) = perm.lock()
+            {
+                guard.set_working_dir(&ctx.session.working_dir);
+            }
             ctx.context.reload();
             let model = ctx.client.completion_model(ctx.session.model.to_string());
             *ctx.agent = crate::provider::build_agent(
