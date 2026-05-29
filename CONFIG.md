@@ -16,7 +16,6 @@ Example:
 ```json
 {
   "provider": "openrouter",
-  "model": "deepseek/deepseek-v4-flash",
   "max_tokens": 8192,
   "temperature": 0.7,
   "context_window": 128000,
@@ -29,7 +28,10 @@ Example:
   "show_edit_diff": true,
   "tool_result_max_chars": 500,
   "tool_result_max_lines": 4,
-  "custom_providers": {
+  "providers": {
+    "openrouter": {
+      "model": "deepseek/deepseek-v4-flash"
+    },
     "local-vllm": {
       "provider_type": "openai",
       "base_url": "http://localhost:8000/v1",
@@ -57,8 +59,12 @@ Accepted top-level keys:
 
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | string  | Provider name. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, and `ollama`; custom provider aliases are also accepted. Default: `openrouter`.        |
-| `model`                   | string  | Model name. Default: `deepseek/deepseek-v4-flash`.                                                                                                                          |
+| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
+| `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
+| `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
+| `escalation_provider`     | string  | Provider alias for the one-shot retry after repair-exhaustion / pre-write syntax failure. Falls back to `provider` (no-op when equal). |
+| `summarization_provider`  | string  | Provider alias for context compaction. Falls back to `provider`. |
+| `subagent_provider`       | string  | Provider alias for `task` tool subagents. Falls back to `provider`. |
 | `max_tokens`              | integer | Maximum response tokens. Default: `8192`.                                                                                                                                   |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `100`.                                                                                                                           |
 | `temperature`             | number  | Model sampling temperature in `0.0`–`2.0`. `--temperature` CLI flag overrides this. Values outside the range are clamped with a stderr warning.                            |
@@ -68,7 +74,6 @@ Accepted top-level keys:
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. Default: `16384`.                                                                                                         |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. Default: `20000`.                                                                                          |
 | `compact_enabled`         | boolean | Enable automatic conversation compaction. Default: `true`.                                                                                                                  |
-| `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env" }`. `provider_type` must resolve to one of the built-in provider types; `api_key_env` is optional. |
 | `permission`              | object  | Permission rules; see the permission config notes below.                                                                                                                    |
 | `restrictive`             | boolean | Select restrictive permission mode. Overridden by `accept_all`/`yolo` if those are also true.                                                                               |
 | `accept_all`              | boolean | Select accept mode, equivalent to `--accept-all`. Overridden by `yolo` if true.                                                                                             |
@@ -84,6 +89,76 @@ Accepted top-level keys:
 | `tools`                   | object  | Optional per-tool enable map. Currently honors `tools.websearch` and `tools.webfetch` (both `bool`, default `true`); set either to `false` to drop the tool from the registered set even when its env vars are present. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, defaults to a single Exa Web Search server; see below.                                                   |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
+
+## Providers and roles
+
+Providers are declared once in the `providers` map and referenced by alias from
+the role-assignment keys — so each role can run on a different model:
+
+```json
+{
+  "provider": "deepseek",
+  "review_provider": "glm",
+  "escalation_provider": "anthropic",
+  "subagent_provider": "glm",
+
+  "providers": {
+    "deepseek": {
+      "model": "deepseek-v4-pro"
+    },
+    "glm": {
+      "model": "glm-4.6"
+    },
+    "anthropic": {
+      "model": "claude-opus-4-5"
+    },
+    "ollama": {
+      "provider_type": "openai",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "llama3.1"
+    }
+  }
+}
+```
+
+Each `providers` entry accepts:
+
+| Field | Description |
+|-------|-------------|
+| `provider_type` | Built-in provider type to speak. Optional — defaults to the entry's alias when that alias matches a built-in name. |
+| `base_url` | Endpoint base URL (for custom / self-hosted endpoints). |
+| `model` | Model name for this provider. |
+| `api_key` | Literal key or `${ENV_VAR}` interpolation. Takes precedence over `api_key_env`. |
+| `api_key_env` | Name of the env var holding the API key. |
+| `allow_insecure` | Allow `http://` URLs (plaintext). Default `false`; only enable for local-only proxies. |
+| `stream_chunk_timeout_secs` | Per-provider streaming chunk timeout override. |
+| `options` | Free-form per-provider model options; currently honors `temperature`. |
+
+The aliases on the left of the map become the values you write in
+role-assignment keys.
+
+### Role assignments
+
+| Key | Used for | Falls back to |
+|-----|----------|---------------|
+| `provider` | Default / main loop | (none — required) |
+| `review_provider` | Background session-review pass | `provider` |
+| `escalation_provider` | One-shot retry after repair-exhaustion / pre-write syntax failure | `provider` (no-op when equal) |
+| `summarization_provider` | Context compaction | `provider` |
+| `subagent_provider` | `task` tool subagents | `provider` |
+
+When a role's provider equals `provider` (either explicitly or by fallback), no
+duplicate client is constructed and the feature has zero overhead — escalation
+routes, for example, simply don't fire because they'd be a no-op anyway.
+
+> **Migration note**: dirge no longer reads the legacy top-level `model`,
+> `custom_providers`, or `review_model` keys — starting a session with any of
+> those at the root fails fast with a migration hint. Move `model` inside the
+> active provider's entry, `custom_providers.<name>` entries directly into
+> `providers`, and `review_model` into the entry referenced by
+> `review_provider`.
+
+## Permissions
 
 Permission actions are lowercase strings: `allow`, `ask`, or `deny`. `rules`
 is an **ordered list** read top-to-bottom; **last match wins**. Each rule has:
@@ -251,10 +326,9 @@ or large-tool-output processing. Bump it if you see false-positive
 
 Resolution order (first hit wins):
 
-1. `custom_providers.<name>.stream_chunk_timeout_secs` — per custom endpoint
-2. `providers.<name>.stream_chunk_timeout_secs` — per built-in provider
-3. top-level `stream_chunk_timeout_secs` — applies to every provider
-4. `300s` default
+1. `providers.<name>.stream_chunk_timeout_secs` — per-provider override
+2. top-level `stream_chunk_timeout_secs` — applies to every provider
+3. `300s` default
 
 Provider name matching is case-insensitive (`anthropic` matches
 `--provider Anthropic`).
@@ -264,9 +338,7 @@ Provider name matching is case-insensitive (`anthropic` matches
   "stream_chunk_timeout_secs": 300,
   "providers": {
     "anthropic": { "stream_chunk_timeout_secs": 900 },
-    "ollama":    { "stream_chunk_timeout_secs": 60 }
-  },
-  "custom_providers": {
+    "ollama":    { "stream_chunk_timeout_secs": 60 },
     "my-vllm": {
       "provider_type": "openai",
       "base_url": "http://localhost:8000/v1",
