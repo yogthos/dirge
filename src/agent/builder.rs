@@ -454,15 +454,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         // forcing webfetch users to edit config.json for an
         // equivalent toggle. The runtime API-key check still has
         // to pass for websearch.
-        let env_true = |k: &str| {
-            std::env::var(k)
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false)
-        };
-        let websearch_enabled = cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
-            || env_true("WEBSEARCH_ENABLED");
-        let webfetch_enabled = cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true)
-            || env_true("WEBFETCH_ENABLED");
+        let websearch_enabled = crate::config::websearch_enabled(cfg);
+        let webfetch_enabled = crate::config::webfetch_enabled(cfg);
 
         // Websearch now works out of the box without an API key —
         // mirrors opencode's behavior. Backend: Exa's hosted MCP
@@ -472,7 +465,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         // optional — when set, it's appended as `?exaApiKey=…` for
         // higher rate limits.
         let websearch_tool = if websearch_enabled {
-            let key = std::env::var("EXA_API_KEY").ok().filter(|k| !k.is_empty());
+            let key = crate::config::exa_api_key();
             Some(Box::new(tools::WebSearchTool::new(
                 permission.clone(),
                 ask_tx.clone(),
@@ -900,17 +893,10 @@ pub async fn build_loop_tools(
     }
 
     // Web tools — network reads, leave at default Parallel.
-    let env_true = |k: &str| {
-        std::env::var(k)
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false)
-    };
-    let websearch_enabled = cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
-        || env_true("WEBSEARCH_ENABLED");
-    let webfetch_enabled =
-        cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true) || env_true("WEBFETCH_ENABLED");
+    let websearch_enabled = crate::config::websearch_enabled(cfg);
+    let webfetch_enabled = crate::config::webfetch_enabled(cfg);
     if websearch_enabled {
-        let key = std::env::var("EXA_API_KEY").ok().filter(|k| !k.is_empty());
+        let key = crate::config::exa_api_key();
         tools.push(
             wrap(
                 tools::WebSearchTool::new(permission.clone(), ask_tx.clone(), key),

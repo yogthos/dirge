@@ -438,6 +438,36 @@ impl Config {
 /// Values are the model's documented maximum context (input + output
 /// combined where the provider quotes a unified figure). Update as
 /// providers extend their context budgets.
+/// Read `EXA_API_KEY`, trimming whitespace and treating empty as unset.
+/// Single source so every consumer (web-search tool, MCP auto-register,
+/// the builder) applies the same trim/empty policy (dirge-3xqe).
+pub fn exa_api_key() -> Option<String> {
+    std::env::var("EXA_API_KEY")
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+fn web_env_true(k: &str) -> bool {
+    std::env::var(k)
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// Whether the websearch tool is enabled: config `tools.websearch`
+/// (default true) OR `WEBSEARCH_ENABLED`. Single source for the
+/// precedence duplicated across the two builder paths (dirge-f8oe).
+pub fn websearch_enabled(cfg: &Config) -> bool {
+    cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
+        || web_env_true("WEBSEARCH_ENABLED")
+}
+
+/// Whether the webfetch tool is enabled: config `tools.webfetch`
+/// (default true) OR `WEBFETCH_ENABLED`.
+pub fn webfetch_enabled(cfg: &Config) -> bool {
+    cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true) || web_env_true("WEBFETCH_ENABLED")
+}
+
 pub fn context_window_for_model(model: &str) -> Option<u64> {
     let m = model.to_lowercase();
     // Ordered: most-specific first.
@@ -593,8 +623,8 @@ pub fn load() -> Config {
         // register Exa anyway with an empty header, then every web-
         // search call failed with 401 at first use. Skip cleanly
         // when no usable key is present.
-        match std::env::var("EXA_API_KEY") {
-            Ok(key) if !key.is_empty() => {
+        match exa_api_key() {
+            Some(key) => {
                 let mut headers = HashMap::new();
                 headers.insert("x-api-key".to_string(), key);
                 let mut defaults = HashMap::new();

@@ -12,7 +12,7 @@ fn home_fallback() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn dirs_path() -> PathBuf {
+pub(crate) fn dirs_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("DIRGE_DATA_DIR") {
         return PathBuf::from(dir);
     }

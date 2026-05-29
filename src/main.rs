@@ -571,12 +571,11 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;
+        // Honor DIRGE_CONFIG_DIR via the shared base, like config.json
+        // (dirge-f8oe) — previously this hard-coded ~/.config/dirge, so
+        // an override moved config but left plugins behind.
         let candidate_dirs: Vec<PathBuf> = vec![
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".config")
-                .join("dirge")
-                .join("plugins"),
+            crate::session::storage::config_path().join("plugins"),
             PathBuf::from(".dirge").join("plugins"),
         ];
         // Silently drop missing default dirs; only surface real errors below.

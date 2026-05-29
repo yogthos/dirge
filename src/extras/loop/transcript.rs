@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use chrono::Utc;
 
 fn transcript_dir(session_id: &str) -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from(".dirge"))
-        .join("dirge")
+    // Route through the shared data-dir base so `DIRGE_DATA_DIR` is
+    // honored here too — previously this used `dirs::data_dir()`
+    // directly, so an override relocated sessions but NOT loop
+    // transcripts (dirge-f8oe).
+    crate::session::storage::dirs_path()
         .join("loops")
         .join(session_id)
 }
