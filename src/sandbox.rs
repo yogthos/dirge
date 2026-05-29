@@ -241,7 +241,7 @@ fn vendor_prefix_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r"(?x)
-            (?P<b>^|[^A-Za-z0-9_\-])
+            (?P<b>^|[^A-Za-z0-9])
             (?P<tok>
                   AKIA[0-9A-Z]{16}                  # AWS Access Key ID
                 | ghp_[A-Za-z0-9]{36}               # GitHub PAT (classic)
@@ -272,9 +272,18 @@ fn vendor_prefix_re() -> &'static Regex {
 /// secret verbatim into the transcript.
 ///
 /// Two layers, both deliberately low-false-positive:
-/// 1. Literal values of the process's own sensitive env vars (catches
-///    opaque secrets with no vendor shape).
-/// 2. The shared vendor-prefix + URL-userinfo patterns.
+/// 1. Literal values of *dirge's own* sensitive env vars — catches an
+///    opaque key (no vendor shape) when the agent echoes a var dirge
+///    itself holds (`echo $ANTHROPIC_API_KEY`). It can NOT see a secret
+///    that only exists in the child's environment or a file (e.g. an
+///    opaque value in `cat .env` that dirge doesn't carry) — that's
+///    layer 2's job, and only if it has a recognizable shape.
+/// 2. The shared vendor-prefix + URL-userinfo patterns — high-confidence
+///    shapes regardless of where the secret originated.
+///
+/// So coverage is: dirge's own keys (any shape) OR vendor/URL-shaped
+/// secrets (any origin). A child-only secret with no recognizable shape
+/// is not caught — an accepted limitation, not a guarantee.
 ///
 /// Returns `Cow::Borrowed` unchanged when nothing matched, so the
 /// common (secret-free) case allocates nothing.
@@ -554,6 +563,29 @@ mod tests {
             !jwt.contains("eyJhbGciOiJIUzI1"),
             "JWT must be redacted, got {jwt}"
         );
+    }
+
+    // Review follow-up: a vendor token glued to a preceding `-` or `_`
+    // must still be redacted (the leading-boundary class previously
+    // excluded `-`/`_`, letting `x-key-sk-live…` slip through).
+    #[test]
+    fn redact_secrets_scrubs_token_after_dash_or_underscore() {
+        for s in [
+            "--header=x-key-sk-abcdefghijklmnopqrstuvwxyz0123",
+            "FOO_sk-abcdefghijklmnopqrstuvwxyz0123",
+            "ghp_0123456789abcdefghijklmnopqrstuvwxyz-trailing",
+        ] {
+            let out = redact_secrets(s);
+            assert!(
+                out.contains("[REDACTED]"),
+                "token after -/_ must be redacted; got {out}"
+            );
+            assert!(
+                !out.contains("sk-abcdefghijklmnopqrstuvwxyz0123")
+                    && !out.contains("ghp_0123456789abcdefghijklmnopqrstuvwxyz"),
+                "secret leaked: {out}"
+            );
+        }
     }
 
     #[test]
