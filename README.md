@@ -12,19 +12,19 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **Claude-compatible skills**: discover skills from `.claude/skills/`, `.opencode/skills/`, `.dirge/skills/` directories. Agent can call the `skill` tool to load instructions on demand
 - **Bash permissions** (tree-sitter): parses shell commands to split `&&`/`;`/`|` into individual segments, detects command substitution and complex constructs
 - **Permission system**: four configurable modes with per-tool patterns, session allowlists, and external directory policies
-- **Session management**: save/load/resume sessions, auto-pruning of large tool results to stay within context windows (current implementation; an LLM-summarization compaction path exists in `src/agent/compression.rs` but is not yet wired into the runtime — `/compress` triggers tool-output pruning only)
+- **Session management & compaction**: save/load/resume sessions with lineage-aware session search. `/compress` runs an LLM-summarization compaction pass (via the auxiliary `summarization_provider`) that folds the conversation middle into a structured summary. Automatic turn-boundary compaction keeps the runtime within the context window without an LLM call: it caps oversized tool results (per-result token cap) and proactively folds when the context-ratio crosses a high threshold, on top of tool-output pruning.
 - **Terminal UI**: crossterm-based, markdown rendering, soft-wrapping input box, mouse selection/copy, scrollback, reasoning visibility toggle
 - **Info panel**: optional right-hand sidebar showing cwd, MCP/LSP server status, pending todos, and recently-modified files. Auto-shown at ≥100 cols; toggle via `/panel`
 - **Mid-execution interjection**: type while the agent is running to queue a follow-up message — the runner stops at the next tool-result boundary so it's picked up promptly instead of waiting for the whole multi-turn run. `Ctrl+X` drops queued messages, `Ctrl+C` cancels both the run and the queue
 - **Prompts system**: switch between system prompt modes at runtime (`code`, `plan`, `review`, `debug`, etc.)
 - **Per-prompt tool restrictions**: each prompt (`prompts/<name>.md`) can declare a `deny_tools` frontmatter list. The permission checker refuses those tools while the prompt is active — replaces the previous prose-based "plan mode" gate with a real security boundary. `plan`, `review`, and `review-security` ship with `edit`, `write`, `apply_patch`, `bash`, and `webfetch` denied
 - **Subagent support**: `task` tool spawns a subagent for research or general analysis subtasks
-- **Memory tool**: persistent per-project memory store at `~/.dirge/memories/` — view, write, delete memories
+- **Memory & self-improvement**: persistent per-project memory at `.dirge/memory/` (`MEMORY.md` facts + `PITFALLS.md`), injected into the system prompt as a frozen snapshot. The agent edits it via the `memory` tool. After an idle session, a unified post-session orchestrator runs (in order, fire-and-forget): a background review that extracts learnings into memory + skills, a skills curator and a memory curator (stale-detection + lifecycle + LLM consolidation, with audit reports under each store's `.curator_reports/`), and a cross-session pass that promotes sub-threshold patterns recurring across past sessions.
 - **MCP support**: connect MCP servers for extended tooling (optional compile-time feature)
 - **Git Worktrees**: `/worktree` to create branch-per-task worktrees, `/wt-merge`, `/wt-exit`
 - **Loop system**: iterative coding loop for long-horizon tasks
 - **ACP support** (gated): Agent Communication Protocol server for editor integration. ACP locks the active prompt at launch — use `--prompt <name>` on startup to opt into a restricted mode (the protocol has no mid-session prompt-switch message)
-- **Plugin system** (Janet, on a dedicated worker thread): hooks for the full session/agent/tool lifecycle. Plugins can intercept tool calls (block/mutate/replace), register slash commands, transform user input, post notifications, and prompt the user with blocking `confirm`/`select` dialogs
+- **Plugin system** (Janet, on a dedicated worker thread): hooks across the full session/agent/tool lifecycle. Plugins can intercept tool calls (block/mutate/replace), register slash commands / tools / keyboard shortcuts / LLM providers, augment the system prompt (`before-agent-start`), transform the message context before each LLM call (`transform-context`), rewrite finalized assistant messages (`message-end`), supply custom compaction summaries (`on-compact`), post notifications, and prompt the user with blocking `confirm`/`select` dialogs. See [`docs/plugins.md`](docs/plugins.md).
 
 ### Robust agent loop
 
@@ -292,7 +292,7 @@ Skills are auto-discovered at agent startup and listed in the `skill` tool descr
 
 ## Plugin system (Janet)
 
-When built with `--features plugin`, dirge embeds the [Janet](https://janet-lang.org) scripting language for harness-driven workflows. Plugins are Janet scripts placed in `~/.config/dirge/plugins/` (global) or `./.dirge/plugins/` (project-local) that define hooks at specific points in the agent lifecycle and call into `harness/*` APIs to log, gate tools, transform prompts, render custom entries, control the session tree, and more.
+When built with `--features plugin`, dirge embeds the [Janet](https://janet-lang.org) scripting language for harness-driven workflows. Plugins are Janet scripts placed in `~/.config/dirge/plugins/` (global) or `./.dirge/plugins/` (project-local) that define hooks at specific points in the agent lifecycle and call into `harness/*` APIs to log, gate tools, transform prompts, augment the system prompt, transform the message context per call, rewrite finalized messages, supply custom compaction summaries, render custom entries, control the session tree, and more. (The plugin layer is opt-in at build time — `build.sh` enables it; a bare `cargo build` compiles it to no-op stubs.)
 
 A minimal plugin:
 
