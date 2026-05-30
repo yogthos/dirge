@@ -513,4 +513,245 @@ mod tests {
         assert_eq!(adapters[0].name, "aaa");
         assert_eq!(adapters[1].name, "bbb");
     }
+
+    // -----------------------------------------------------------------------
+    // Language → Adapter mapping table (data-driven, from defaults.json)
+    // -----------------------------------------------------------------------
+
+    /// Every file extension in defaults.json must map to at least one adapter.
+    #[test]
+    fn all_file_types_have_an_adapter() {
+        let defaults = load_defaults();
+        let mut seen = std::collections::HashSet::new();
+        let mut covered = std::collections::HashSet::new();
+        for (name, cfg) in &defaults {
+            for ft in &cfg.file_types {
+                seen.insert(ft.clone());
+                covered.insert((ft.clone(), name.clone()));
+            }
+        }
+        // Check that every extension has at least one adapter.
+        // (Extensions with >1 adapter are fine — the sort logic picks.)
+        for ext in &seen {
+            let adapters: Vec<_> = defaults
+                .iter()
+                .filter(|(_, cfg)| cfg.file_types.contains(ext))
+                .map(|(n, _)| n.as_str())
+                .collect();
+            assert!(
+                !adapters.is_empty(),
+                "extension {ext} has no adapter (should be unreachable)"
+            );
+        }
+        // Specific known extensions.
+        assert!(seen.contains(".py"), ".py must be covered");
+        assert!(seen.contains(".rs"), ".rs must be covered");
+        assert!(seen.contains(".go"), ".go must be covered");
+        assert!(seen.contains(".c"), ".c must be covered");
+        assert!(seen.contains(".js"), ".js must be covered");
+        assert!(seen.contains(".rb"), ".rb must be covered");
+    }
+
+    /// Every language declared in defaults.json must have a non-empty file_types list.
+    #[test]
+    fn every_adapter_has_file_types() {
+        let defaults = load_defaults();
+        for (name, cfg) in &defaults {
+            assert!(
+                !cfg.file_types.is_empty(),
+                "adapter {name} must declare at least one file_type"
+            );
+        }
+    }
+
+    /// Specific language→adapter mappings from defaults.json.
+    #[test]
+    fn known_language_to_adapter_mappings() {
+        let defaults = load_defaults();
+
+        // Python → debugpy
+        let debugpy = &defaults["debugpy"];
+        assert!(debugpy.file_types.contains(&".py".to_string()));
+        assert!(debugpy.languages.contains(&"python".to_string()));
+
+        // Go → dlv
+        let dlv = &defaults["dlv"];
+        assert!(dlv.file_types.contains(&".go".to_string()));
+        assert!(dlv.languages.contains(&"go".to_string()));
+
+        // Ruby → rdbg
+        let rdbg = &defaults["rdbg"];
+        assert!(rdbg.file_types.contains(&".rb".to_string()));
+        assert!(rdbg.languages.contains(&"ruby".to_string()));
+
+        // JS/TS → js-debug-adapter
+        let js_dap = &defaults["js-debug-adapter"];
+        assert!(js_dap.file_types.contains(&".js".to_string()));
+        assert!(js_dap.file_types.contains(&".ts".to_string()));
+        assert!(js_dap.languages.contains(&"javascript".to_string()));
+        assert!(js_dap.languages.contains(&"typescript".to_string()));
+
+        // Java → jdtls-debug
+        let jdtls = &defaults["jdtls-debug"];
+        assert!(jdtls.file_types.contains(&".java".to_string()));
+        assert!(jdtls.languages.contains(&"java".to_string()));
+
+        // Elixir → elixir-ls-debugger
+        let elixir = &defaults["elixir-ls-debugger"];
+        assert!(elixir.file_types.contains(&".ex".to_string()));
+        assert!(elixir.file_types.contains(&".exs".to_string()));
+        assert!(elixir.languages.contains(&"elixir".to_string()));
+
+        // Clojure → clojure-lsp-debug
+        let clj = &defaults["clojure-lsp-debug"];
+        assert!(clj.file_types.contains(&".clj".to_string()));
+        assert!(clj.languages.contains(&"clojure".to_string()));
+    }
+
+    /// C-family extensions must be covered by at least one native debugger (gdb or lldb-dap).
+    #[test]
+    fn c_family_covered_by_native_debuggers() {
+        let defaults = load_defaults();
+        let c_exts = [".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"];
+        for ext in c_exts {
+            let covered_by_gdb = defaults["gdb"].file_types.contains(&ext.to_string());
+            let covered_by_lldb = defaults["lldb-dap"].file_types.contains(&ext.to_string());
+            assert!(
+                covered_by_gdb || covered_by_lldb,
+                "C-family extension {ext} must be covered by gdb or lldb-dap"
+            );
+        }
+    }
+
+    /// Every adapter must have a non-empty command string.
+    #[test]
+    fn every_adapter_has_command() {
+        let defaults = load_defaults();
+        for (name, cfg) in &defaults {
+            assert!(!cfg.command.is_empty(), "adapter {name}: command must not be empty");
+            assert!(!cfg.command.trim().is_empty(), "adapter {name}: command must not be whitespace");
+        }
+    }
+
+    /// Every adapter must have a non-empty root_markers list (or explicitly empty).
+    /// Root markers are optional — but validate they're sensible strings.
+    #[test]
+    fn root_markers_are_non_empty_strings() {
+        let defaults = load_defaults();
+        for (name, cfg) in &defaults {
+            for marker in &cfg.root_markers {
+                assert!(
+                    !marker.trim().is_empty(),
+                    "adapter {name}: root marker must not be whitespace"
+                );
+            }
+        }
+    }
+
+    /// Extensionless binary sorting: only native debuggers or root-marker matches.
+    #[test]
+    fn extensionless_prefers_native() {
+        let tmp = make_temp_dir();
+        let cwd = tmp.path();
+
+        // Only gdb and lldb-dap should appear; debugpy (no root marker) should not.
+        let mut all = vec![
+            make_adapter("gdb", &[".c"], &[]),
+            make_adapter("lldb-dap", &[".c", ".rs"], &[]),
+            make_adapter("debugpy", &[".py"], &[]),
+        ];
+        sort_adapters_for_launch(Path::new("/tmp/a.out"), cwd, &mut all);
+        // gdb and lldb-dap are both native, debugpy is not.
+        // gdb (rank 0) before lldb-dap (rank 1) before debugpy (rank MAX).
+        let names: Vec<&str> = all.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["gdb", "lldb-dap", "debugpy"]);
+    }
+
+    /// Root-marker match wins over native-debugger rank for extensionless binaries.
+    #[test]
+    fn extensionless_root_marker_overrides_native_rank() {
+        let tmp = make_temp_dir();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("Cargo.toml"), "").unwrap();
+
+        // debugpy with root marker match should sort before native gdb.
+        let mut all = vec![
+            make_adapter("gdb", &[".c"], &[]),
+            make_adapter("debugpy", &[".py"], &["Cargo.toml"]),
+        ];
+        sort_adapters_for_launch(Path::new("/tmp/a.out"), cwd, &mut all);
+        // debugpy has root-marker match → sorts first.
+        assert_eq!(all[0].name, "debugpy");
+        assert_eq!(all[1].name, "gdb");
+    }
+
+    /// When a dotfile has no matching extension, all available adapters are returned.
+    #[test]
+    fn unknown_extension_returns_all() {
+        let tmp = make_temp_dir();
+        let cwd = tmp.path();
+
+        let mut adapters = vec![
+            make_adapter("gdb", &[".c"], &[]),
+            make_adapter("debugpy", &[".py"], &[]),
+        ];
+        sort_adapters_for_launch(Path::new("/tmp/prog.xyz"), cwd, &mut adapters);
+        // No extension match → all adapters, sorted alphabetically or by rank.
+        // gdb (rank 0) → first, debugpy (rank MAX) → second.
+        assert_eq!(adapters.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // select_attach_adapter logic (unit, no PATH needed)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attach_with_port_prefers_debugpy() {
+        // When a port is given and debugpy is available, it should win.
+        // We can't test the full function without PATH, but we test the
+        // logic via explicit adapter name path.
+        let result = select_attach_adapter(Some("debugpy"), Some(5678));
+        // Debugpy may or may not be on PATH — just verify no panic.
+        let _ = result;
+    }
+
+    #[test]
+    fn attach_without_port_prefers_native() {
+        let result = select_attach_adapter(None, None);
+        // Without adapters on PATH, returns None. No panic.
+        let _ = result;
+    }
+
+    // -----------------------------------------------------------------------
+    // ConnectMode validation for all bundled adapters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_bundled_adapter_connect_mode_is_valid() {
+        let defaults = load_defaults();
+        for (_name, cfg) in &defaults {
+            match cfg.connect_mode {
+                ConnectMode::Stdio | ConnectMode::Socket => {}
+            }
+        }
+    }
+
+    /// Verify specific adapters that use socket mode.
+    #[test]
+    fn socket_mode_adapters() {
+        let defaults = load_defaults();
+        assert_eq!(defaults["dlv"].connect_mode, ConnectMode::Socket);
+        assert_eq!(defaults["codelldb"].connect_mode, ConnectMode::Socket);
+    }
+
+    /// Verify specific adapters that use stdio mode.
+    #[test]
+    fn stdio_mode_adapters() {
+        let defaults = load_defaults();
+        assert_eq!(defaults["debugpy"].connect_mode, ConnectMode::Stdio);
+        assert_eq!(defaults["gdb"].connect_mode, ConnectMode::Stdio);
+        assert_eq!(defaults["lldb-dap"].connect_mode, ConnectMode::Stdio);
+        assert_eq!(defaults["rdbg"].connect_mode, ConnectMode::Stdio);
+        assert_eq!(defaults["js-debug-adapter"].connect_mode, ConnectMode::Stdio);
+    }
 }

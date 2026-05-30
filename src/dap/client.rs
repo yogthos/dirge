@@ -492,4 +492,184 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RpcError::ConnectionClosed));
     }
+
+    // -------------------------------------------------------------------
+    // Integration: full lifecycle against mock Python adapter
+    // -------------------------------------------------------------------
+
+    /// Path to the mock adapter, relative to the repo root.
+    fn mock_adapter_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("mock_dap_adapter.py")
+    }
+
+    /// End-to-end test: spawn the mock adapter process, run the full
+    /// initialize→launch→setBreakpoints→configurationDone→threads→
+    /// stackTrace→scopes→variables→evaluate→continue→terminate→disconnect
+    /// lifecycle.
+    #[tokio::test]
+    async fn full_lifecycle_against_mock_adapter() {
+        use crate::dap::types::{
+            Capabilities, ContinueResponse, EvaluateResponse, ScopesResponse,
+            SetBreakpointsResponse, StackTraceResponse, ThreadsResponse,
+            VariablesResponse,
+        };
+
+        let program = mock_adapter_path();
+        assert!(
+            program.exists(),
+            "mock adapter must exist at {}",
+            program.display()
+        );
+
+        let client = super::DapClient::spawn_stdio(
+            "mock",
+            std::path::Path::new("python3"),
+            &[program.to_string_lossy().to_string()],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("mock adapter should spawn");
+
+        // 1. initialize
+        let caps: Capabilities = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "adapterID": "mock",
+                    "clientID": "dirge-test",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path"
+                }),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("initialize should succeed");
+        assert!(
+            caps.supports_configuration_done_request.unwrap_or(false),
+            "mock adapter should support configurationDoneRequest"
+        );
+
+        // 2. launch
+        client
+            .request::<_, Value>(
+                "launch",
+                serde_json::json!({"program": "/tmp/test.py", "stopOnEntry": true}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("launch should succeed");
+
+        // 3. setBreakpoints
+        let bp_response: SetBreakpointsResponse = client
+            .request(
+                "setBreakpoints",
+                serde_json::json!({
+                    "source": {"path": "/tmp/test.py"},
+                    "breakpoints": [{"line": 10}]
+                }),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("setBreakpoints should succeed");
+        assert_eq!(bp_response.breakpoints.len(), 1);
+        assert!(bp_response.breakpoints[0].verified);
+
+        // 4. configurationDone
+        client
+            .request::<_, Value>(
+                "configurationDone",
+                serde_json::json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("configurationDone should succeed");
+
+        // 5. threads
+        let threads_response: ThreadsResponse = client
+            .request("threads", serde_json::json!({}), std::time::Duration::from_secs(5))
+            .await
+            .expect("threads should succeed");
+        assert!(!threads_response.threads.is_empty());
+        let thread_id = threads_response.threads[0].id;
+
+        // 6. stackTrace
+        let st_response: StackTraceResponse = client
+            .request(
+                "stackTrace",
+                serde_json::json!({"threadId": thread_id, "levels": 10}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("stackTrace should succeed");
+        assert!(!st_response.stack_frames.is_empty());
+        let frame_id = st_response.stack_frames[0].id;
+
+        // 7. scopes
+        let scopes_response: ScopesResponse = client
+            .request(
+                "scopes",
+                serde_json::json!({"frameId": frame_id}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("scopes should succeed");
+        assert!(!scopes_response.scopes.is_empty());
+        let variables_ref = scopes_response.scopes[0].variables_reference;
+
+        // 8. variables
+        let vars_response: VariablesResponse = client
+            .request(
+                "variables",
+                serde_json::json!({"variablesReference": variables_ref}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("variables should succeed");
+        assert!(!vars_response.variables.is_empty());
+
+        // 9. evaluate
+        let eval_response: EvaluateResponse = client
+            .request(
+                "evaluate",
+                serde_json::json!({"expression": "1 + 1", "frameId": frame_id, "context": "repl"}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("evaluate should succeed");
+        assert_eq!(eval_response.result, "2");
+
+        // 10. continue
+        let continue_response: ContinueResponse = client
+            .request(
+                "continue",
+                serde_json::json!({"threadId": thread_id}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("continue should succeed");
+        assert!(continue_response.all_threads_continued.unwrap_or(true));
+
+        // 11. terminate
+        client
+            .request::<_, Value>(
+                "terminate",
+                serde_json::json!({}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("terminate should succeed");
+
+        // 12. disconnect
+        client
+            .request::<_, Value>(
+                "disconnect",
+                serde_json::json!({"terminateDebuggee": true}),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("disconnect should succeed");
+    }
 }
