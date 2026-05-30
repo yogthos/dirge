@@ -637,6 +637,74 @@ async fn kwz_storm_breaker_trips_on_repeat() {
     );
 }
 
+/// F4 — in-session reflexion memory. When the storm guard fires, the
+/// abandoned approach is recorded and the guard text carries the
+/// running list of dead ends. Driving one storm should produce a guard
+/// whose text includes the abandoned-approaches block naming the looped
+/// tool, proving the reflexion buffer is wired into the guard (not just
+/// a standalone module).
+#[tokio::test]
+async fn reflexion_buffer_surfaces_abandoned_approach_in_guard() {
+    let tool = std::sync::Arc::new(RecordingTool::new("dup"));
+    let mut ctx = empty_context();
+    ctx.tools.push(tool.clone());
+
+    let mut cfg = build_config();
+    cfg.storm_mutating_tools = Some(vec!["dup".to_string()]);
+
+    let identical = || tool_use_response("call-x", "dup", serde_json::json!({"k": "v"}));
+    let stream = scripted_stream(vec![
+        vec![StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message: identical(),
+            usage: None,
+        }],
+        vec![StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message: identical(),
+            usage: None,
+        }],
+        vec![StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message: identical(),
+            usage: None,
+        }],
+        vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: text_response("done"),
+            usage: None,
+        }],
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let messages = run_agent_loop(
+        vec![user("repeat")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &stream,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let saw_reflexion = messages.iter().any(|m| match m {
+        LoopMessage::ToolResult(t) => t.content.iter().any(|c| match c {
+            ContentBlock::Text { text } => {
+                text.contains("abandoned this run") && text.contains("dup(")
+            }
+            _ => false,
+        }),
+        _ => false,
+    });
+    assert!(
+        saw_reflexion,
+        "guard text should carry the reflexion buffer's abandoned-approaches block naming dup(...)",
+    );
+}
+
 // ===============================================================
 // 5. AbortSignal mid-turn
 // ===============================================================

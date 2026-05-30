@@ -639,6 +639,12 @@ pub async fn run_loop(
     // runaway run. `max_turns = None` means unlimited (legacy).
     let mut turns_taken: usize = 0;
 
+    // F4: in-session reflexion memory. Accumulates the approaches the
+    // model looped on and abandoned this run, so the repeat-loop guard
+    // can remind it of every dead end (not just the latest repeat).
+    // Lives outside the outer loop so it persists across turns.
+    let mut reflections = super::reflexion::ReflectionLog::new();
+
     'outer: loop {
         // Storm: fresh intent on each new user turn.
         // Port of Reasonix loop.ts:621 `this.repair.resetStorm()`.
@@ -961,14 +967,26 @@ pub async fn run_loop(
                     // diagnose, then DIVERGE — a different tool, entry
                     // point, or assumption — and gives explicit permission
                     // to stop. See docs/agent-loop.md.
-                    let guard_text = "[repeat-loop guard] You've made this exact call more than once and gotten the same result — you're stuck in a loop. Do NOT repeat it. Before doing anything else, work through these steps:\n\
+                    const REPEAT_LOOP_GUARD: &str = "[repeat-loop guard] You've made this exact call more than once and gotten the same result — you're stuck in a loop. Do NOT repeat it. Before doing anything else, work through these steps:\n\
                         1. State what you were trying to achieve with this call and why it isn't getting you there.\n\
                         2. Look at the earlier results for it above. What assumption of yours might be wrong, and what do those results actually tell you?\n\
                         3. Propose 2-3 FUNDAMENTALLY different approaches — a different tool, a different entry point, or a different interpretation of the problem — and pick the most promising one.\n\
                         4. Proceed with that approach.\n\
                         If none of them can work with the tools available, say so plainly and report what you found instead of trying again.";
+                    // F4: record each looped call as an abandoned approach,
+                    // then append the running list so the model sees every
+                    // dead end it has hit this run, not just this repeat.
+                    for call in &tool_calls {
+                        let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+                        let sig = super::reflexion::approach_signature(&call.name, &args);
+                        reflections.record(sig);
+                    }
+                    let guard_text = format!(
+                        "{REPEAT_LOOP_GUARD}{}",
+                        reflections.block().unwrap_or_default()
+                    );
                     let guard_blocks = vec![ContentBlock::Text {
-                        text: guard_text.to_string(),
+                        text: guard_text.clone(),
                     }];
                     for call in &tool_calls {
                         let tr = ToolResultMessage {
