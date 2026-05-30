@@ -2428,3 +2428,77 @@ async fn auto_confirm_no_responds_false_and_none() {
         other => panic!("expected Select(None), got {:?}", other),
     }
 }
+
+/// The shipped nREPL plugin (plugins/nrepl/) loads cleanly through the
+/// real directory loader and registers its slash commands + the
+/// `nrepl_eval` tool. Guards against a syntax error or a renamed
+/// `harness/*` function silently breaking the bundled plugin. Loading
+/// only evaluates the files (registering commands/tools); it does NOT
+/// fire `on-init`, so no network connection is attempted here.
+#[test]
+fn shipped_nrepl_plugin_loads_and_registers() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/nrepl");
+    assert!(dir.is_dir(), "plugins/nrepl missing at {}", dir.display());
+
+    let mut mgr = PluginManager::try_new().unwrap();
+    let loaded = super::load_plugin(&mut mgr, &dir)
+        .unwrap_or_else(|e| panic!("nrepl plugin failed to load: {e}"));
+    assert_eq!(loaded.stem, "nrepl");
+
+    let cmds: Vec<String> = mgr.list_commands().into_iter().map(|(c, _)| c).collect();
+    for expected in [
+        "nrepl-connect",
+        "nrepl-disconnect",
+        "nrepl-eval",
+        "nrepl-status",
+        "nrepl-timeout",
+        "nrepl-interrupt",
+    ] {
+        assert!(
+            cmds.iter().any(|c| c == expected),
+            "command {expected} not registered; got {cmds:?}"
+        );
+    }
+
+    let tools: Vec<String> = mgr
+        .list_plugin_tools()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        tools.iter().any(|t| t == "nrepl_eval"),
+        "nrepl_eval tool not registered; got {tools:?}"
+    );
+}
+
+/// The plugin's pure-Janet paren repair closes unbalanced delimiters in
+/// the correct (stack) order — the behavior the eval path relies on to
+/// hand the nREPL server valid syntax. Loads only 00-state.janet (no
+/// network).
+#[test]
+fn nrepl_plugin_paren_repair_balances_delimiters() {
+    let state = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/nrepl/00-state.janet"),
+    )
+    .unwrap();
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(&state).unwrap();
+
+    assert_eq!(mgr.eval(r#"(paren-repair "(+ 1 2")"#).unwrap(), "(+ 1 2)");
+    assert_eq!(
+        mgr.eval(r#"(paren-repair "(defn f [x] {:a x")"#).unwrap(),
+        "(defn f [x] {:a x})"
+    );
+    // Balanced input is returned unchanged.
+    assert_eq!(
+        mgr.eval(r#"(paren-repair "(+ 1 (* 2 3))")"#).unwrap(),
+        "(+ 1 (* 2 3))"
+    );
+    // A ')' inside a string literal must not be treated as a closer,
+    // so balanced-with-embedded-paren input is returned unchanged.
+    // (Janet long-string `...` passes the code without escape noise.)
+    assert_eq!(
+        mgr.eval(r#"(paren-repair `(str ")")`)"#).unwrap(),
+        r#"(str ")")"#
+    );
+}

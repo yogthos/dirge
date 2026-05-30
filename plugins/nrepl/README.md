@@ -73,7 +73,11 @@ repair notice when delimiters were fixed.
 
 - dirge built with `--features plugin` (the default build includes it)
 - A running Clojure nREPL server that writes `.nrepl-port` in the project root
-- `janet` available on `PATH` (the plugin runtime)
+
+No external `janet` binary is required. The plugin runs entirely inside
+dirge's embedded Janet runtime — including the TCP transport, which uses
+Janet's built-in `net/*` (driven by dirge's event loop). It shells out to
+nothing.
 
 ## Differences from clojure-mcp-light
 

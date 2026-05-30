@@ -106,19 +106,44 @@
 (var nrepl-connected false)
 (var nrepl-eval-timeout 120)  # per-eval timeout in seconds
 (var nrepl-current-eval-id nil)  # active eval id for interrupt
+(var nrepl-rbuf @"")      # bytes read but not yet decoded (see below)
 
 # ── nREPL protocol ──────────────────────────────────────────────
 
+(defn- try-decode-buffered [b]
+  "Attempt to parse ONE complete bencode value from buffer `b`.
+  Returns [value consumed-bytes], or nil when `b` holds only a
+  partial (incomplete) message. Incomplete data makes the byte-level
+  parsers run off the end and raise, which we treat as 'need more'."
+  (if (= (length b) 0)
+    nil
+    (try
+      (parse-value (string b) 0)
+      ([_] nil))))
+
 (defn nrepl-read-msg [conn &opt timeout-secs]
-  "Read one bencode-encoded nREPL message from the socket.
-  Returns a parsed dict. Raises on timeout or disconnect.
-  timeout-secs defaults to nil (no timeout / blocking)."
-  (def buf (if timeout-secs
-             (net/read conn 65536 nil timeout-secs)
-             (net/read conn 65536)))
-  (if (= (length buf) 0)
-    (error "nREPL connection closed by server"))
-  (bencode-decode (string buf)))
+  "Read one complete bencode-encoded nREPL message, buffering across
+  socket reads. A single TCP read can return a partial message OR
+  several coalesced messages; `nrepl-rbuf` retains undecoded bytes so
+  neither case loses data. Returns a parsed dict. Raises on timeout
+  or disconnect. timeout-secs defaults to nil (blocking)."
+  (var result nil)
+  (while (nil? result)
+    (if-let [decoded (try-decode-buffered nrepl-rbuf)]
+      (do
+        (def [v consumed] decoded)
+        # Keep any bytes past this message for the next call so a
+        # coalesced follow-up message isn't dropped.
+        (set nrepl-rbuf (buffer (string/slice nrepl-rbuf consumed)))
+        (set result v))
+      (do
+        (def buf (if timeout-secs
+                   (net/read conn 65536 nil timeout-secs)
+                   (net/read conn 65536)))
+        (if (or (nil? buf) (= (length buf) 0))
+          (error "nREPL connection closed by server"))
+        (buffer/push-string nrepl-rbuf buf))))
+  result)
 
 (defn nrepl-send-msg [conn msg]
   "Send a single nREPL message (as a Janet dict/table)."
@@ -126,6 +151,8 @@
 
 (defn- connect-nrepl-inner [host port]
   (def conn (net/connect host port :stream))
+  # Fresh socket → drop any leftover bytes from a previous session.
+  (set nrepl-rbuf @"")
   (nrepl-send-msg conn @{"op" "clone" "id" "dirge-clone"})
   (def clone-resp (nrepl-read-msg conn))
   (def session (get clone-resp "new-session"))
@@ -161,6 +188,7 @@
       (set nrepl-conn nil)
       (set nrepl-session nil)
       (set nrepl-connected false)
+      (set nrepl-rbuf @"")
       "disconnected from nREPL")))
 
 # ── paren repair ─────────────────────────────────────────────────
@@ -256,9 +284,12 @@
   (var err "")
   (var done false)
   (var ns "")
-  (var start-ms (os/time))
+  # os/time is in SECONDS (Unix epoch), so elapsed is a plain
+  # difference — no /1000. (The previous code divided by 1000, which
+  # made the timeout ~1000x too long and the interrupt never fire.)
+  (var start-s (os/time))
   (while (not done)
-    (def elapsed-s (/ (- (os/time) start-ms) 1000))
+    (def elapsed-s (- (os/time) start-s))
     (if (>= elapsed-s nrepl-eval-timeout)
       (do
         (nrepl-interrupt)

@@ -9,10 +9,13 @@
   (if-let [port-str (try (string/trim (slurp port-file)) ([_] nil))]
     (do
       (harness/log (string "nrepl: found .nrepl-port → " port-str))
+      # Janet `try` takes ONE body form, so multi-step bodies must be
+      # wrapped in `(do ...)`.
       (try
-        (def status (nrepl-connect nrepl-host port-str))
-        (harness/notify (string "[nrepl] " status) :info)
-        (harness/log (string "nrepl: " status))
+        (do
+          (def status (nrepl-connect nrepl-host port-str))
+          (harness/notify (string "[nrepl] " status) :info)
+          (harness/log (string "nrepl: " status)))
         ([err]
          (harness/notify
            (string "[nrepl] auto-connect failed: " err) :warn))))
