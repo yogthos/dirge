@@ -69,7 +69,13 @@ pub struct Scene<'a> {
 /// area + the scene's input_rows.
 pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     let area = f.area();
-    let layout = Layout::new(area.width, area.height, scene.input_rows);
+    let layout = Layout::with_panels(
+        area.width,
+        area.height,
+        scene.input_rows,
+        scene.show_left_panel,
+        scene.show_right_panel,
+    );
     let frame_style = Style::default().fg(crossterm_to_ratatui(scene.frame_color));
 
     // Top frame (full width, across left panel + chat + right panel).
@@ -369,9 +375,11 @@ mod tests {
         );
     }
 
-    /// `/display` granularity: the left and right panels are toggled
-    /// independently. With only the left shown, the left gutter has
-    /// content and the right gutter is blank; and vice-versa.
+    /// `/display` granularity: the left and right panels toggle
+    /// independently, and a hidden panel's gutter is reclaimed by the
+    /// chat band (not left blank). With only the left shown the left
+    /// gutter draws and the chat expands rightward to the edge; with
+    /// only the right shown the chat expands leftward.
     #[test]
     fn left_and_right_panels_toggle_independently() {
         fn region_has_content(backend: &TestBackend, r: ratatui::layout::Rect) -> bool {
@@ -391,8 +399,8 @@ mod tests {
         let pd = PanelData::default();
         let info = LeftPanelInfo::default();
         let subs: Vec<SubagentStatusRow> = Vec::new();
-        let layout = Layout::new(160, 30, 1);
-        assert!(layout.left_panel.width >= 12 && layout.right_panel.width >= 16);
+        let both = Layout::new(160, 30, 1);
+        assert!(both.left_panel.width >= 12 && both.right_panel.width >= 16);
 
         let render = |show_left: bool, show_right: bool| {
             let mut scene = empty_scene(&buf, &pd, &info, &subs, "ready");
@@ -404,25 +412,31 @@ mod tests {
             terminal.backend().clone()
         };
 
-        // Left only.
+        // Left only: left gutter draws; the chat reclaims the right
+        // gutter so it is wider than the both-visible chat.
+        let left_only = Layout::with_panels(160, 30, 1, true, false);
+        assert_eq!(left_only.right_panel.width, 0);
+        assert_eq!(
+            left_only.chat.width,
+            both.chat.width + both.right_panel.width
+        );
         let b = render(true, false);
         assert!(
-            region_has_content(&b, layout.left_panel),
+            region_has_content(&b, left_only.left_panel),
             "left should draw"
         );
-        assert!(
-            !region_has_content(&b, layout.right_panel),
-            "right should be blank"
-        );
 
-        // Right only.
+        // Right only: right gutter draws; the chat reclaims the left
+        // gutter and runs flush to the left edge.
+        let right_only = Layout::with_panels(160, 30, 1, false, true);
+        assert_eq!(right_only.left_panel.width, 0);
+        assert_eq!(
+            right_only.chat.width,
+            both.chat.width + both.left_panel.width
+        );
         let b = render(false, true);
         assert!(
-            !region_has_content(&b, layout.left_panel),
-            "left should be blank"
-        );
-        assert!(
-            region_has_content(&b, layout.right_panel),
+            region_has_content(&b, right_only.right_panel),
             "right should draw"
         );
     }

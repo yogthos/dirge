@@ -559,7 +559,13 @@ impl Renderer {
         // line block.
         let (cols_q, rows_q) = crate::ui::terminal::tty_size();
         let effective_input_rows = if let Some(lines) = alert_overlay.as_ref() {
-            let probe = crate::ui::tui::layout::Layout::new(cols_q, rows_q, 1);
+            let probe = crate::ui::tui::layout::Layout::with_panels(
+                cols_q,
+                rows_q,
+                1,
+                show_left_panel,
+                show_right_panel,
+            );
             let wrapped =
                 crate::ui::tui::bottom::overlay_wrapped_row_count(lines, probe.input_box.width);
             // Leave at least 4 rows for the chat (+ 5 fixed rows
@@ -578,7 +584,13 @@ impl Renderer {
         // they're identical. The terminal::size() probe used here
         // matches what render_frame sees because both go through the
         // same /dev/tty winsize.
-        let layout_now = crate::ui::tui::layout::Layout::new(cols_q, rows_q, effective_input_rows);
+        let layout_now = crate::ui::tui::layout::Layout::with_panels(
+            cols_q,
+            rows_q,
+            effective_input_rows,
+            show_left_panel,
+            show_right_panel,
+        );
         let chat_rect_now = layout_now.chat;
         *cached_chat_rect = Some(chat_rect_now);
 

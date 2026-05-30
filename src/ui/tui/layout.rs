@@ -71,13 +71,37 @@ pub struct Layout {
 
 impl Layout {
     /// Compute layout for `cols × rows` with `input_rows` editor
-    /// lines. `input_rows` is clamped to `[1, MAX_INPUT_ROWS]`.
+    /// lines, with both side panels visible. `input_rows` is clamped
+    /// to `[1, MAX_INPUT_ROWS]`.
     ///
     /// On very small terminals some rects collapse to zero width or
     /// height (e.g. left/right panels disappear when the chat fills
     /// the available width). Callers must check `rect.is_empty()`
     /// before painting into a region.
+    ///
+    /// Production callers go through [`Layout::with_panels`] to honour
+    /// per-side visibility; `new` is the both-visible convenience used
+    /// throughout the widget tests.
+    #[allow(dead_code)]
     pub fn new(cols: u16, rows: u16, input_rows: u16) -> Self {
+        Self::with_panels(cols, rows, input_rows, true, true)
+    }
+
+    /// Compute layout for `cols × rows` with `input_rows` editor lines,
+    /// reserving gutter space only for the side panels that are shown.
+    ///
+    /// A hidden panel's gutter is reclaimed by the chat band rather
+    /// than left blank — so `/display main` widens the conversation to
+    /// the full content width, and hiding one side shifts the chat to
+    /// absorb that side's gutter while the other panel keeps its width.
+    /// When both panels are visible this is identical to [`Layout::new`].
+    pub fn with_panels(
+        cols: u16,
+        rows: u16,
+        input_rows: u16,
+        show_left: bool,
+        show_right: bool,
+    ) -> Self {
         let input_rows = input_rows.clamp(1, MAX_INPUT_ROWS);
         let full = Rect::new(0, 0, cols, rows);
 
@@ -97,13 +121,20 @@ impl Layout {
         let status_y = rows.saturating_sub(1);
 
         // Horizontal layout: chat band centered in (cols - 2) so the
-        // left/right gutters are symmetric. Side panels each take
-        // `gutter` cols.
+        // left/right gutters are symmetric. Each VISIBLE side panel
+        // takes `base_gutter` cols; the gutter of a hidden panel is
+        // reclaimed by the chat band instead of left blank, so the
+        // conversation expands to use the freed space.
         let line_w = cols.saturating_sub(2);
-        let chat_content_w = line_w.min(CHAT_CONTENT_MAX_W);
-        let gutter = line_w.saturating_sub(chat_content_w) / 2;
+        let base_chat_w = line_w.min(CHAT_CONTENT_MAX_W);
+        let base_gutter = line_w.saturating_sub(base_chat_w) / 2;
+        let left_gutter = if show_left { base_gutter } else { 0 };
+        // Chat keeps its capped width plus whichever gutters are freed.
+        let freed =
+            if show_left { 0 } else { base_gutter } + if show_right { 0 } else { base_gutter };
+        let chat_content_w = base_chat_w.saturating_add(freed);
 
-        let chat_v_left_col = gutter; // col of chat's left ║
+        let chat_v_left_col = left_gutter; // col of chat's left ║
         let chat_x = chat_v_left_col.saturating_add(1);
         let chat_v_right_col = chat_x.saturating_add(chat_content_w);
         // Right panel starts after the right ║. Compute its width
@@ -115,7 +146,7 @@ impl Layout {
         // Chat content rect — between ║ borders, rows 1..chat_bot_frame_y.
         let chat = Rect::new(chat_x, chat_content_top, chat_content_w, chat_h);
 
-        let left_panel = Rect::new(0, chat_content_top, gutter, chat_h);
+        let left_panel = Rect::new(0, chat_content_top, left_gutter, chat_h);
         let right_panel = Rect::new(right_panel_x, chat_content_top, right_panel_w, chat_h);
 
         let chat_bot_frame = Rect::new(0, chat_bot_frame_y, cols, 1);
@@ -124,7 +155,7 @@ impl Layout {
         let strip_h = input_rows.saturating_add(2);
         // Avatar box mirrors the left panel cols; input box spans
         // chat verticals inclusive; right margin mirrors right panel cols.
-        let avatar_box = Rect::new(0, bottom_strip_top_y, gutter, strip_h);
+        let avatar_box = Rect::new(0, bottom_strip_top_y, left_gutter, strip_h);
         // Input box includes both chat ║ cols so its rounded ╭...╮
         // sits exactly at the chat verticals — visual continuation.
         let input_box_x = chat_v_left_col;
@@ -181,6 +212,78 @@ mod tests {
         assert_eq!(l.right_panel.x, 161);
         assert_eq!(l.right_panel.width, 39);
         assert_eq!(l.left_panel.width, 39);
+    }
+
+    /// Hiding the right panel reclaims its gutter for the chat band:
+    /// the chat grows by the freed gutter width, the left panel keeps
+    /// its width, and the right panel collapses to zero.
+    #[test]
+    fn hiding_right_panel_expands_chat() {
+        let both = Layout::new(200, 30, 1);
+        let l = Layout::with_panels(200, 30, 1, true, false);
+        // Left panel unchanged; right panel gone.
+        assert_eq!(l.left_panel.width, both.left_panel.width);
+        assert_eq!(l.right_panel.width, 0);
+        // Chat absorbs the freed right gutter (no blank reserved space).
+        assert_eq!(l.chat.width, both.chat.width + both.right_panel.width);
+        assert_eq!(l.chat.x, both.chat.x); // chat start unchanged (left kept)
+        // Horizontal tiling still covers the full viewport.
+        assert_eq!(
+            l.left_panel.width + 1 + l.chat.width + 1 + l.right_panel.width,
+            200
+        );
+    }
+
+    /// Hiding the left panel reclaims its gutter for the chat band and
+    /// shifts the chat flush-left.
+    #[test]
+    fn hiding_left_panel_expands_chat() {
+        let both = Layout::new(200, 30, 1);
+        let l = Layout::with_panels(200, 30, 1, false, true);
+        assert_eq!(l.left_panel.width, 0);
+        assert_eq!(l.right_panel.width, both.right_panel.width);
+        assert_eq!(l.chat.width, both.chat.width + both.left_panel.width);
+        assert_eq!(l.chat_v_left_col, 0);
+        assert_eq!(l.chat.x, 1);
+        assert_eq!(
+            l.left_panel.width + 1 + l.chat.width + 1 + l.right_panel.width,
+            200
+        );
+    }
+
+    /// Hiding both panels gives the entire content band to the chat.
+    #[test]
+    fn hiding_both_panels_fills_chat() {
+        let l = Layout::with_panels(200, 30, 1, false, false);
+        assert_eq!(l.left_panel.width, 0);
+        assert_eq!(l.right_panel.width, 0);
+        assert_eq!(l.chat.width, 198); // cols - 2 (the two ║ borders)
+        assert_eq!(l.chat.x, 1);
+    }
+
+    /// The avatar box (bottom-left) tracks the left gutter, so hiding
+    /// the left panel collapses it and the input box expands left.
+    #[test]
+    fn avatar_box_tracks_left_gutter() {
+        let both = Layout::new(200, 30, 1);
+        assert_eq!(both.avatar_box.width, both.left_panel.width);
+        let left_hidden = Layout::with_panels(200, 30, 1, false, true);
+        assert_eq!(left_hidden.avatar_box.width, 0);
+        // Input box now starts at col 0 (flush left, no avatar gutter).
+        assert_eq!(left_hidden.input_box.x, 0);
+    }
+
+    /// `Layout::new` is the both-panels-visible case of `with_panels`.
+    #[test]
+    fn new_matches_with_panels_both_visible() {
+        assert_eq!(
+            Layout::new(200, 30, 1),
+            Layout::with_panels(200, 30, 1, true, true)
+        );
+        assert_eq!(
+            Layout::new(80, 24, 3),
+            Layout::with_panels(80, 24, 3, true, true)
+        );
     }
 
     /// Narrow terminal: line_w <= CHAT_CONTENT_MAX_W → no gutter,
