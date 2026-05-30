@@ -1329,6 +1329,27 @@ mod reminder_tests {
         );
     }
 
+    /// Phase D — all three base-prompt guidance features (F2 finishing
+    /// self-check, F3 progress narration, F5 ask-vs-proceed calibration)
+    /// coexist in one assembled preamble. Guards against a future edit
+    /// silently dropping one.
+    #[test]
+    fn base_preamble_carries_full_guidance_suite() {
+        let p = assemble_base_preamble();
+        assert!(
+            p.contains("# Finishing a task"),
+            "F2 finishing self-check missing"
+        );
+        assert!(
+            p.contains("# Progress updates"),
+            "F3 progress narration missing"
+        );
+        assert!(
+            p.contains("# Clarifying vs. proceeding"),
+            "F5 ask-vs-proceed calibration missing"
+        );
+    }
+
     /// F3 — the base preamble tells the agent to plan up front and post
     /// terse progress notes during multi-step tool runs, while keeping
     /// the final reply terse (no contradiction with the Output section).

@@ -36,6 +36,19 @@ headline differentiators, see the top-level [README](../README.md).
 
 Hardening against the failure modes that plague long sessions and weaker models. See [agent-loop.md](agent-loop.md) for the architecture and [tool-input-repair.md](tool-input-repair.md) for the repair layer.
 
+### Reasoning & tool-use guidance suite
+
+A set of research-backed, model-agnostic guidance features that steer reasoning and tool use, layered so they compose. All are baked-in (no config keys) and verified wired end-to-end:
+
+- **Few-shot tool-use exemplars** (loop): on-topic worked demonstrations retrieved per task and injected before the prompt.
+- **Finish discipline** (prompt): a single pre-reply self-check + explicit definition-of-done and stop condition.
+- **Progress updates** (prompt): up-front plan and terse step notes for multi-step runs, distinct from the terse final reply.
+- **Ask-vs-proceed calibration** (prompt): ask only on costly, un-inferable, genuinely divergent ambiguity; otherwise proceed and state the assumption.
+- **In-session reflexion memory** (loop): accumulates abandoned approaches and re-surfaces the full list in the repeat-loop guard.
+- **Pre-finalization verifier gate** (loop): nudges to verify when code was edited but nothing was run to check it.
+
+On top of these, **model-aware steering** tailors guidance to the active model family (e.g. a DeepSeek-specific fragment). The prompt-layer features live in the base system prompt (`assemble_base_preamble`); the loop-layer features are wired into `run_agent_loop`. Each is covered by its own end-to-end "actually used" test, plus cross-feature composition tests.
+
 - **Few-shot tool-use exemplars**: a small curated corpus of worked tool-call demonstrations (read-before-edit, locate-then-read, multi-file `apply_patch`, run-tests-and-adapt, parallel reads). At the start of each task the most relevant 0–3 are retrieved by lexical match (nucleo-matcher scored per token, no embeddings) and injected into the model-facing context just before the prompt — on-topic demonstrations only, nothing for an off-topic task. In-context tool demonstrations are one of the largest reliability levers for open models.
 - **Pre-finalization verifier gate**: a cheap, signal-based in-loop critic that backs "verify before done" with a mechanism, not just prose. It watches the run for code edits (to source-file extensions) versus shell commands, and at the finalization boundary — when the agent is about to declare done — injects one soft "verify before done" nudge if code was changed but nothing was ever run to check it, re-entering the loop once. Doc-only edits don't count; bounded to fire at most once per run so it can never loop; no extra LLM call.
 - **Tool-input repair layer**: catches and fixes common malformed tool calls before they hit the tool — strips `null` optional fields, parses JSON-string arrays, unwraps markdown links in path fields, applies relational defaults declared in the tool's schema. Failed repairs emit a structured `tool_input_invalid` log with the original args.

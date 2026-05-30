@@ -820,6 +820,84 @@ async fn verifier_gate_silent_when_a_command_ran() {
     );
 }
 
+/// Phase D — F1 (few-shot exemplars) and F6 (verifier gate) compose in a
+/// single realistic run without interfering. A code-edit task should:
+///   1. inject exemplars into the FIRST LLM call (F1), and
+///   2. after the model edits code and tries to finish, surface the
+///      verify-before-done nudge in a LATER LLM call (F6).
+/// A custom factory inspects exactly what each LLM call received, so this
+/// proves both features are live end-to-end in the same run.
+#[tokio::test]
+async fn exemplars_and_verifier_compose_in_one_run() {
+    use std::sync::Arc;
+
+    let tool = Arc::new(RecordingTool::new("edit"));
+    let mut ctx = empty_context();
+    ctx.tools.push(tool);
+
+    let mut cfg = build_config();
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+    cfg.tool_execution = ToolExecutionMode::Sequential;
+
+    let saw_exemplars = Arc::new(Mutex::new(false));
+    let saw_nudge = Arc::new(Mutex::new(false));
+    let se = saw_exemplars.clone();
+    let sn = saw_nudge.clone();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let factory: StreamFn = Arc::new(move |llm_ctx, _opts| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        let has = |needle: &str| {
+            llm_ctx.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.contains(needle))
+                    == Some(true)
+            })
+        };
+        if n == 0 {
+            *se.lock().unwrap() = has("[Tool-use examples]");
+        }
+        if n == 2 {
+            *sn.lock().unwrap() = has("[verify-before-done]");
+        }
+        let msg = if n == 0 {
+            tool_use_response("c1", "edit", serde_json::json!({"path": "src/auth.rs"}))
+        } else {
+            text_response("done")
+        };
+        let reason = msg.stop_reason;
+        Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+            reason,
+            message: msg,
+            usage: None,
+        }]))
+    });
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let _messages = run_agent_loop(
+        vec![user("change the handle_login function in src")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    assert!(
+        *saw_exemplars.lock().unwrap(),
+        "F1: exemplars should be injected into the first LLM call for a code-edit task",
+    );
+    assert!(
+        *saw_nudge.lock().unwrap(),
+        "F6: verify-before-done nudge should reach a later LLM call after edit-without-run",
+    );
+}
+
 // ===============================================================
 // 5. AbortSignal mid-turn
 // ===============================================================
