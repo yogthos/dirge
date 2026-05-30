@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::agent::tools::background::{BackgroundStore, TaskKind};
+use crate::agent::tools::background::BackgroundStore;
+use crate::agent::tools::bg_shell::BackgroundShellStore;
 use crate::session::Session;
 
 pub struct StatusLine;
@@ -58,6 +59,7 @@ impl StatusLine {
         prompt_name: Option<&str>,
         perm_mode: Option<&str>,
         bg_store: Option<&BackgroundStore>,
+        shell_store: Option<&BackgroundShellStore>,
     ) -> String {
         let state = if is_running { "running" } else { "ready" };
         let wd_path = Path::new(&session.working_dir);
@@ -110,13 +112,8 @@ impl StatusLine {
         // Active background work, counted per kind. Each badge is shown
         // only when non-zero, like the other conditional badges, so the
         // bar stays quiet during normal single-agent work.
-        let (active_agents, active_shells) = match bg_store {
-            Some(s) => (
-                s.running_count_kind(TaskKind::Subagent),
-                s.running_count_kind(TaskKind::Shell),
-            ),
-            None => (0, 0),
-        };
+        let active_agents = bg_store.map(|s| s.running_count()).unwrap_or(0);
+        let active_shells = shell_store.map(|s| s.running_count()).unwrap_or(0);
         let agents_badge = if active_agents > 0 {
             format!(" | agents:{}", active_agents)
         } else {
@@ -151,39 +148,43 @@ impl StatusLine {
 #[cfg(test)]
 mod tests {
     use super::StatusLine;
-    use crate::agent::tools::background::{BackgroundStore, TaskKind};
+    use crate::agent::tools::background::BackgroundStore;
+    use crate::agent::tools::bg_shell::BackgroundShellStore;
     use crate::session::Session;
 
-    /// Build a store with `agents` running subagents and `shells` running
-    /// shells (each needs a live handle to count, so attach a never-ending
-    /// spawned task per entry).
-    fn store_with(agents: usize, shells: usize) -> BackgroundStore {
+    /// A subagent store with `agents` running subagents (each needs a
+    /// live handle to count, so attach a never-ending spawned task).
+    fn agent_store(agents: usize) -> BackgroundStore {
         let store = BackgroundStore::new();
-        let mut n = 0;
-        for (kind, count) in [(TaskKind::Subagent, agents), (TaskKind::Shell, shells)] {
-            for _ in 0..count {
-                let id = format!("id{n}");
-                n += 1;
-                store.insert(id.clone(), kind);
-                let h = tokio::runtime::Handle::try_current()
-                    .ok()
-                    .map(|_| tokio::spawn(async { std::future::pending::<()>().await }));
-                if let Some(h) = h {
-                    store.attach_handle(&id, h);
-                }
+        for n in 0..agents {
+            let id = format!("a{n}");
+            store.insert(id.clone());
+            if tokio::runtime::Handle::try_current().is_ok() {
+                store.attach_handle(&id, tokio::spawn(std::future::pending::<()>()));
             }
         }
         store
     }
 
-    fn render(store: &BackgroundStore) -> String {
+    /// A shell store with `shells` running shells.
+    fn shell_store(shells: usize) -> BackgroundShellStore {
+        let store = BackgroundShellStore::new();
+        for n in 0..shells {
+            store.register(format!("s{n}"), "cmd".to_string());
+        }
+        store
+    }
+
+    fn render(agents: usize, shells: usize) -> String {
         let session = Session::new("openrouter", "test-model", 100_000);
-        StatusLine::render(&session, false, 0, None, None, None, Some(store))
+        let a = agent_store(agents);
+        let s = shell_store(shells);
+        StatusLine::render(&session, false, 0, None, None, None, Some(&a), Some(&s))
     }
 
     #[tokio::test]
     async fn badges_hidden_when_nothing_active() {
-        let line = render(&store_with(0, 0));
+        let line = render(0, 0);
         assert!(
             !line.contains("agents:"),
             "no agents badge expected: {line}"
@@ -196,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn agents_and_shells_counted_separately() {
-        let line = render(&store_with(2, 3));
+        let line = render(2, 3);
         assert!(line.contains("agents:2"), "expected agents:2 in: {line}");
         assert!(line.contains("shells:3"), "expected shells:3 in: {line}");
     }

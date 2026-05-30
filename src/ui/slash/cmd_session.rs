@@ -216,6 +216,20 @@ pub(super) async fn cmd_tasks(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
             theme::dim(),
         )?;
     }
+
+    // Background shells (bash background=true). Listed with their status
+    // so the user can see what's running and kill it via the model's
+    // kill_shell tool (or it auto-cleans on session end).
+    let shells = crate::agent::tools::bg_shell::global().list();
+    if !shells.is_empty() {
+        ctx.renderer.write_line("background shells:", c_result())?;
+        for s in &shells {
+            ctx.renderer.write_line(
+                &format!("  [{}] {} — {}", s.status.label(), s.id, s.command),
+                c_result(),
+            )?;
+        }
+    }
     Ok(())
 }
 

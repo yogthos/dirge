@@ -1,6 +1,7 @@
 pub(crate) mod apply_patch;
 pub(crate) mod background;
 mod bash;
+pub(crate) mod bg_shell;
 pub(crate) mod cache;
 pub(crate) mod edit;
 mod find_files;
@@ -30,6 +31,7 @@ pub(crate) mod write;
 
 pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
+pub use bg_shell::{BashOutputTool, KillShellTool};
 pub use cache::ToolCache;
 pub use edit::EditTool;
 pub use find_files::FindFilesTool;
@@ -88,6 +90,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "skill",
     "task",
     "task_status",
+    "bash_output",
+    "kill_shell",
     "tool_search",
     "question",
     "webfetch",

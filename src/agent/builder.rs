@@ -376,8 +376,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     sandbox.clone(),
                     cache.clone(),
                 )
-                .with_bg_store(bg_store.clone()),
+                .with_shell_store(Some(tools::bg_shell::global())),
             ),
+            Box::new(tools::BashOutputTool::new(tools::bg_shell::global())),
+            Box::new(tools::KillShellTool::new(tools::bg_shell::global())),
             Box::new(tools::GrepTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
@@ -759,11 +761,13 @@ pub async fn build_loop_tools(
                 sandbox.clone(),
                 cache.clone(),
             )
-            .with_bg_store(bg_store.clone()),
+            .with_shell_store(Some(tools::bg_shell::global())),
             Some(ToolExecutionMode::Sequential),
         )
         .await,
     );
+    tools.push(wrap(tools::BashOutputTool::new(tools::bg_shell::global()), None).await);
+    tools.push(wrap(tools::KillShellTool::new(tools::bg_shell::global()), None).await);
 
     // Read-only batch.
     tools.push(
