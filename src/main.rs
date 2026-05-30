@@ -1,6 +1,8 @@
 mod agent;
 mod cli;
 mod config;
+#[cfg(feature = "dap")]
+mod dap;
 mod context;
 mod event;
 mod extras;

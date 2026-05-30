@@ -1,0 +1,162 @@
+{
+    "gdb": {
+        "command": "gdb",
+        "args": ["-i", "dap"],
+        "languages": ["c", "cpp", "rust"],
+        "file_types": [".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".rs"],
+        "root_markers": ["Makefile", "CMakeLists.txt", "Cargo.toml", "compile_commands.json"],
+        "connect_mode": "stdio",
+        "launch_defaults": {
+            "request": "launch",
+            "stopOnEntry": true,
+            "stopAtBeginningOfMainSubprogram": true
+        },
+        "attach_defaults": {
+            "request": "attach"
+        }
+    },
+    "lldb-dap": {
+        "command": "lldb-dap",
+        "args": [],
+        "languages": ["c", "cpp", "objc", "swift", "rust", "zig"],
+        "file_types": [".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".swift", ".rs", ".zig"],
+        "root_markers": ["Package.swift", "Cargo.toml", "Makefile", "CMakeLists.txt", "build.zig"],
+        "connect_mode": "stdio",
+        "launch_defaults": {
+            "request": "launch",
+            "stopOnEntry": true
+        },
+        "attach_defaults": {
+            "request": "attach"
+        }
+    },
+    "codelldb": {
+        "command": "codelldb",
+        "args": ["--port", "0"],
+        "connect_mode": "socket",
+        "languages": ["c", "cpp", "rust", "zig"],
+        "file_types": [".c", ".cc", ".cpp", ".cxx", ".rs", ".zig"],
+        "root_markers": ["Cargo.toml", "CMakeLists.txt", "Makefile", "compile_commands.json", "build.zig"],
+        "launch_defaults": {
+            "request": "launch",
+            "stopOnEntry": true
+        },
+        "attach_defaults": {
+            "request": "attach"
+        }
+    },
+    "debugpy": {
+        "command": "python",
+        "args": ["-m", "debugpy.adapter"],
+        "languages": ["python"],
+        "file_types": [".py"],
+        "root_markers": ["pyproject.toml", "setup.py", "requirements.txt", "Pipfile"],
+        "connect_mode": "stdio",
+        "launch_defaults": {
+            "request": "launch",
+            "justMyCode": false,
+            "stopOnEntry": true
+        },
+        "attach_defaults": {
+            "request": "attach",
+            "justMyCode": false
+        }
+    },
+    "dlv": {
+        "command": "dlv",
+        "args": ["dap"],
+        "languages": ["go"],
+        "file_types": [".go"],
+        "root_markers": ["go.mod", "go.sum"],
+        "connect_mode": "socket",
+        "launch_defaults": {
+            "request": "launch",
+            "mode": "debug",
+            "stopOnEntry": true
+        },
+        "attach_defaults": {
+            "request": "attach",
+            "mode": "local"
+        }
+    },
+    "js-debug-adapter": {
+        "command": "js-debug-adapter",
+        "args": [],
+        "languages": ["javascript", "typescript"],
+        "file_types": [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"],
+        "root_markers": ["package.json", "tsconfig.json", "jsconfig.json"],
+        "connect_mode": "stdio",
+        "launch_defaults": {
+            "request": "launch",
+            "type": "pwa-node",
+            "stopOnEntry": true
+        },
+        "attach_defaults": {
+            "request": "attach",
+            "type": "pwa-node"
+        }
+    },
+    "rdbg": {
+        "command": "rdbg",
+        "args": ["--open", "--command", "--"],
+        "languages": ["ruby"],
+        "file_types": [".rb", ".rake", ".gemspec"],
+        "root_markers": ["Gemfile", "Rakefile", ".ruby-version"],
+        "connect_mode": "stdio",
+        "launch_defaults": {
+            "request": "launch",
+            "type": "rdbg"
+        },
+        "attach_defaults": {
+            "request": "attach",
+            "type": "rdbg"
+        }
+    },
+    "elixir-ls-debugger": {
+        "command": "elixir-ls-debugger",
+        "args": [],
+        "languages": ["elixir"],
+        "file_types": [".ex", ".exs", ".heex", ".eex"],
+        "root_markers": ["mix.exs", "mix.lock"],
+        "connect_mode": "stdio",
+        "launch_defaults": {
+            "request": "launch",
+            "type": "mix_task",
+            "task": "run",
+            "stopOnEntry": true
+        },
+        "attach_defaults": {
+            "request": "attach"
+        }
+    },
+    "jdtls-debug": {
+        "command": "jdtls",
+        "args": [],
+        "languages": ["java"],
+        "file_types": [".java"],
+        "root_markers": ["pom.xml", "build.gradle", "build.gradle.kts", ".project"],
+        "connect_mode": "stdio",
+        "launch_defaults": {
+            "request": "launch",
+            "stopOnEntry": true
+        },
+        "attach_defaults": {
+            "request": "attach"
+        }
+    },
+    "clojure-lsp-debug": {
+        "command": "clojure-lsp-debug",
+        "args": [],
+        "languages": ["clojure"],
+        "file_types": [".clj", ".cljs", ".cljc", ".edn"],
+        "root_markers": ["deps.edn", "project.clj", "shadow-cljs.edn", "build.clj"],
+        "connect_mode": "stdio",
+        "launch_defaults": {
+            "request": "launch",
+            "stopOnEntry": true
+        },
+        "attach_defaults": {
+            "request": "attach"
+        }
+    }
+}

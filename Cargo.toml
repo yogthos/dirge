@@ -120,6 +120,7 @@ semantic-cpp = ["semantic", "dep:tree-sitter-cpp"]
 semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
+dap = ["dep:which"]
 experimental-ui-tab-slash = []
 experimental-ui-terminal-tab = []
 
@@ -230,6 +231,14 @@ indexmap = "2"
 lsp-types = { version = "0.97", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
+# DAP (Debug Adapter Protocol) — optional feature for driving
+# debuggers (lldb-dap, dlv, debugpy, node) to fix crashes instead
+# of sprinkling print statements. Types are hand-rolled in
+# src/dap/types.rs — the dap-types crate on crates.io only has v0.0.1
+# which is too incomplete.
+# which: locate debug adapter binaries on the system PATH at session
+# startup rather than requiring explicit paths in config.
+which = { version = "8", optional = true }
 # YAML parser for skill frontmatter (replaces hand-rolled parser in
 # `src/extras/skills/format.rs`). `yaml-rust2` is the maintained fork
 # of the abandoned `yaml-rust` crate, fully YAML 1.2 compliant.

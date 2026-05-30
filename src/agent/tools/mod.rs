@@ -8,6 +8,8 @@ mod find_files;
 mod glob;
 mod grep;
 mod list_dir;
+#[cfg(feature = "dap")]
+pub(crate) mod debug;
 #[cfg(feature = "lsp")]
 mod lsp;
 mod memory;
@@ -40,6 +42,8 @@ pub use grep::GrepTool;
 pub use list_dir::ListDirTool;
 #[cfg(feature = "lsp")]
 pub use lsp::LspTool;
+#[cfg(feature = "dap")]
+pub use debug::DebugTool;
 pub use memory::MemoryTool;
 pub use plan::{PlanEnterTool, PlanExitTool};
 pub use question::QuestionTool;
@@ -97,6 +101,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "webfetch",
     "websearch",
     "lsp",
+    "debug",
     "repo_overview",
     "session_search",
     "list_symbols",
