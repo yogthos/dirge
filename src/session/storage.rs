@@ -6,6 +6,7 @@ fn session_dir() -> PathBuf {
     dirs_path().join("sessions")
 }
 
+#[cfg(not(test))]
 fn home_fallback() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -16,8 +17,22 @@ pub(crate) fn dirs_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("DIRGE_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    let base = dirs::data_dir().unwrap_or_else(home_fallback);
-    base.join("dirge")
+    // dirge-sn1k: tests must NEVER write to the user's real data dir.
+    // Several tests exercise the runtime `new_session` handler, which
+    // calls `save_session` — and they build fixtures with model "m" and
+    // "stale"/"outgoing" messages. Without isolation those persist into
+    // ~/.../dirge/sessions and pollute the user's recent-sessions list on
+    // every `cargo test`. Route all test writes to a per-process temp dir
+    // (DIRGE_DATA_DIR still wins, so tests can pick their own location).
+    #[cfg(test)]
+    {
+        return std::env::temp_dir().join(format!("dirge-test-data-{}", std::process::id()));
+    }
+    #[cfg(not(test))]
+    {
+        let base = dirs::data_dir().unwrap_or_else(home_fallback);
+        base.join("dirge")
+    }
 }
 
 pub(crate) fn config_path() -> PathBuf {
@@ -212,6 +227,34 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dirge-sn1k: under test, the data dir must route to a per-process
+    /// temp location (never the user's real ~/.../dirge), so persistence
+    /// tests can't leak fixtures into the recent-sessions list. (An
+    /// explicit DIRGE_DATA_DIR override still wins.)
+    #[test]
+    fn test_data_dir_is_isolated_to_temp() {
+        if std::env::var_os("DIRGE_DATA_DIR").is_some() {
+            return; // explicit override — isolation is the caller's choice
+        }
+        let p = dirs_path();
+        assert!(
+            p.starts_with(std::env::temp_dir()),
+            "test data dir must be under temp, got {p:?}"
+        );
+        assert!(p.to_string_lossy().contains("dirge-test-data"), "got {p:?}");
+        // And the real data dir must NOT be the session location in tests.
+        assert!(
+            !session_dir()
+                .to_string_lossy()
+                .contains("Application Support/dirge")
+                && !session_dir()
+                    .to_string_lossy()
+                    .ends_with(".local/share/dirge/sessions"),
+            "session_dir leaked to the real data dir: {:?}",
+            session_dir()
+        );
+    }
 
     #[test]
     fn validate_session_id_accepts_uuids() {
