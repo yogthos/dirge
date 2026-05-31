@@ -371,23 +371,42 @@ impl MemoryStore {
         let disk_entries = split_entries(&on_disk);
         let disk_entries = deduplicate_entries(disk_entries);
 
-        // Detect drift: if our in-memory entries don't match what's
-        // on disk (and the snapshot isn't the same either), someone
-        // modified the file externally.
-        if self.entries != disk_entries && self.snapshot != disk_entries {
-            // Snapshot the corrupted file and refuse.
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let bak = self.file_path.with_extension(format!("bak.{}", ts));
-            std::fs::rename(&self.file_path, &bak)
-                .map_err(|e| format!("External drift detected but failed to snapshot: {e}"))?;
+        // Detect drift: distinguish a benign concurrent append (another
+        // dirge process in the same project added entries) from a genuine
+        // external edit (a user hand-editing or corrupting the file).
+        //
+        // dirge-cdik: the old check (`entries != disk && snapshot != disk`)
+        // flagged ANY disk mismatch as corruption — so two sessions in one
+        // project made each other's legitimate appends look like external
+        // tampering, renaming MEMORY.md to .bak and refusing the write.
+        //
+        // New rule: treat disk as COMPATIBLE (accept it as truth) as long as
+        // every entry we already knew about — our load-time snapshot AND our
+        // current in-memory entries — is still present on disk. That covers
+        // concurrent appends. Only when disk has DROPPED or REWRITTEN an
+        // entry we knew about do we treat it as a real external edit worth
+        // preserving. (Limitation: a concurrent dirge REMOVE by another
+        // session looks like divergence and is conservatively preserved to
+        // .bak — no data is lost, just an extra backup.)
+        if self.entries != disk_entries {
+            let disk_set: std::collections::HashSet<&String> = disk_entries.iter().collect();
+            let snapshot_preserved = self.snapshot.iter().all(|e| disk_set.contains(e));
+            let entries_preserved = self.entries.iter().all(|e| disk_set.contains(e));
+            if !snapshot_preserved || !entries_preserved {
+                // Genuine external divergence — snapshot the file and refuse.
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let bak = self.file_path.with_extension(format!("bak.{}", ts));
+                std::fs::rename(&self.file_path, &bak)
+                    .map_err(|e| format!("External drift detected but failed to snapshot: {e}"))?;
 
-            return Err(format!(
-                "External drift detected — file was modified outside dirge. Original saved to {}.",
-                bak.display()
-            ));
+                return Err(format!(
+                    "External drift detected — file was modified outside dirge. Original saved to {}.",
+                    bak.display()
+                ));
+            }
         }
 
         // Accept disk state as truth.
@@ -593,7 +612,7 @@ impl FileLock {
         // staleness detection. If the process crashes, the lock
         // file remains — we detect this by checking whether the
         // PID in the lock file is still alive.
-        for attempt in 0..50 {
+        for _ in 0..50 {
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -607,10 +626,16 @@ impl FileLock {
                     return Ok(FileLock { path: path.clone() });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Check if the lock holder is still alive.
-                    if attempt == 0 && Self::is_lock_stale(path) {
+                    // dirge-3mx6: re-check staleness on EVERY attempt, not just
+                    // the first. The holder may crash AFTER we begin waiting;
+                    // the old `attempt == 0` gate meant the remaining 49 tries
+                    // never re-checked, so we'd time out against an orphan lock
+                    // left by a dead process. `is_lock_stale` only reports true
+                    // when the recorded PID is genuinely gone, so a live holder
+                    // is never stolen from.
+                    if Self::is_lock_stale(path) {
                         let _ = std::fs::remove_file(path);
-                        continue; // Retry immediately.
+                        continue; // Retry immediately to claim it.
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
@@ -835,6 +860,122 @@ mod tests {
 
         let err = store.remove("nonexistent").unwrap_err();
         assert!(err.contains("No entry found"), "got: {err}");
+    }
+
+    /// dirge-cdik: two dirge sessions in one project. A legitimate
+    /// concurrent append by session B must NOT make session A's next write
+    /// see the file as externally corrupted — no `.bak`, no refusal.
+    #[test]
+    fn concurrent_append_by_another_session_is_not_drift() {
+        let (paths, _dir) = temp_project();
+        // Seed disk with one entry.
+        {
+            let mut seed = MemoryStore::load_memory(&paths).unwrap();
+            seed.add("entry one").unwrap();
+        }
+        // Two sessions load the same project independently.
+        let mut session_a = MemoryStore::load_memory(&paths).unwrap();
+        let mut session_b = MemoryStore::load_memory(&paths).unwrap();
+
+        // Session B appends — a legitimate concurrent write.
+        session_b.add("entry two from B").unwrap();
+
+        // Session A now appends. The old code saw disk=[one,two] ≠ its
+        // snapshot/entries=[one], renamed MEMORY.md to .bak, and refused.
+        // With the fix it accepts the compatible superset and appends.
+        session_a
+            .add("entry three from A")
+            .expect("concurrent append must not be treated as drift");
+
+        let dir = paths.memory_dir();
+        let baks: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak"))
+            .collect();
+        assert!(
+            baks.is_empty(),
+            "no .bak should be created on a concurrent append, found {baks:?}"
+        );
+
+        let on_disk = std::fs::read_to_string(paths.memory_file("MEMORY.md")).unwrap();
+        assert!(on_disk.contains("entry one"));
+        assert!(on_disk.contains("entry two from B"));
+        assert!(on_disk.contains("entry three from A"));
+    }
+
+    /// dirge-cdik: a genuinely destructive external edit (a known entry
+    /// removed / rewritten by hand) is still detected as drift and the file
+    /// preserved to a `.bak`.
+    #[test]
+    fn genuine_external_edit_still_detected_as_drift() {
+        let (paths, _dir) = temp_project();
+        {
+            let mut seed = MemoryStore::load_memory(&paths).unwrap();
+            seed.add("original entry").unwrap();
+        }
+        let mut session = MemoryStore::load_memory(&paths).unwrap();
+
+        // A user hand-edits the file, REPLACING the known entry.
+        crate::fs_atomic::atomic_write_sync(
+            &paths.memory_file("MEMORY.md"),
+            "totally different hand-written note\n".as_bytes(),
+        )
+        .unwrap();
+
+        let err = session.add("new entry").unwrap_err();
+        assert!(err.contains("External drift"), "got: {err}");
+
+        let dir = paths.memory_dir();
+        let has_bak = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".bak"));
+        assert!(
+            has_bak,
+            "destructive external edit must be snapshotted to .bak"
+        );
+    }
+
+    /// dirge-3mx6: a lock holder that crashes AFTER we start waiting must
+    /// still be reclaimed. We seed the lock with our own (live) PID so the
+    /// first attempt sees it as held, then a background thread rewrites it
+    /// with a genuinely-dead PID mid-wait. The old `attempt == 0`-only
+    /// staleness check would never re-inspect and would time out; the
+    /// per-attempt check reclaims it.
+    #[cfg(unix)]
+    #[test]
+    fn stale_lock_is_reclaimed_after_attempt_zero() {
+        let (_paths, dir) = temp_project();
+        let lock_path = dir.join("reclaim.lock");
+
+        // Attempt 0: lock holds THIS (live) process's PID → not stale.
+        std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
+
+        // A genuinely-dead PID: spawn a child, then reap it.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn helper process");
+        let dead_pid = child.id();
+        child.wait().unwrap(); // reaped → PID no longer alive
+
+        // Mid-wait, replace the live PID with the dead one (holder crash).
+        let lp = lock_path.clone();
+        let swapper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::fs::write(&lp, dead_pid.to_string()).unwrap();
+        });
+
+        // Must NOT time out: once the lock goes stale, the per-attempt
+        // re-check clears it and we claim the lock.
+        let lock =
+            FileLock::acquire(&lock_path).expect("stale lock must be reclaimed, not time out");
+        swapper.join().unwrap();
+        drop(lock); // Drop removes the lock file.
+        assert!(
+            !lock_path.exists(),
+            "lock file should be cleaned up on drop"
+        );
     }
 
     #[test]

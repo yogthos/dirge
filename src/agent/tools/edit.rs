@@ -205,12 +205,16 @@ impl Tool for EditTool {
             )));
         }
 
+        // dirge-nj6d: the fuzzy fallback matchers can return OVERLAPPING
+        // byte ranges (e.g. the whitespace-normalized matcher tries block
+        // sizes up to +5, so two different start lines can cover the same
+        // region). Splicing overlapping ranges — even in reverse — corrupts
+        // the buffer or panics at a non-char boundary inside
+        // `replace_range`. Keep only a disjoint set so every downstream
+        // consumer (ambiguity count + replace_all splice) is safe.
+        let match_ranges: Vec<(usize, usize)> = keep_disjoint_ranges(match_positions);
         // Reduce to start positions for backwards compat with the
         // downstream ambiguity-reporting and replacement logic.
-        // Each "position" still refers to the START of a match;
-        // the actual matched length is captured via the byte range
-        // for replacement below.
-        let match_ranges: Vec<(usize, usize)> = match_positions;
         let match_positions: Vec<usize> = match_ranges.iter().map(|(s, _)| *s).collect();
 
         let do_replace_all = args.replace_all.unwrap_or(false);
@@ -399,6 +403,25 @@ impl Tool for EditTool {
 // end_byte) byte ranges in `content` that match `find` under the
 // helper's normalization. Empty Vec = no matches. The cascade
 // tries each in priority order in the call site above.
+
+/// dirge-nj6d: reduce a set of (start, end) byte ranges to a disjoint
+/// subset. Sorts by start and greedily keeps a range only if it begins
+/// at or after the previously-kept range's end; overlapping ranges are
+/// dropped. This protects the reverse-order `replace_range` splice from
+/// corruption / non-char-boundary panics when the fuzzy matchers emit
+/// overlapping candidates. Stable preference: the earliest-starting
+/// range of any overlapping cluster wins.
+fn keep_disjoint_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_by_key(|r| r.0);
+    let mut disjoint: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match disjoint.last() {
+            Some(&(_, last_end)) if start < last_end => {} // overlaps kept → drop
+            _ => disjoint.push((start, end)),
+        }
+    }
+    disjoint
+}
 
 /// Line-trimmed match. Match each logical block of N lines where
 /// each line's .trim() equals the corresponding find line's
@@ -630,5 +653,56 @@ mod fuzzy_tests {
         assert_eq!(m.len(), 1);
         let (s, e) = m[0];
         assert_eq!(&content[s..e], "        let x = 1;\n        let y = 2;");
+    }
+
+    // ── dirge-nj6d: overlapping-range dedup for replace_all ──
+
+    #[test]
+    fn keep_disjoint_drops_overlaps_keeps_earliest() {
+        // Two overlapping clusters; earliest-starting range of each wins.
+        let input = vec![(0, 10), (5, 15), (12, 20), (20, 25)];
+        assert_eq!(
+            keep_disjoint_ranges(input),
+            vec![(0, 10), (12, 20), (20, 25)],
+        );
+    }
+
+    #[test]
+    fn keep_disjoint_sorts_unsorted_input() {
+        // Unsorted input with a nested range fully inside an earlier one.
+        let input = vec![(20, 25), (0, 30), (5, 8)];
+        // After sort: (0,30),(5,8),(20,25). (5,8) and (20,25) both inside
+        // (0,30) → dropped.
+        assert_eq!(keep_disjoint_ranges(input), vec![(0, 30)]);
+    }
+
+    #[test]
+    fn keep_disjoint_adjacent_ranges_are_kept() {
+        // end-exclusive: (0,5) and (5,10) touch but don't overlap.
+        let input = vec![(0, 5), (5, 10)];
+        assert_eq!(keep_disjoint_ranges(input), vec![(0, 5), (5, 10)]);
+    }
+
+    #[test]
+    fn keep_disjoint_empty() {
+        assert!(keep_disjoint_ranges(Vec::new()).is_empty());
+    }
+
+    /// Mirrors the call-site reverse-order `replace_range` splice over a
+    /// set that originated as OVERLAPPING matcher output. Without
+    /// `keep_disjoint_ranges` this corrupts the buffer (and can panic at a
+    /// non-char boundary); with it, the splice is safe and correct.
+    #[test]
+    fn replace_all_reverse_splice_over_deduped_ranges_is_safe() {
+        let content = "aXbXc".to_string();
+        // (1,3) and (1,2) overlap; (3,4) is disjoint.
+        let overlapping = vec![(1, 3), (1, 2), (3, 4)];
+        let ranges = keep_disjoint_ranges(overlapping);
+        assert_eq!(ranges, vec![(1, 3), (3, 4)]);
+        let mut out = content.clone();
+        for (s, e) in ranges.into_iter().rev() {
+            out.replace_range(s..e, "_");
+        }
+        assert_eq!(out, "a__c");
     }
 }

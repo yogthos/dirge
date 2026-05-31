@@ -270,9 +270,13 @@ impl LspManager {
         root: &Path,
         key: &(PathBuf, String),
     ) -> Option<Arc<ClientEntry>> {
-        // If another caller is already spawning this key, wait for them
-        // instead of racing.
-        let wait_for: Option<Arc<Notify>> = {
+        // Decide our role under the lock, then RELEASE it before any await
+        // (the MutexGuard is not Send and must not cross `.await`).
+        enum Slot {
+            Wait(Arc<Notify>),
+            Spawn(Arc<Notify>),
+        }
+        let slot = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             // Re-check cache under the lock — could have landed between
             // the fast-path miss and now.
@@ -283,30 +287,49 @@ impl LspManager {
                 return None;
             }
             if let Some(notify) = state.spawning.get(key) {
-                Some(Arc::clone(notify))
+                Slot::Wait(Arc::clone(notify))
             } else {
-                // We're the spawner. Mark in-flight.
+                // We're the spawner. Mark in-flight and keep the handle.
                 let notify = Arc::new(Notify::new());
                 state.spawning.insert(key.clone(), Arc::clone(&notify));
-                None
+                Slot::Spawn(notify)
             }
         };
 
-        if let Some(notify) = wait_for {
-            // Safety timeout in case we subscribed after `notify_waiters` fired
-            // (Notify doesn't save permits for late subscribers). The cache is
-            // authoritative either way — re-check after the wait, regardless
-            // of how it terminated.
-            let _ = tokio::time::timeout(Duration::from_secs(60), notify.notified()).await;
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = state.clients.get(key) {
-                return Some(Arc::clone(entry));
+        // If another caller is already spawning this key, wait for them
+        // instead of racing.
+        let spawn_notify = match slot {
+            Slot::Wait(notify) => {
+                // Safety timeout in case we subscribed after `notify_waiters`
+                // fired (Notify doesn't save permits for late subscribers).
+                // The cache is authoritative either way — re-check after the
+                // wait, regardless of how it terminated.
+                let _ = tokio::time::timeout(Duration::from_secs(60), notify.notified()).await;
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = state.clients.get(key) {
+                    return Some(Arc::clone(entry));
+                }
+                return None;
             }
-            return None;
-        }
+            Slot::Spawn(notify) => notify,
+        };
+
+        // dirge-gt8c: arm a Drop guard so a cancelled future (Ctrl-C during a
+        // cold spawn) releases the slot + wakes waiters instead of orphaning
+        // it. The normal completion path below disarms it.
+        let mut slot_guard = SpawnSlotGuard {
+            state: Arc::clone(&self.state),
+            key: key.clone(),
+            notify: Arc::clone(&spawn_notify),
+            armed: true,
+        };
 
         // We're responsible for the spawn.
         let result = self.do_spawn(server, root).await;
+
+        // Reached completion under our own control — disarm; the two-phase
+        // cleanup below removes the slot and notifies waiters itself.
+        slot_guard.armed = false;
 
         // Two-phase: update state under the lock, then log + signal outside.
         // Slot-disappeared warning is captured for emit after lock release.
@@ -757,6 +780,37 @@ enum SpawnOutcome {
     },
 }
 
+/// dirge-gt8c: RAII guard held by the caller responsible for a spawn.
+/// If that caller's future is dropped mid-spawn (e.g. Ctrl-C during a
+/// cold rust-analyzer / jdtls startup), the in-flight `spawning` slot
+/// would otherwise be orphaned — every later caller then blocks on the
+/// stale `Notify`, times out, and gets `None`, leaving the server
+/// permanently unspawnable for the session. On drop the guard removes
+/// the slot and wakes any waiters so the next request re-attempts the
+/// spawn. The normal completion path disarms the guard (`armed = false`)
+/// because it removes + notifies the slot itself.
+struct SpawnSlotGuard {
+    state: Arc<Mutex<ManagerState>>,
+    key: (PathBuf, String),
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl Drop for SpawnSlotGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.spawning.remove(&self.key);
+        }
+        // Wake waiters AFTER releasing the lock — they re-check the cache,
+        // find no client, and one of them becomes the new spawner.
+        self.notify.notify_waiters();
+    }
+}
+
 impl ClientEntry {
     #[allow(dead_code)]
     pub fn server_id(&self) -> &str {
@@ -792,8 +846,9 @@ mod tests {
         spawn_calls: StdArc<AtomicUsize>,
         fail_keys: std::sync::Mutex<std::collections::HashSet<(String, PathBuf)>>,
         /// Delay each spawn by this much so concurrent calls have a chance
-        /// to collide on the dedupe path.
-        delay_ms: u64,
+        /// to collide on the dedupe path. Atomic so tests can lengthen it
+        /// (to park a spawn for cancellation) then shorten it for a retry.
+        delay_ms: std::sync::atomic::AtomicU64,
     }
 
     impl CountingSpawner {
@@ -801,11 +856,14 @@ mod tests {
             Self {
                 spawn_calls: StdArc::new(AtomicUsize::new(0)),
                 fail_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
-                delay_ms,
+                delay_ms: std::sync::atomic::AtomicU64::new(delay_ms),
             }
         }
         fn count(&self) -> usize {
             self.spawn_calls.load(Ordering::SeqCst)
+        }
+        fn set_delay(&self, ms: u64) {
+            self.delay_ms.store(ms, Ordering::SeqCst);
         }
         fn fail_for(&self, server_id: &str, root: &Path) {
             self.fail_keys
@@ -826,8 +884,9 @@ mod tests {
         ) -> BoxFuture<'a, std::io::Result<Spawned>> {
             Box::pin(async move {
                 self.spawn_calls.fetch_add(1, Ordering::SeqCst);
-                if self.delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+                let delay = self.delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
                 if self
                     .fail_keys
@@ -917,6 +976,57 @@ mod tests {
         let clients2 = manager.get_clients(&file).await;
         assert_eq!(clients2.len(), 1);
         assert_eq!(spawner.count(), 1);
+
+        std::fs::remove_dir_all(&tree).ok();
+    }
+
+    /// dirge-gt8c: if the spawner's future is dropped mid-spawn (Ctrl-C
+    /// during a cold rust-analyzer/jdtls startup), the in-flight slot must
+    /// be released and waiters woken — otherwise that server is
+    /// permanently unspawnable for the session. Asserts (1) the slot is
+    /// freed after cancellation and (2) a subsequent call re-spawns and
+    /// succeeds rather than hanging on the orphaned `Notify`.
+    #[tokio::test]
+    async fn cancelled_spawn_releases_slot_for_retry() {
+        let tree = cargo_tree("cancel-retry");
+        // Long cold-spawn delay so we can cancel while it's in-flight.
+        let spawner = StdArc::new(CountingSpawner::new(10_000));
+        let manager = LspManager::new(spawner.clone(), tree.clone());
+        let file = tree.join("src/lib.rs");
+
+        // Start the spawn, drive it until it parks in the slow do_spawn
+        // await, then drop the future (simulating an abort).
+        {
+            let fut = manager.get_clients(&file);
+            tokio::pin!(fut);
+            let _ = tokio::time::timeout(Duration::from_millis(250), &mut fut).await;
+            // `fut` dropped at end of block → SpawnSlotGuard fires.
+        }
+        // Let the guard's lock/notify settle.
+        tokio::task::yield_now().await;
+        assert_eq!(spawner.count(), 1, "first spawn should have been attempted");
+
+        // The in-flight slot must be gone.
+        {
+            let state = manager.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                state.spawning.is_empty(),
+                "cancelled spawn must release its in-flight slot, got {:?}",
+                state.spawning.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                state.broken.is_empty(),
+                "a cancelled (not failed) spawn must not mark the server broken",
+            );
+        }
+
+        // A retry must actually re-spawn and succeed — proving the server
+        // is NOT permanently disabled. Shorten the delay so it completes.
+        spawner.set_delay(0);
+        let clients = manager.get_clients(&file).await;
+        assert_eq!(clients.len(), 1, "retry after cancellation must succeed");
+        assert_eq!(clients[0].server_id(), "rust");
+        assert_eq!(spawner.count(), 2, "retry must spawn afresh");
 
         std::fs::remove_dir_all(&tree).ok();
     }
