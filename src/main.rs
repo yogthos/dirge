@@ -16,6 +16,7 @@ mod semantic;
 mod session;
 mod shell;
 mod skill;
+mod text;
 mod ui;
 
 #[cfg(test)]

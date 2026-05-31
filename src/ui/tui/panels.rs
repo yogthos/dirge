@@ -392,10 +392,7 @@ fn paint_subagent_list(buf: &mut Buffer, area: Rect, rows: &[SubagentStatusRow])
                 file.clone()
             } else {
                 // Left-truncate to preserve basename.
-                format!(
-                    "…{}",
-                    &file[file.len().saturating_sub(file_avail.saturating_sub(1))..]
-                )
+                format!("…{}", crate::text::tail(file, file_avail.saturating_sub(1)))
             };
             buf.set_stringn(
                 area.x + file_indent,

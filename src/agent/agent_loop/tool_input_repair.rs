@@ -1097,7 +1097,7 @@ pub fn format_structured_error(schema: &Value, args: &Value, errors: &[String]) 
     let summary = errors.join("; ");
     let args_str = serde_json::to_string(args).unwrap_or_default();
     let truncated = if args_str.len() > 200 {
-        format!("{}…", &args_str[..200])
+        format!("{}…", crate::text::head(&args_str, 200))
     } else {
         args_str
     };
@@ -2013,5 +2013,23 @@ mod tests {
         assert_eq!(snap.truncation_fixed, 2);
         assert_eq!(snap.total_successful(), 2);
         assert!(!snap.is_empty());
+    }
+
+    /// dirge-fb8t: a validation failure whose args carry multibyte UTF-8
+    /// crossing the 200-byte truncation cut must NOT panic the agent run.
+    /// Before the char-boundary fix this slice (`&args_str[..200]`) panicked.
+    #[test]
+    fn format_structured_error_does_not_panic_on_multibyte_args() {
+        // Force a multibyte char to straddle byte offset 200.
+        let mut content = "a".repeat(199);
+        content.push('世'); // 3 bytes at offsets 199..202
+        content.push_str(&"b".repeat(50));
+        let args = serde_json::json!({ "content": content });
+        let schema = serde_json::json!({"type": "object"});
+        let out = format_structured_error(&schema, &args, &["missing field `path`".into()]);
+        assert!(out.contains("missing field"), "got: {out}");
+        // Also exercise the path-style emoji case.
+        let args2 = serde_json::json!({ "path": "/tmp/файл😀".to_string() + &"x".repeat(220) });
+        let _ = format_structured_error(&schema, &args2, &["bad".into()]);
     }
 }

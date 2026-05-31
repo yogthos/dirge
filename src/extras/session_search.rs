@@ -448,7 +448,7 @@ fn truncate_content(content: &str, max_len: usize) -> String {
     }
     format!(
         "{}…[{} more chars]",
-        &content[..max_len.saturating_sub(20)],
+        crate::text::head(content, max_len.saturating_sub(20)),
         content.len() - max_len
     )
 }

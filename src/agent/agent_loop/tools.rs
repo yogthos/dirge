@@ -290,7 +290,7 @@ async fn prepare_tool_call(
             let original_truncated: String = if original_args.len() > 4096 {
                 format!(
                     "{}... ({} bytes truncated)",
-                    &original_args[..4096],
+                    crate::text::head(&original_args, 4096),
                     original_args.len() - 4096
                 )
             } else {
@@ -346,7 +346,7 @@ async fn prepare_tool_call(
             let original_truncated: String = if original_args.len() > 16384 {
                 format!(
                     "{}... ({} bytes truncated)",
-                    &original_args[..16384],
+                    crate::text::head(&original_args, 16384),
                     original_args.len() - 16384
                 )
             } else {

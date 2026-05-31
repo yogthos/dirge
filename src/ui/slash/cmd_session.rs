@@ -26,7 +26,7 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                 ctx.renderer.write_line(
                     &format!(
                         "  {}  {}  {}msgs  {}  {}",
-                        &s.id[..8],
+                        crate::text::head(&s.id, 8),
                         time,
                         s.messages.len(),
                         s.model,
@@ -55,7 +55,7 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                         .write_line(&format!("failed to delete: {}", e), c_error())?;
                 } else {
                     ctx.renderer.write_line(
-                        &format!("deleted session {} {}", &id[..8], preview),
+                        &format!("deleted session {} {}", crate::text::head(&id, 8), preview),
                         c_agent(),
                     )?;
                 }
@@ -76,7 +76,7 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                 ctx.renderer.write_line(
                     &format!(
                         "  {}  {}  {}msgs  {}  {}",
-                        &s.id[..8],
+                        crate::text::head(&s.id, 8),
                         time,
                         s.messages.len(),
                         s.model,
@@ -182,7 +182,7 @@ pub(super) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                 ctx.renderer.write_line(
                     &format!(
                         "  {}  {}  {}msgs  {}  {}",
-                        &s.id[..8],
+                        crate::text::head(&s.id, 8),
                         time,
                         s.messages.len(),
                         s.model,

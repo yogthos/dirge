@@ -577,7 +577,7 @@ fn truncate_for_error(s: &str) -> String {
     if s.len() <= 60 {
         s.to_string()
     } else {
-        format!("{}…", &s[..57])
+        format!("{}…", crate::text::head(s, 57))
     }
 }
 
