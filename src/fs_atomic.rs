@@ -78,16 +78,27 @@ fn existing_mode(_target: &Path) -> Option<u32> {
 /// use the existing `From<io::Error>` conversions in their error
 /// types (e.g. `ToolError`).
 pub fn atomic_write_sync(target: &Path, content: &[u8]) -> io::Result<()> {
+    // Existing direct callers (session / memory / skills state) keep the
+    // owner-only (0600) hardening for new files.
+    atomic_write_inner(target, content, /* private */ true)
+}
+
+/// dirge-i5pu: shared impl. `private` controls the new-file mode — `true`
+/// forces owner-only 0600 (session/memory state); `false` lets new files
+/// inherit the umask (≈0644), which is correct for agent-created PROJECT
+/// files written by the `write`/`edit`/`apply_patch` tools (forcing 0600
+/// on those was a regression — they became un-readable group/other).
+fn atomic_write_inner(target: &Path, content: &[u8], private: bool) -> io::Result<()> {
     let prev_mode = existing_mode(target);
     let tmp = next_temp(target);
     let result: io::Result<()> = (|| {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;
-        // SESS-3: Session files contain user prompts, file contents,
-        // and command outputs — restrict to owner-only (0600).
-        // Only set on new files; existing file mode is preserved below.
+        // SESS-3: session/memory files contain user prompts, file contents,
+        // and command outputs — restrict to owner-only (0600). Only on new
+        // private files; existing file mode is preserved below.
         #[cfg(unix)]
-        if prev_mode.is_none() {
+        if private && prev_mode.is_none() {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
         }
@@ -123,12 +134,18 @@ pub fn atomic_write_sync(target: &Path, content: &[u8]) -> io::Result<()> {
 /// internally. We don't use `tokio::fs` here because we want the
 /// create + fsync + chmod + rename sequence to happen in one
 /// blocking task without yielding between steps.
+///
+/// dirge-i5pu: these are PROJECT files the user edits/reads outside
+/// dirge, so new files inherit the umask (`private = false`) rather than
+/// the owner-only 0600 used for session/memory state.
 pub async fn atomic_write(target: &Path, content: &[u8]) -> io::Result<()> {
     let target = target.to_path_buf();
     let bytes = content.to_vec();
-    tokio::task::spawn_blocking(move || atomic_write_sync(&target, &bytes))
-        .await
-        .map_err(|e| io::Error::other(format!("spawn_blocking join failed: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        atomic_write_inner(&target, &bytes, /* private */ false)
+    })
+    .await
+    .map_err(|e| io::Error::other(format!("spawn_blocking join failed: {e}")))?
 }
 
 #[cfg(test)]
@@ -220,6 +237,42 @@ mod tests {
         atomic_write_sync(&target, b"#!/bin/sh\necho new").unwrap();
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "executable bit dropped");
+    }
+
+    /// dirge-i5pu: private writes (session/memory state) force a new
+    /// file to owner-only 0600.
+    #[cfg(unix)]
+    #[test]
+    fn private_write_new_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("priv");
+        let target = dir.path().join("session.json");
+        atomic_write_sync(&target, b"secret").unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "session/memory files must be owner-only");
+    }
+
+    /// dirge-i5pu: agent-authored PROJECT files (write/edit/apply_patch,
+    /// via the async `atomic_write` → `private = false`) must NOT be
+    /// forced to 0600 — they inherit the umask exactly like a plain
+    /// `File::create`, so the user can read them outside dirge. Compared
+    /// against a reference create to stay deterministic under any umask.
+    #[cfg(unix)]
+    #[test]
+    fn project_write_matches_umask_like_plain_create() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("proj");
+        let reference = dir.path().join("reference");
+        std::fs::File::create(&reference).unwrap();
+        let want = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+
+        let target = dir.path().join("src.rs");
+        atomic_write_inner(&target, b"fn main() {}", false).unwrap();
+        let got = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            got, want,
+            "project file mode should follow the umask (like a plain create), not be forced to 0600"
+        );
     }
 
     /// Crash simulation: write a temp manually but skip the

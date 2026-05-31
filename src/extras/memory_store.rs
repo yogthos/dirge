@@ -96,7 +96,7 @@ const INVISIBLE_CHARS: &[char] = &[
     '\u{200c}', // zero-width non-joiner
     '\u{200d}', // zero-width joiner
     '\u{2060}', // word joiner
-    '\u{fef}',  // BOM / zero-width no-break space
+    '\u{feff}', // BOM / zero-width no-break space
     '\u{202a}', // left-to-right embedding
     '\u{202b}', // right-to-left embedding
     '\u{202c}', // pop directional formatting
@@ -752,6 +752,12 @@ mod tests {
     #[test]
     fn scan_rejects_invisible_unicode() {
         assert!(scan_for_threats("hello\u{200b}world").is_err());
+        // dirge-q14a: the real BOM / zero-width-no-break-space is U+FEFF
+        // (the list previously had U+0FEF, so this slipped through).
+        assert!(
+            scan_for_threats("data\u{feff}exfil").is_err(),
+            "U+FEFF must be blocked"
+        );
     }
 
     // ── MemoryStore operations ───────────────────────────

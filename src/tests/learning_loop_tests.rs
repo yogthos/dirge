@@ -243,8 +243,10 @@ fn memory_store_invisible_unicode_is_blocked() {
     let store = MemoryToolStore::load(&paths).unwrap();
 
     // Full set of invisible characters should be blocked.
+    // dirge-q14a: U+FEFF (BOM / ZWNBSP) — was the wrong U+0FEF, which is a
+    // visible Tibetan-block codepoint and never an injection marker.
     for ch in &[
-        '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{fef}', '\u{202a}', '\u{202b}',
+        '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}', '\u{202a}', '\u{202b}',
         '\u{202c}', '\u{202d}', '\u{202e}',
     ] {
         let content = format!("hello{ch}world");

@@ -550,8 +550,10 @@ pub(crate) fn first_external_path(
 /// a legitimate filesystem reference and would canonicalize to
 /// `working_dir` itself, falsely classifying as internal.
 fn extract_arg_paths(args: &JsonObject) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    // Pass 1: whitelisted keys.
+    // dirge-70t8: walk the WHOLE argument tree, not just top-level fields.
+    // The external-path guard previously inspected only top-level scalars,
+    // so any MCP server whose schema nests path args (e.g. `{edits:[{path:…}]}`
+    // or `{options:{cwd:…}}`) bypassed it entirely.
     const PATH_KEYS: &[&str] = &[
         "path",
         "file_path",
@@ -570,47 +572,46 @@ fn extract_arg_paths(args: &JsonObject) -> Vec<String> {
         "output_file",
         "working_dir",
         "target_dir",
+        "paths",
     ];
-    for key in PATH_KEYS {
-        if let Some(s) = args.get(*key).and_then(|v| v.as_str())
-            && !s.is_empty()
-        {
-            out.push(s.to_string());
-        }
+    fn key_is_pathlike(k: &str) -> bool {
+        PATH_KEYS.contains(&k)
     }
-    if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
-        for v in arr {
-            if let Some(s) = v.as_str()
-                && !s.is_empty()
-            {
-                out.push(s.to_string());
+    // A string under a whitelisted key is taken verbatim; any other
+    // path-shaped string (absolute / ./ / ../ / ~/) is taken by the
+    // conservative heuristic so URLs / regex / arbitrary text don't trip
+    // the guard.
+    fn walk(v: &serde_json::Value, key_pathlike: bool, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => {
+                if s.is_empty() {
+                    return;
+                }
+                if key_pathlike
+                    || s.starts_with('/')
+                    || s.starts_with("./")
+                    || s.starts_with("../")
+                    || s.starts_with("~/")
+                {
+                    out.push(s.clone());
+                }
             }
+            serde_json::Value::Array(arr) => {
+                for e in arr {
+                    walk(e, key_pathlike, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    walk(val, key_is_pathlike(k), out);
+                }
+            }
+            _ => {}
         }
     }
-    // Pass 2: fallback — any other top-level scalar that looks
-    // path-shaped. Skips keys already covered in pass 1 to avoid
-    // duplicates.
-    let seen_keys: std::collections::HashSet<&str> = PATH_KEYS
-        .iter()
-        .copied()
-        .chain(std::iter::once("paths"))
-        .collect();
-    for (key, val) in args.iter() {
-        if seen_keys.contains(key.as_str()) {
-            continue;
-        }
-        let Some(s) = val.as_str() else { continue };
-        if s.is_empty() {
-            continue;
-        }
-        // Path-shaped heuristic. Conservative: only catches
-        // absolute / explicitly-relative / home-anchored
-        // prefixes so URLs (`https://…`), regex (`.*/foo`),
-        // and arbitrary strings don't trip the guard.
-        if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") || s.starts_with("~/")
-        {
-            out.push(s.to_string());
-        }
+    let mut out: Vec<String> = Vec::new();
+    for (k, val) in args.iter() {
+        walk(val, key_is_pathlike(k), &mut out);
     }
     out
 }
@@ -855,6 +856,57 @@ mod tests {
         });
         let obj = args.as_object().unwrap().clone();
         assert!(first_external_path(&perm, &obj, false).is_none());
+    }
+
+    /// dirge-70t8: the guard walks the WHOLE argument tree, not just
+    /// top-level fields. An MCP whose schema NESTS path args inside an
+    /// object or an array-of-objects (e.g. `{edits:[{path:…}]}`,
+    /// `{options:{cwd:…}}`) must not bypass the external-path guard.
+    #[test]
+    fn mcp_external_path_guard_recurses_into_nested_args() {
+        let (perm, _cwd) = mk_perm(PermissionConfig::default());
+
+        // Whitelisted key nested inside an object.
+        let args = serde_json::json!({"options": {"cwd": "/etc"}});
+        let obj = args.as_object().unwrap().clone();
+        assert!(
+            first_external_path(&perm, &obj, false).is_some(),
+            "nested whitelisted key should be caught",
+        );
+
+        // Whitelisted key inside an array of objects.
+        let args = serde_json::json!({
+            "edits": [
+                {"path": "src/in_cwd.rs", "contents": "ok"},
+                {"path": "/etc/passwd", "contents": "evil"},
+            ],
+        });
+        let obj = args.as_object().unwrap().clone();
+        assert!(
+            first_external_path(&perm, &obj, false).is_some(),
+            "external path in array-of-objects should be caught",
+        );
+
+        // Path-shaped scalar deep in a nested structure (non-whitelisted
+        // key) → still caught by the heuristic at depth.
+        let args = serde_json::json!({"payload": {"items": ["ok", "/etc/shadow"]}});
+        let obj = args.as_object().unwrap().clone();
+        assert!(
+            first_external_path(&perm, &obj, false).is_some(),
+            "path-shaped scalar in nested array should be caught",
+        );
+
+        // No external path anywhere in a nested structure → no false
+        // positive (URLs / arbitrary strings stay clean at depth too).
+        let args = serde_json::json!({
+            "options": {"url": "https://example.com", "label": "foo/bar"},
+            "edits": [{"note": "nothing path-shaped"}],
+        });
+        let obj = args.as_object().unwrap().clone();
+        assert!(
+            first_external_path(&perm, &obj, false).is_none(),
+            "nested non-path values must not trip the guard",
+        );
     }
 
     /// `allow_external_paths` is round-trip-deserializable on both

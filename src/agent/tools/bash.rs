@@ -761,7 +761,30 @@ async fn check_bash_segments(
             claims.push(cmd_claim(command));
         } else {
             for segment in quote_aware_split(command) {
-                claims.push(cmd_claim(&segment));
+                claims.push(cmd_claim(segment));
+            }
+            // dirge-9bqy: route redirect/mutation targets through Edit so
+            // the write deny-lists + external-dir gate govern them, same as
+            // the semantic-bash path. Relative targets classify against the
+            // project root (no `cd`-folding here — that refinement is
+            // semantic-only; absolute out-of-tree writes are the gap that
+            // matters and are caught). Skipped on `has_substitution` since
+            // a whole-command claim already forces confirmation there.
+            let working_dir = {
+                let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+                g.working_dir().to_string()
+            };
+            let path_claim = |target: &str| {
+                Claim::new(
+                    Operation::Edit,
+                    crate::permission::engine::classify_path(target, &working_dir),
+                )
+            };
+            for target in coarse_redirect_targets(command) {
+                claims.push(path_claim(&target));
+            }
+            for path in coarse_mutation_paths(command) {
+                claims.push(path_claim(&path));
             }
         }
     }
@@ -886,6 +909,124 @@ fn push_segment<'a>(command: &'a str, start: usize, end: usize, out: &mut Vec<&'
     if !s.is_empty() {
         out.push(s);
     }
+}
+
+/// dirge-9bqy: coarse redirect-target scan for the no-`semantic-bash`
+/// build. Without tree-sitter we still must not let `echo x > /etc/passwd`
+/// write outside the project ungated. Walks the command outside single/
+/// double quotes and, on a `>`/`>>` operator (a leading fd digit or `&`
+/// has already been consumed as a normal byte), captures the next
+/// whitespace-delimited token as a write target. Quote-aware so a literal
+/// `>` inside a string is not treated as a redirect. Exotic forms
+/// (process substitution, `{fd}>`) never reach here — the caller routes
+/// `$(`/`` ` ``/`<(`/`>(`/`$'`/`<<` to a whole-command claim first.
+#[cfg(not(feature = "semantic-bash"))]
+fn coarse_redirect_targets(command: &str) -> Vec<String> {
+    let bytes = command.as_bytes();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' => i += 2, // skip the escaped byte
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'>' => {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'>' {
+                    i += 1; // append `>>`
+                }
+                if i < bytes.len() && bytes[i] == b'|' {
+                    i += 1; // clobber `>|`
+                }
+                while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+                    i += 1;
+                }
+                let start = i;
+                while i < bytes.len() {
+                    let t = bytes[i];
+                    if (t as char).is_whitespace()
+                        || matches!(t, b';' | b'|' | b'&' | b'>' | b'<' | b'(' | b')')
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i > start {
+                    let tok = command[start..i].trim_matches(['"', '\'']);
+                    if !tok.is_empty() {
+                        targets.push(tok.to_string());
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    targets
+}
+
+/// Known file-mutating commands whose path operands must route through
+/// an Edit claim on the no-`semantic-bash` build.
+#[cfg(not(feature = "semantic-bash"))]
+const COARSE_MUTATORS: &[&str] = &[
+    "rm", "cp", "mv", "mkdir", "rmdir", "touch", "chmod", "chown", "ln", "dd", "truncate", "tee",
+    "install", "shred",
+];
+
+/// dirge-9bqy: coarse mutation-path scan for the no-`semantic-bash`
+/// build. For each split segment whose command head is a known mutator,
+/// treat non-flag operands as write targets so the write rules + external-
+/// dir gate apply (matching the semantic path's `extract_mutation_paths`).
+/// Conservative: mode/owner operands (`chmod 755 …`) classify in-cwd and
+/// are harmless; `dd` only contributes its `of=` operand.
+#[cfg(not(feature = "semantic-bash"))]
+fn coarse_mutation_paths(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for segment in quote_aware_split(command) {
+        let mut toks = segment.split_whitespace();
+        let Some(head) = toks.next() else { continue };
+        let base = head.rsplit('/').next().unwrap_or(head);
+        if !COARSE_MUTATORS.contains(&base) {
+            continue;
+        }
+        for t in toks {
+            if t.starts_with('-') {
+                continue; // flag
+            }
+            if base == "dd" {
+                if let Some(rest) = t.strip_prefix("of=") {
+                    if !rest.is_empty() {
+                        out.push(rest.to_string());
+                    }
+                }
+                continue; // dd uses key=value operands only
+            }
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1871,6 +2012,81 @@ mod tests {
                 n >= 2,
                 "both command segments should be summarized; got {n}"
             );
+        }
+    }
+
+    // ── dirge-9bqy: coarse redirect/mutation gating (no-semantic-bash) ──
+
+    #[cfg(not(feature = "semantic-bash"))]
+    #[test]
+    fn coarse_redirect_targets_extracts_external_write() {
+        // Absolute out-of-tree redirect target is captured.
+        assert_eq!(
+            coarse_redirect_targets("echo x > /etc/passwd"),
+            vec!["/etc/passwd".to_string()]
+        );
+        // Append + clobber operators.
+        assert_eq!(
+            coarse_redirect_targets("cmd >> /var/log/x"),
+            vec!["/var/log/x".to_string()]
+        );
+        assert_eq!(
+            coarse_redirect_targets("cmd >| out.txt"),
+            vec!["out.txt".to_string()]
+        );
+        // fd-prefixed redirect (`2>`).
+        assert_eq!(
+            coarse_redirect_targets("cmd 2> err.log"),
+            vec!["err.log".to_string()]
+        );
+        // A literal `>` inside quotes is NOT a redirect (no false positive).
+        assert!(coarse_redirect_targets("echo \">notaredirect\"").is_empty());
+        // fd duplication `1>&2` captures no file target.
+        assert!(coarse_redirect_targets("cmd 1>&2").is_empty());
+    }
+
+    #[cfg(not(feature = "semantic-bash"))]
+    #[test]
+    fn coarse_mutation_paths_extracts_targets() {
+        assert_eq!(
+            coarse_mutation_paths("rm -rf /tmp/x"),
+            vec!["/tmp/x".to_string()]
+        );
+        assert_eq!(
+            coarse_mutation_paths("cp a b"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // `dd` only contributes its `of=` operand.
+        assert_eq!(
+            coarse_mutation_paths("dd if=/dev/zero of=/etc/wipe bs=1"),
+            vec!["/etc/wipe".to_string()]
+        );
+        // A `/bin/`-prefixed mutator is still recognized by basename.
+        assert_eq!(
+            coarse_mutation_paths("/bin/rm /etc/hosts"),
+            vec!["/etc/hosts".to_string()]
+        );
+        // Non-mutators contribute nothing.
+        assert!(coarse_mutation_paths("echo hello").is_empty());
+    }
+
+    /// End-to-end on the no-semantic build: a redirect to an out-of-tree
+    /// path produces an Edit claim against an EXTERNAL resource, so the
+    /// external-dir gate fires instead of the write riding through ungated.
+    #[cfg(not(feature = "semantic-bash"))]
+    #[tokio::test]
+    async fn coarse_external_redirect_is_gated() {
+        use crate::permission::engine::classify_path;
+        // The coarse target resolves to the absolute out-of-tree path …
+        let targets = coarse_redirect_targets("echo pwned > /etc/passwd");
+        assert_eq!(targets, vec!["/etc/passwd".to_string()]);
+        // … and classify_path marks it outside any plausible project root.
+        let r = classify_path("/etc/passwd", "/home/user/project");
+        match r {
+            crate::permission::engine::types::Resource::Path { in_cwd, .. } => {
+                assert!(!in_cwd, "/etc/passwd must classify as outside the cwd");
+            }
+            other => panic!("expected a Path resource, got {other:?}"),
         }
     }
 }

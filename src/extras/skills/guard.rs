@@ -20,7 +20,7 @@ const INVISIBLE_CHARS: &[char] = &[
     '\u{200c}', // zero-width non-joiner
     '\u{200d}', // zero-width joiner
     '\u{2060}', // word joiner
-    '\u{fef}',  // BOM / zero-width no-break space
+    '\u{feff}', // BOM / zero-width no-break space
     '\u{202a}', // left-to-right embedding
     '\u{202b}', // right-to-left embedding
     '\u{202c}', // pop directional formatting
@@ -159,6 +159,11 @@ mod tests {
     #[test]
     fn zero_width_space_blocked() {
         assert!(scan_skill_content("hello\u{200b}world").is_err());
+        // dirge-q14a: real BOM / ZWNBSP U+FEFF (was the wrong U+0FEF).
+        assert!(
+            scan_skill_content("x\u{feff}y").is_err(),
+            "U+FEFF must be blocked"
+        );
     }
 
     #[test]
