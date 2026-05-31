@@ -769,6 +769,15 @@ pub struct AnyAgent {
     /// stream factory so the filter sees the same set the tool
     /// mutates. `None` when the feature is off.
     tool_def_filter: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// dirge-tpx6: the live `tool_search` registry — the SAME Arc held by
+    /// the `ToolSearchTool` in `loop_tools`. `extend_loop_tools` appends
+    /// background-injected MCP tools' meta here so they stay search-gated
+    /// (discoverable via `tool_search`, hidden until requested) rather
+    /// than always-visible. `None` when dynamic_tool_search is off. Only
+    /// read on the MCP-injection path.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    tool_search_registry:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::agent::tools::tool_search::ToolMeta>>>>,
     /// Phase 4 part 1: alternate stream function for dual-client
     /// escalation. Constructed at `build_agent` time when
     /// `ConfigRole::Escalation` resolves to a DIFFERENT provider
@@ -851,6 +860,7 @@ impl AnyAgent {
             model_name,
             dynamic_tool_search: false,
             tool_def_filter: None,
+            tool_search_registry: None,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             critic_fn: None,
@@ -871,25 +881,28 @@ impl AnyAgent {
     /// dispatch and the request's tool-definition list. Cheap: each
     /// entry is an `Arc` bump.
     ///
-    /// dirge-ffwa: when `dynamic_tool_search` is on, the request only
+    /// dirge-ffwa/tpx6: when `dynamic_tool_search` is on, the request only
     /// ships tool defs whose names are in the shared loaded-set, and the
-    /// model discovers the rest via `tool_search` — which only knows the
-    /// registry snapshot taken at BUILD time, before MCP connected. So
-    /// these late-injected tools are in neither place and would be
-    /// filtered out of every request (uncallable) and undiscoverable. Mark
-    /// their names loaded here so they pass `filter_tool_defs`. The
-    /// trade-off vs. build-time MCP tools is that they're always-visible
-    /// rather than search-gated — acceptable: they're user-configured and
-    /// few. No-op when the filter is `None` (dynamic search off).
+    /// model discovers the rest via `tool_search` over a registry snapshot
+    /// taken at BUILD time — before MCP connected. A late-injected tool is
+    /// in neither place, so it would be both undiscoverable and filtered
+    /// out of every request (uncallable). Fix: append its meta to the live
+    /// `tool_search` registry so the model can DISCOVER it via
+    /// `tool_search` (and `tool_search` then marks it loaded on demand) —
+    /// keeping it search-gated, exactly like a build-time MCP tool, rather
+    /// than force-loading it into every request. No-op when
+    /// dynamic_tool_search is off (registry is `None`).
     #[cfg(feature = "mcp")]
     pub fn extend_loop_tools(
         &mut self,
         more: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
     ) {
-        if let Some(filter) = &self.tool_def_filter {
-            let mut loaded = filter.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(registry) = &self.tool_search_registry {
+            let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
             for t in &more {
-                loaded.insert(t.name().to_string());
+                reg.push(crate::agent::tools::tool_search::meta_from_loop_tool(
+                    t.as_ref(),
+                ));
             }
         }
         self.loop_tools.extend(more);
@@ -1001,9 +1014,11 @@ impl AnyAgent {
     pub fn with_dynamic_tool_search(
         mut self,
         filter: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        registry: std::sync::Arc<std::sync::Mutex<Vec<crate::agent::tools::tool_search::ToolMeta>>>,
     ) -> Self {
         self.dynamic_tool_search = true;
         self.tool_def_filter = Some(filter);
+        self.tool_search_registry = Some(registry);
         self
     }
 
@@ -1725,7 +1740,7 @@ pub async fn build_agent(
             // is on, `tool_def_filter` is `Some` and a
             // `ToolSearchTool` has been registered inside `tools`
             // with the same Arc.
-            let (loop_tools, tool_def_filter) = builder::build_loop_tools(
+            let (loop_tools, dyn_search) = builder::build_loop_tools(
                 cache.clone(),
                 permission_for_loop,
                 ask_tx_for_loop,
@@ -1753,7 +1768,7 @@ pub async fn build_agent(
             // one-liner nudge so the model knows to call
             // `tool_search` before reaching for unknown tools.
             let mut preamble = agent.preamble.clone().unwrap_or_default();
-            if tool_def_filter.is_some() {
+            if dyn_search.is_some() {
                 if !preamble.is_empty() {
                     preamble.push_str("\n\n");
                 }
@@ -1773,8 +1788,8 @@ pub async fn build_agent(
             if let Some(provider) = memory_provider {
                 agent = agent.with_memory_provider(provider);
             }
-            if let Some(filter) = tool_def_filter {
-                agent.with_dynamic_tool_search(filter)
+            if let Some(ds) = dyn_search {
+                agent.with_dynamic_tool_search(ds.filter, ds.registry)
             } else {
                 agent
             }

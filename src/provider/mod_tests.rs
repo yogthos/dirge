@@ -692,20 +692,21 @@ impl crate::agent::agent_loop::LoopTool for NamedTool {
     }
 }
 
-/// dirge-ffwa: with `dynamic_tool_search` on, the request only ships
-/// tool defs whose names are in the shared loaded-set (the model
-/// discovers the rest via `tool_search`, which only knows the registry
-/// snapshot taken at BUILD time). Background-injected MCP tools aren't in
-/// that snapshot, so `extend_loop_tools` MUST mark their names loaded —
-/// otherwise they'd be filtered out of every request and be uncallable.
+/// dirge-tpx6: with `dynamic_tool_search` on, background-injected MCP
+/// tools must be appended to the live `tool_search` registry so the model
+/// can DISCOVER them — but NOT force-loaded, so they stay search-gated
+/// (don't ship in every request) exactly like build-time MCP tools.
 #[cfg(feature = "mcp")]
 #[test]
-fn extend_loop_tools_marks_injected_names_loaded_under_dynamic_search() {
+fn extend_loop_tools_adds_injected_to_search_registry_not_loaded() {
+    use crate::agent::tools::tool_search::ToolMeta;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     let filter: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let mut agent = build_openai_any_agent().with_dynamic_tool_search(filter.clone());
+    let registry: Arc<Mutex<Vec<ToolMeta>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut agent =
+        build_openai_any_agent().with_dynamic_tool_search(filter.clone(), registry.clone());
 
     let tools: Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> = vec![
         Arc::new(NamedTool("mcp_alpha")),
@@ -715,23 +716,32 @@ fn extend_loop_tools_marks_injected_names_loaded_under_dynamic_search() {
 
     // Appended to the live dispatch registry…
     assert_eq!(agent.loop_tools.len(), 2);
-    // …AND marked loaded so `filter_tool_defs` lets them through.
-    let loaded = filter.lock().unwrap();
-    assert!(loaded.contains("mcp_alpha"), "loaded = {loaded:?}");
-    assert!(loaded.contains("mcp_beta"), "loaded = {loaded:?}");
+    // …and to the SEARCHABLE registry so `tool_search` can surface them…
+    let reg = registry.lock().unwrap();
+    assert!(
+        reg.iter().any(|m| m.name == "mcp_alpha"),
+        "reg missing alpha"
+    );
+    assert!(reg.iter().any(|m| m.name == "mcp_beta"), "reg missing beta");
+    // …but NOT force-loaded: they stay search-gated (not in every request).
+    assert!(
+        filter.lock().unwrap().is_empty(),
+        "injected tools must not be pre-loaded — discovered via tool_search"
+    );
 }
 
-/// When `dynamic_tool_search` is OFF (no filter), injection still grows
-/// the registry and doesn't touch any (absent) loaded-set.
+/// When `dynamic_tool_search` is OFF (no registry), injection still grows
+/// the dispatch registry and touches no search state.
 #[cfg(feature = "mcp")]
 #[test]
-fn extend_loop_tools_without_filter_only_grows_registry() {
+fn extend_loop_tools_without_dynamic_search_only_grows_registry() {
     use std::sync::Arc;
 
-    let mut agent = build_openai_any_agent(); // tool_def_filter == None
+    let mut agent = build_openai_any_agent(); // tool_search_registry == None
     let tools: Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> = vec![Arc::new(NamedTool("x"))];
     agent.extend_loop_tools(tools);
 
     assert_eq!(agent.loop_tools.len(), 1);
     assert!(agent.tool_def_filter.is_none());
+    assert!(agent.tool_search_registry.is_none());
 }

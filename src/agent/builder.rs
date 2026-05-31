@@ -663,6 +663,19 @@ pub async fn wrap_mcp_tools(
 // Phase 4.5h-4 — parallel LoopTool registry builder
 // ============================================================
 
+/// dirge-tpx6: the dynamic_tool_search state `build_loop_tools` produces
+/// for the agent to hold onto. Both Arcs are the SAME ones the
+/// `ToolSearchTool` registered in `loop_tools` holds, so the agent can
+/// mutate them after build:
+/// - `filter` — the shared loaded-set (names whose full defs ship each
+///   request); `tool_search` inserts into it as the model discovers tools.
+/// - `registry` — the live searchable catalog; `extend_loop_tools` appends
+///   background-injected MCP tools here so they stay search-gated.
+pub struct DynamicToolSearch {
+    pub filter: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub registry: std::sync::Arc<std::sync::Mutex<Vec<tools::ToolMeta>>>,
+}
+
 /// Build the LoopTool registry for the new agent_loop path.
 ///
 /// Mirrors the tool construction in `build_agent_inner` but
@@ -706,7 +719,7 @@ pub async fn build_loop_tools(
     session_id: Option<String>,
 ) -> (
     Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
-    Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    Option<DynamicToolSearch>,
 ) {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
@@ -1084,19 +1097,24 @@ pub async fn build_loop_tools(
     // (which `spawn_runner` then forwards to the stream
     // factory's filter).
     let tool_def_filter = if cfg.resolve_dynamic_tool_search() {
-        let registry: Vec<tools::ToolMeta> = tools
+        let registry_vec: Vec<tools::ToolMeta> = tools
             .iter()
             .map(|t| tools::tool_search::meta_from_loop_tool(t.as_ref()))
             .collect();
+        // dirge-tpx6: registry behind a Mutex so the background MCP
+        // loader can append late-connected tools (keeping them
+        // search-gated). The SAME Arc goes into the ToolSearchTool and
+        // back to the agent via `DynamicToolSearch`.
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(registry_vec));
         let filter: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        let search_tool = tools::ToolSearchTool::new(Arc::new(registry), filter.clone());
+        let search_tool = tools::ToolSearchTool::new(registry.clone(), filter.clone());
         // ToolSearchTool implements LoopTool directly (not via
         // RigToolAdapter — it needs to mutate session state and
         // doesn't fit the rig::ToolDyn shape). Push as Arc
         // straight away.
         tools.push(Arc::new(search_tool));
-        Some(filter)
+        Some(DynamicToolSearch { filter, registry })
     } else {
         None
     };

@@ -65,9 +65,14 @@ pub const ALWAYS_ON_TOOLS: &[&str] = &[TOOL_SEARCH_NAME, "task_status", "write_t
 /// `tool_search` meta-tool. Registers as a LoopTool so it can
 /// mutate the per-session loaded set during execution.
 pub struct ToolSearchTool {
-    /// Full registry snapshot (every tool that COULD be loaded).
-    /// Built at session start in `agent::builder::build_loop_tools`.
-    registry: Arc<Vec<ToolMeta>>,
+    /// Live registry of every tool that COULD be loaded, searched by
+    /// `tool_search`. Seeded at session start in
+    /// `agent::builder::build_loop_tools`. Behind a `Mutex` (was an
+    /// immutable snapshot) so the background MCP loader can append
+    /// late-connected tools via `AnyAgent::extend_loop_tools` and keep
+    /// them search-gated rather than always-visible (dirge-tpx6). The
+    /// lock is taken only on a `tool_search` call, so contention is nil.
+    registry: Arc<Mutex<Vec<ToolMeta>>>,
     /// Per-session "loaded" set. The factory filter reads this
     /// (Arc-shared with `LoopConfig.tool_def_filter`). Tool calls
     /// here APPEND to it; once a tool is loaded, it stays loaded
@@ -80,14 +85,17 @@ pub struct ToolSearchTool {
 impl std::fmt::Debug for ToolSearchTool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolSearchTool")
-            .field("registry_size", &self.registry.len())
+            .field(
+                "registry_size",
+                &self.registry.lock().map(|r| r.len()).unwrap_or(0),
+            )
             .field("top_k", &self.top_k)
             .finish()
     }
 }
 
 impl ToolSearchTool {
-    pub fn new(registry: Arc<Vec<ToolMeta>>, loaded: Arc<Mutex<HashSet<String>>>) -> Self {
+    pub fn new(registry: Arc<Mutex<Vec<ToolMeta>>>, loaded: Arc<Mutex<HashSet<String>>>) -> Self {
         Self {
             registry,
             loaded,
@@ -103,11 +111,15 @@ impl ToolSearchTool {
     }
 
     /// Rank registry entries against `query` and return the top-K
-    /// matches. Pure function — no Arc state touched. Tests use
-    /// this directly to assert rank ordering.
+    /// matches (owned clones — the registry lock isn't held past the
+    /// call). Tests use this directly to assert rank ordering.
     #[allow(dead_code)]
-    pub fn rank(&self, query: &str, top_k: usize) -> Vec<&ToolMeta> {
-        rank_tools(&self.registry, query, top_k)
+    pub fn rank(&self, query: &str, top_k: usize) -> Vec<ToolMeta> {
+        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        rank_tools(&reg, query, top_k)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// Expose the shared loaded-set Arc. `spawn_runner` needs the
@@ -179,7 +191,17 @@ impl LoopTool for ToolSearchTool {
                 return Err("tool_search: query must not be empty".to_string());
             }
             let k = parsed.top_k.unwrap_or(self.top_k).clamp(1, 20);
-            let ranked = rank_tools(&self.registry, &parsed.query, k);
+            // Rank under the registry lock and clone the top-K out (≤20)
+            // so the lock is released before we take the loaded-set lock
+            // or build the response — no nested locks, no lock held across
+            // the await boundary.
+            let ranked: Vec<ToolMeta> = {
+                let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+                rank_tools(&reg, &parsed.query, k)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            };
 
             // Mutate the loaded set BEFORE building the response so
             // the model can rely on next-turn availability.
@@ -366,8 +388,8 @@ pub fn rank_tools<'a>(meta: &'a [ToolMeta], query: &str, top_k: usize) -> Vec<&'
 mod tests {
     use super::*;
 
-    fn fixture() -> Arc<Vec<ToolMeta>> {
-        Arc::new(vec![
+    fn fixture() -> Arc<Mutex<Vec<ToolMeta>>> {
+        Arc::new(Mutex::new(vec![
             ToolMeta {
                 name: "read".into(),
                 description: "Read a file from disk and return its contents.".into(),
@@ -388,7 +410,7 @@ mod tests {
                 description: "Search the web with a query and return ranked URLs.".into(),
                 parameter_summary: "{query: string}".into(),
             },
-        ])
+        ]))
     }
 
     #[test]
@@ -421,11 +443,11 @@ mod tests {
         // English descriptions because bigrams like "th" / "er"
         // recur. Use a registry of pure-ASCII letters that
         // contain no bigrams from the query alphabet.
-        let reg = Arc::new(vec![ToolMeta {
+        let reg = Arc::new(Mutex::new(vec![ToolMeta {
             name: "xyz".into(),
             description: "yyy yyy yyy".into(),
             parameter_summary: "{}".into(),
-        }]);
+        }]));
         let loaded: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tool = ToolSearchTool::new(reg, loaded);
         // Query bigrams: "qw", "ww", "ww", "wq" — none in xyz/yyy.
@@ -506,5 +528,32 @@ mod tests {
     #[test]
     fn always_on_includes_tool_search() {
         assert!(ALWAYS_ON_TOOLS.contains(&TOOL_SEARCH_NAME));
+    }
+
+    /// dirge-tpx6: the registry is shared (Arc<Mutex>) and read live, so
+    /// tools appended AFTER the ToolSearchTool is built — e.g. by the
+    /// background MCP loader via `extend_loop_tools` — become discoverable
+    /// without rebuilding the tool. This is the mechanism the search-gated
+    /// fix depends on.
+    #[test]
+    fn rank_sees_tools_appended_after_construction() {
+        let reg: Arc<Mutex<Vec<ToolMeta>>> = Arc::new(Mutex::new(Vec::new()));
+        let loaded: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tool = ToolSearchTool::new(reg.clone(), loaded);
+
+        // Nothing to find yet.
+        assert!(tool.rank("websearch", 5).is_empty());
+
+        // Background injection appends to the SAME Arc the tool holds.
+        reg.lock().unwrap().push(ToolMeta {
+            name: "websearch".into(),
+            description: "Search the web with a query.".into(),
+            parameter_summary: "{query: string}".into(),
+        });
+
+        // Now discoverable through the live registry.
+        let r = tool.rank("websearch", 5);
+        assert_eq!(r.len(), 1, "late-appended tool must be searchable");
+        assert_eq!(r[0].name, "websearch");
     }
 }
