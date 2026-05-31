@@ -870,11 +870,28 @@ impl AnyAgent {
     /// `clone().spawn_runner` forwards the grown registry to the loop
     /// dispatch and the request's tool-definition list. Cheap: each
     /// entry is an `Arc` bump.
+    ///
+    /// dirge-ffwa: when `dynamic_tool_search` is on, the request only
+    /// ships tool defs whose names are in the shared loaded-set, and the
+    /// model discovers the rest via `tool_search` — which only knows the
+    /// registry snapshot taken at BUILD time, before MCP connected. So
+    /// these late-injected tools are in neither place and would be
+    /// filtered out of every request (uncallable) and undiscoverable. Mark
+    /// their names loaded here so they pass `filter_tool_defs`. The
+    /// trade-off vs. build-time MCP tools is that they're always-visible
+    /// rather than search-gated — acceptable: they're user-configured and
+    /// few. No-op when the filter is `None` (dynamic search off).
     #[cfg(feature = "mcp")]
     pub fn extend_loop_tools(
         &mut self,
         more: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
     ) {
+        if let Some(filter) = &self.tool_def_filter {
+            let mut loaded = filter.lock().unwrap_or_else(|e| e.into_inner());
+            for t in &more {
+                loaded.insert(t.name().to_string());
+            }
+        }
         self.loop_tools.extend(more);
     }
 

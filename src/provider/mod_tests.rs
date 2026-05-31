@@ -648,3 +648,90 @@ async fn compaction_passes_check_on_clean_input() {
         "clean input must NOT trip the delimiter check, got: {err}"
     );
 }
+
+// ============================================================
+// dirge-ffwa: background MCP tool injection + dynamic_tool_search
+// ============================================================
+
+/// Minimal LoopTool fixture — only `name()` matters for these tests;
+/// `execute` is never called.
+#[cfg(feature = "mcp")]
+#[derive(Debug)]
+struct NamedTool(&'static str);
+
+#[cfg(feature = "mcp")]
+impl crate::agent::agent_loop::LoopTool for NamedTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "test"
+    }
+    fn label(&self) -> &str {
+        "test"
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: serde_json::Value,
+        _signal: crate::agent::agent_loop::tool::AbortSignal,
+        _on_update: crate::agent::agent_loop::tool::LoopToolUpdate,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::agent::agent_loop::LoopToolResult, String>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(crate::agent::agent_loop::LoopToolResult::default()) })
+    }
+}
+
+/// dirge-ffwa: with `dynamic_tool_search` on, the request only ships
+/// tool defs whose names are in the shared loaded-set (the model
+/// discovers the rest via `tool_search`, which only knows the registry
+/// snapshot taken at BUILD time). Background-injected MCP tools aren't in
+/// that snapshot, so `extend_loop_tools` MUST mark their names loaded —
+/// otherwise they'd be filtered out of every request and be uncallable.
+#[cfg(feature = "mcp")]
+#[test]
+fn extend_loop_tools_marks_injected_names_loaded_under_dynamic_search() {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    let filter: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let mut agent = build_openai_any_agent().with_dynamic_tool_search(filter.clone());
+
+    let tools: Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> = vec![
+        Arc::new(NamedTool("mcp_alpha")),
+        Arc::new(NamedTool("mcp_beta")),
+    ];
+    agent.extend_loop_tools(tools);
+
+    // Appended to the live dispatch registry…
+    assert_eq!(agent.loop_tools.len(), 2);
+    // …AND marked loaded so `filter_tool_defs` lets them through.
+    let loaded = filter.lock().unwrap();
+    assert!(loaded.contains("mcp_alpha"), "loaded = {loaded:?}");
+    assert!(loaded.contains("mcp_beta"), "loaded = {loaded:?}");
+}
+
+/// When `dynamic_tool_search` is OFF (no filter), injection still grows
+/// the registry and doesn't touch any (absent) loaded-set.
+#[cfg(feature = "mcp")]
+#[test]
+fn extend_loop_tools_without_filter_only_grows_registry() {
+    use std::sync::Arc;
+
+    let mut agent = build_openai_any_agent(); // tool_def_filter == None
+    let tools: Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> = vec![Arc::new(NamedTool("x"))];
+    agent.extend_loop_tools(tools);
+
+    assert_eq!(agent.loop_tools.len(), 1);
+    assert!(agent.tool_def_filter.is_none());
+}
