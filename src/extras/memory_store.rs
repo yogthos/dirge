@@ -195,8 +195,6 @@ impl MemoryStore {
         self.char_limit
     }
 
-    /// Add a new entry. Returns error if the entry already exists
-    /// (exact match) or the char budget would be exceeded.
     /// Add an entry. Returns the number of OLD entries that were evicted to
     /// make room (usually 0). dirge-mc0p: when the char budget is full, the
     /// store COMPACTS — it evicts the oldest entries (front of the list)
