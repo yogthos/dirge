@@ -3,13 +3,13 @@ pub(crate) mod background;
 mod bash;
 pub(crate) mod bg_shell;
 pub(crate) mod cache;
+#[cfg(feature = "dap")]
+pub(crate) mod debug;
 pub(crate) mod edit;
 mod find_files;
 mod glob;
 mod grep;
 mod list_dir;
-#[cfg(feature = "dap")]
-pub(crate) mod debug;
 #[cfg(feature = "lsp")]
 mod lsp;
 mod memory;
@@ -35,6 +35,8 @@ pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
 pub use bg_shell::{BashOutputTool, KillShellTool};
 pub use cache::ToolCache;
+#[cfg(feature = "dap")]
+pub use debug::DebugTool;
 pub use edit::EditTool;
 pub use find_files::FindFilesTool;
 pub use glob::GlobTool;
@@ -42,8 +44,6 @@ pub use grep::GrepTool;
 pub use list_dir::ListDirTool;
 #[cfg(feature = "lsp")]
 pub use lsp::LspTool;
-#[cfg(feature = "dap")]
-pub use debug::DebugTool;
 pub use memory::MemoryTool;
 pub use plan::{PlanEnterTool, PlanExitTool};
 pub use question::QuestionTool;

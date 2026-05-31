@@ -8,8 +8,8 @@
 //!   identification + `REPORT.md` writer.
 //! - PR-2: LLM consolidation pass — `MEMORY_CURATOR_PROMPT`
 //!   + memory-only forked runner via
-//!   `AnyAgent::spawn_memory_curator_runner` + `LLM_REPORT.md`
-//!   writer.
+//!     `AnyAgent::spawn_memory_curator_runner` + `LLM_REPORT.md`
+//!     writer.
 //!
 //! Parallel structure to `extras::skills::curator`:
 //! - `.dirge/memory/.curator_state` — scheduler state

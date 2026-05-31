@@ -31,6 +31,7 @@ impl CppAdapter {
     /// Recursive declarator walk shared with C — finds the
     /// identifier buried under pointer/reference/parenthesized
     /// wrappers.
+    #[allow(clippy::only_used_in_recursion)]
     fn declarator_name<'a>(&self, n: Node<'a>, s: &'a [u8]) -> Option<String> {
         match n.kind() {
             "identifier" | "field_identifier" | "destructor_name" | "operator_name" => {

@@ -18,7 +18,9 @@ use super::chat::{ChatPane, crossterm_to_ratatui};
 use super::frame::{ChatBotFrame, TopFrame};
 use super::layout::Layout;
 use super::panels::{LeftPanel, RightPanel};
-use crate::ui::renderer::{LeftPanelInfo, LineEntry, PanelData, PanelMode, SelectionRange, SubagentStatusRow};
+use crate::ui::renderer::{
+    LeftPanelInfo, LineEntry, PanelData, PanelMode, SelectionRange, SubagentStatusRow,
+};
 
 #[allow(unused_imports)] // RColor stays in scope for the doctest example.
 use ratatui::style::Color as _RColor;

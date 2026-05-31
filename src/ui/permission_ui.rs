@@ -32,7 +32,7 @@ fn significant_bash_head(command: &str) -> Option<&str> {
         "cd", "pushd", "popd", "export", "set", "unset", ":", "true", "env",
     ];
     command
-        .split(|c| matches!(c, '&' | '|' | ';' | '\n'))
+        .split(['&', '|', ';', '\n'])
         .map(str::trim)
         .filter_map(|seg| seg.split_whitespace().next())
         .find(|head| !BENIGN.contains(head))

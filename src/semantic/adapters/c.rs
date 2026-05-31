@@ -43,6 +43,7 @@ impl CAdapter {
     /// identifier. The declarator can be nested under
     /// `pointer_declarator` (for `int *foo()`-style returns) or
     /// `parenthesized_declarator` (function pointers).
+    #[allow(clippy::only_used_in_recursion)]
     fn declarator_name<'a>(&self, n: Node<'a>, s: &'a [u8]) -> Option<String> {
         match n.kind() {
             "identifier" => Some(node_text(n, s).to_string()),

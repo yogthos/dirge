@@ -770,14 +770,11 @@ pub mod debug {
                     for v in &self.data.variables {
                         let val = &v.value;
                         let type_hint = v
-                            .var_type
+                            .type_field
                             .as_deref()
                             .map(|t| format!(": {t}"))
                             .unwrap_or_default();
-                        p = p.line(
-                            format!("{} = {}{}", v.name, val, type_hint),
-                            body_color,
-                        );
+                        p = p.line(format!("{} = {}{}", v.name, val, type_hint), body_color);
                     }
                 }
                 p
@@ -792,7 +789,10 @@ pub mod debug {
             let bp_count = summary.map(|s| s.breakpoint_count).unwrap_or(0);
             let fbp_count = summary.map(|s| s.function_breakpoint_count).unwrap_or(0);
             let bp_panel = SubPanel::new("BREAKPOINTS")
-                .line(format!("source: {}  func: {}", bp_count, fbp_count), body_color)
+                .line(
+                    format!("source: {}  func: {}", bp_count, fbp_count),
+                    body_color,
+                )
                 .border_style(self.style);
             let h = bp_panel.height();
             if y + h <= area.y + area.height {
@@ -1332,6 +1332,8 @@ mod tests {
         use crate::dap::types::{DebugPanelData, SessionStatus, Variable};
 
         let data = DebugPanelData {
+            adapter: "test".into(),
+            status: SessionStatus::Stopped,
             session_summary: Some(crate::dap::types::SessionSummary {
                 id: "s1".into(),
                 adapter_name: "test".into(),
@@ -1341,14 +1343,21 @@ mod tests {
                 function_breakpoint_count: 2,
                 stop_reason: Some("breakpoint".into()),
                 thread_id: Some(1),
+                output: String::new(),
+                output_truncated: false,
+                exit_code: None,
+                capabilities: None,
+                languages: vec![],
             }),
             threads: vec![],
             frames: vec![],
+            scopes: vec![],
+            breakpoints: vec![],
             variables: vec![
                 Variable {
                     name: "x".into(),
                     value: "42".into(),
-                    var_type: Some("i32".into()),
+                    type_field: Some("i32".into()),
                     presentation_hint: None,
                     evaluate_name: None,
                     variables_reference: 0,
@@ -1359,7 +1368,7 @@ mod tests {
                 Variable {
                     name: "msg".into(),
                     value: "\"hello\"".into(),
-                    var_type: Some("String".into()),
+                    type_field: Some("String".into()),
                     presentation_hint: None,
                     evaluate_name: None,
                     variables_reference: 0,
@@ -1370,6 +1379,7 @@ mod tests {
             ],
             output: "hello\nworld\n".into(),
             output_truncated: false,
+            exit_code: None,
         };
 
         let backend = TestBackend::new(30, 30);

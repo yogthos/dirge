@@ -50,6 +50,7 @@ impl RustAdapter {
     /// expression: `Foo` → `Foo`, `Foo<T>` → `Foo`, `Box<Foo<T>>` →
     /// `Box`. Used by `handle_impl` so `impl<T> Trait for Foo<T>`
     /// attaches its methods to `Foo`, not the generic param `T`.
+    #[allow(clippy::only_used_in_recursion)]
     fn type_leaf_name(&self, n: Node, s: &[u8]) -> Option<String> {
         match n.kind() {
             "type_identifier" => Some(node_text(n, s).to_string()),

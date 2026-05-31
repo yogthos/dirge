@@ -301,7 +301,7 @@ fn env_secret_values() -> &'static [String] {
             .filter(|(k, val)| is_sensitive_env_name(k) && val.len() >= 8)
             .map(|(_, val)| val)
             .collect();
-        v.sort_by(|a, b| b.len().cmp(&a.len()));
+        v.sort_by_key(|b| std::cmp::Reverse(b.len()));
         v.dedup();
         v
     })

@@ -134,10 +134,8 @@ impl ElixirAdapter {
             let Some(c) = block.named_child(i) else {
                 continue;
             };
-            if c.kind() == "call" {
-                if !self.walk_call(c, s, symbols, imports, Some(parent)) {
-                    self.maybe_import(c, s, imports);
-                }
+            if c.kind() == "call" && !self.walk_call(c, s, symbols, imports, Some(parent)) {
+                self.maybe_import(c, s, imports);
             }
         }
     }
@@ -281,11 +279,9 @@ impl LanguageAdapter for ElixirAdapter {
             let Some(c) = root.named_child(i) else {
                 continue;
             };
-            if c.kind() == "call" {
-                if !self.walk_call(c, bytes, &mut symbols, &mut imports, None) {
-                    // Not a definition — check for import/alias/require/use.
-                    self.maybe_import(c, bytes, &mut imports);
-                }
+            if c.kind() == "call" && !self.walk_call(c, bytes, &mut symbols, &mut imports, None) {
+                // Not a definition — check for import/alias/require/use.
+                self.maybe_import(c, bytes, &mut imports);
             }
         }
 

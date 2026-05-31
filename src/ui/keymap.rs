@@ -40,6 +40,7 @@ impl KeyAction {
     /// All actions, with their config command name and default chords.
     /// Single source of truth for both the default keymap and the
     /// command-name lookup / docs.
+    #[allow(clippy::type_complexity)]
     pub const ALL: &'static [(KeyAction, &'static str, &'static [(KeyCode, KeyModifiers)])] = &[
         (
             KeyAction::ToggleReasoning,

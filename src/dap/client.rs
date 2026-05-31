@@ -214,10 +214,7 @@ async fn dispatch(inner: &Arc<Inner>, msg: Value) {
             }
         }
         "event" => {
-            let event_type = msg
-                .get("event")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let event_type = msg.get("event").and_then(|v| v.as_str()).unwrap_or("");
             let handlers = inner.handlers.lock().await;
             if let Some(handler) = handlers.get(event_type) {
                 let body = msg.get("body").cloned().unwrap_or(Value::Null);
@@ -225,9 +222,7 @@ async fn dispatch(inner: &Arc<Inner>, msg: Value) {
             }
         }
         _ => {
-            tracing::warn!(
-                "dap: unexpected message type {msg_type:?}, ignoring"
-            );
+            tracing::warn!("dap: unexpected message type {msg_type:?}, ignoring");
         }
     }
 }
@@ -411,11 +406,19 @@ mod tests {
         let (rpc, _task) = DapRpc::new(client_reader, client_write);
 
         let adapter = tokio::spawn(async move {
-            fake_adapter(&mut tokio::io::BufReader::new(server_read), &mut server_write).await;
+            fake_adapter(
+                &mut tokio::io::BufReader::new(server_read),
+                &mut server_write,
+            )
+            .await;
         });
 
         let response: Value = rpc
-            .request("initialize", serde_json::json!({ "adapterID": "test" }), Duration::from_secs(5))
+            .request(
+                "initialize",
+                serde_json::json!({ "adapterID": "test" }),
+                Duration::from_secs(5),
+            )
             .await
             .unwrap();
 
@@ -443,7 +446,11 @@ mod tests {
         .await;
 
         let adapter = tokio::spawn(async move {
-            fake_adapter(&mut tokio::io::BufReader::new(server_read), &mut server_write).await;
+            fake_adapter(
+                &mut tokio::io::BufReader::new(server_read),
+                &mut server_write,
+            )
+            .await;
         });
 
         // This will also consume the initialize request (which the fake expects)
@@ -512,8 +519,7 @@ mod tests {
     async fn full_lifecycle_against_mock_adapter() {
         use crate::dap::types::{
             Capabilities, ContinueResponse, EvaluateResponse, ScopesResponse,
-            SetBreakpointsResponse, StackTraceResponse, ThreadsResponse,
-            VariablesResponse,
+            SetBreakpointsResponse, StackTraceResponse, ThreadsResponse, VariablesResponse,
         };
 
         let program = mock_adapter_path();
@@ -589,7 +595,11 @@ mod tests {
 
         // 5. threads
         let threads_response: ThreadsResponse = client
-            .request("threads", serde_json::json!({}), std::time::Duration::from_secs(5))
+            .request(
+                "threads",
+                serde_json::json!({}),
+                std::time::Duration::from_secs(5),
+            )
             .await
             .expect("threads should succeed");
         assert!(!threads_response.threads.is_empty());
@@ -713,7 +723,9 @@ mod tests {
             .args(["-c", "import debugpy"])
             .output();
         if check.map_or(true, |o| !o.status.success()) {
-            eprintln!("SKIP: debugpy smoke test — debugpy module not installed (pip install debugpy)");
+            eprintln!(
+                "SKIP: debugpy smoke test — debugpy module not installed (pip install debugpy)"
+            );
             return;
         }
 
@@ -748,7 +760,11 @@ mod tests {
 
         // Clean shutdown.
         let _ = client
-            .request::<_, Value>("disconnect", serde_json::json!({"terminateDebuggee": false}), SMOKE_TIMEOUT)
+            .request::<_, Value>(
+                "disconnect",
+                serde_json::json!({"terminateDebuggee": false}),
+                SMOKE_TIMEOUT,
+            )
             .await;
     }
 
@@ -790,7 +806,138 @@ mod tests {
 
         // Clean shutdown.
         let _ = client
-            .request::<_, Value>("disconnect", serde_json::json!({"terminateDebuggee": false}), SMOKE_TIMEOUT)
+            .request::<_, Value>(
+                "disconnect",
+                serde_json::json!({"terminateDebuggee": false}),
+                SMOKE_TIMEOUT,
+            )
             .await;
+    }
+
+    /// Full launch→stop-on-entry→continue→terminate with debugpy + test_program.py.
+    #[tokio::test]
+    async fn smoke_debugpy_launch_test_program() {
+        skip_if_missing!("python3", "debugpy");
+
+        let check = std::process::Command::new("python3")
+            .args(["-c", "import debugpy"])
+            .output();
+        if check.map_or(true, |o| !o.status.success()) {
+            eprintln!("SKIP: debugpy not installed");
+            return;
+        }
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tests")
+            .join("dap")
+            .join("fixtures")
+            .join("test_program.py");
+        assert!(
+            fixture.exists(),
+            "test_program.py must exist at {}",
+            fixture.display()
+        );
+
+        let client = super::DapClient::spawn_stdio(
+            "debugpy",
+            std::path::Path::new("python3"),
+            &["-m".to_string(), "debugpy.adapter".to_string()],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("debugpy adapter should spawn");
+
+        // Register events before initialize so we don't miss any.
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .on_event(
+                "stopped",
+                Box::new(move |body: serde_json::Value| {
+                    let _ = evt_tx.send(body);
+                }),
+            )
+            .await;
+        client
+            .on_event("output", Box::new(|_: serde_json::Value| {}))
+            .await;
+        client
+            .on_event("terminated", Box::new(|_: serde_json::Value| {}))
+            .await;
+
+        // 1. initialize
+        let caps: crate::dap::types::Capabilities = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "adapterID": "debugpy",
+                    "clientID": "dirge-smoke",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path",
+                    "locale": "en-us"
+                }),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("initialize should succeed");
+        assert!(caps.supports_configuration_done_request.unwrap_or(false));
+
+        // 2. launch with stopOnEntry (notify to avoid deadlock —
+        // debugpy won't respond until configurationDone is sent)
+        client
+            .notify(
+                "launch",
+                &serde_json::json!({
+                    "program": fixture.to_string_lossy(),
+                    "stopOnEntry": true,
+                    "console": "internalConsole"
+                }),
+            )
+            .await
+            .expect("launch notify should succeed");
+
+        // 3. configurationDone
+        client
+            .request::<_, serde_json::Value>(
+                "configurationDone",
+                serde_json::json!({}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("configurationDone should succeed");
+
+        // 4. Wait for stopped event (stopOnEntry)
+        let stopped = tokio::time::timeout(SMOKE_TIMEOUT, evt_rx.recv())
+            .await
+            .expect("timed out waiting for stopped event")
+            .expect("adapter disconnected before stopped event");
+        assert_eq!(stopped["reason"], "entry", "expected stop-on-entry");
+
+        // 5. continue
+        client
+            .request::<_, serde_json::Value>(
+                "continue",
+                serde_json::json!({"threadId": stopped["threadId"]}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("continue should succeed");
+
+        // 6. terminate
+        client
+            .request::<_, serde_json::Value>("terminate", serde_json::json!({}), SMOKE_TIMEOUT)
+            .await
+            .expect("terminate should succeed");
+
+        // 7. disconnect
+        client
+            .request::<_, serde_json::Value>(
+                "disconnect",
+                serde_json::json!({"terminateDebuggee": true}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("disconnect should succeed");
     }
 }

@@ -46,6 +46,7 @@ pub struct ResolvedAdapter {
     pub resolved_command: PathBuf,
     pub args: Vec<String>,
     pub file_types: Vec<String>,
+    pub languages: Vec<String>,
     pub root_markers: Vec<String>,
     pub launch_defaults: serde_json::Value,
     pub attach_defaults: serde_json::Value,
@@ -64,9 +65,8 @@ const EXTENSIONLESS_DEBUGGER_ORDER: &[&str] = &["gdb", "lldb-dap"];
 // ---------------------------------------------------------------------------
 
 fn load_defaults() -> HashMap<String, AdapterConfig> {
-    let raw: HashMap<String, AdapterConfig> =
-        serde_json::from_str(include_str!("defaults.json"))
-            .expect("defaults.json is valid at compile time");
+    let raw: HashMap<String, AdapterConfig> = serde_json::from_str(include_str!("defaults.json"))
+        .expect("defaults.json is valid at compile time");
     raw
 }
 
@@ -116,6 +116,7 @@ pub fn resolve_adapter(name: &str) -> Option<ResolvedAdapter> {
         launch_defaults: config.launch_defaults.clone(),
         attach_defaults: config.attach_defaults.clone(),
         connect_mode: config.connect_mode,
+        languages: config.languages.clone(),
     })
 }
 
@@ -172,11 +173,7 @@ fn get_matching_adapters(program: &Path, cwd: &Path) -> Vec<ResolvedAdapter> {
 /// Sort adapters by how well they match the program/cwd.
 ///
 /// Priority order: file-type match → root-marker match → native debugger rank → name.
-fn sort_adapters_for_launch(
-    program: &Path,
-    cwd: &Path,
-    adapters: &mut Vec<ResolvedAdapter>,
-) {
+fn sort_adapters_for_launch(program: &Path, cwd: &Path, adapters: &mut [ResolvedAdapter]) {
     let ext = program
         .extension()
         .and_then(|e| e.to_str())
@@ -185,10 +182,10 @@ fn sort_adapters_for_launch(
     adapters.sort_by(|left, right| {
         let left_ext = ext
             .as_ref()
-            .map_or(false, |e| left.file_types.iter().any(|ft| ft.eq_ignore_ascii_case(e)));
+            .is_some_and(|e| left.file_types.iter().any(|ft| ft.eq_ignore_ascii_case(e)));
         let right_ext = ext
             .as_ref()
-            .map_or(false, |e| right.file_types.iter().any(|ft| ft.eq_ignore_ascii_case(e)));
+            .is_some_and(|e| right.file_types.iter().any(|ft| ft.eq_ignore_ascii_case(e)));
 
         // Extension match wins.
         if left_ext != right_ext {
@@ -295,10 +292,7 @@ mod tests {
 
         // Every entry must have a non-empty command.
         for (name, cfg) in &defaults {
-            assert!(
-                !cfg.command.is_empty(),
-                "{name}: command must not be empty"
-            );
+            assert!(!cfg.command.is_empty(), "{name}: command must not be empty");
         }
     }
 
@@ -308,7 +302,10 @@ mod tests {
         // runtime cwd does not matter. Just confirm it contains
         // known adapters.
         let defaults = load_defaults();
-        assert!(defaults.contains_key("lldb-dap"), "lldb-dap must be bundled");
+        assert!(
+            defaults.contains_key("lldb-dap"),
+            "lldb-dap must be bundled"
+        );
         assert!(defaults.contains_key("debugpy"), "debugpy must be bundled");
         assert!(defaults.contains_key("dlv"), "dlv must be bundled");
         assert!(defaults.contains_key("rdbg"), "rdbg must be bundled");
@@ -324,7 +321,8 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("dirge-dap-config-test-{id}-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("dirge-dap-config-test-{id}-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         // Return a guard that cleans up.
         TempDir { path }
@@ -376,11 +374,8 @@ mod tests {
     fn explicit_adapter_name_bypasses_heuristics() {
         // gdb is unlikely to exist in CI, so resolve_adapter returns None.
         // But the code path is exercised.
-        let result = select_launch_adapter(
-            Path::new("/tmp/prog.py"),
-            Path::new("/tmp"),
-            Some("gdb"),
-        );
+        let result =
+            select_launch_adapter(Path::new("/tmp/prog.py"), Path::new("/tmp"), Some("gdb"));
         // May be Some or None depending on PATH — we only assert the call
         // succeeds (no panic).
         let _ = result;
@@ -447,6 +442,7 @@ mod tests {
             launch_defaults: serde_json::Value::Object(Default::default()),
             attach_defaults: serde_json::Value::Object(Default::default()),
             connect_mode: ConnectMode::Stdio,
+            languages: vec![],
         }
     }
 
@@ -628,8 +624,14 @@ mod tests {
     fn every_adapter_has_command() {
         let defaults = load_defaults();
         for (name, cfg) in &defaults {
-            assert!(!cfg.command.is_empty(), "adapter {name}: command must not be empty");
-            assert!(!cfg.command.trim().is_empty(), "adapter {name}: command must not be whitespace");
+            assert!(
+                !cfg.command.is_empty(),
+                "adapter {name}: command must not be empty"
+            );
+            assert!(
+                !cfg.command.trim().is_empty(),
+                "adapter {name}: command must not be whitespace"
+            );
         }
     }
 
@@ -752,6 +754,9 @@ mod tests {
         assert_eq!(defaults["gdb"].connect_mode, ConnectMode::Stdio);
         assert_eq!(defaults["lldb-dap"].connect_mode, ConnectMode::Stdio);
         assert_eq!(defaults["rdbg"].connect_mode, ConnectMode::Stdio);
-        assert_eq!(defaults["js-debug-adapter"].connect_mode, ConnectMode::Stdio);
+        assert_eq!(
+            defaults["js-debug-adapter"].connect_mode,
+            ConnectMode::Stdio
+        );
     }
 }

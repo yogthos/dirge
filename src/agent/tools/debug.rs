@@ -17,10 +17,12 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agent::agent_loop::tool::AbortSignal;
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm, head_cap, required_nonblank};
-use crate::dap::config::{self, ResolvedAdapter};
+use crate::agent::tools::{
+    AskSender, PermCheck, ToolError, check_perm, head_cap, required_nonblank,
+};
+use crate::dap::config::{self, ConnectMode, ResolvedAdapter};
 use crate::dap::session::{DAP_MANAGER, DapSessionManager};
-use crate::dap::types::SourceBreakpoint;
+use crate::dap::types::{FunctionBreakpoint, SourceBreakpoint};
 
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
@@ -70,10 +72,7 @@ pub struct DebugTool {
 }
 
 impl DebugTool {
-    pub fn new(
-        permission: Option<PermCheck>,
-        ask_tx: Option<AskSender>,
-    ) -> Self {
+    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
         let session = Arc::new(DapSessionManager::new());
         *DAP_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
         Self {
@@ -118,6 +117,7 @@ pub struct DebugArgs {
     pub file: Option<String>,
     #[serde(default)]
     pub line: Option<u32>,
+    // DEAD CODE: function breakpoints not yet exposed as a debug-tool action.
     #[serde(default)]
     pub function: Option<String>,
     #[serde(default)]
@@ -166,6 +166,7 @@ enum Action {
     Variables,
     Terminate,
     Sessions,
+    FunctionBreakpoints,
     #[cfg(feature = "lsp")]
     RunToCursor,
     #[cfg(feature = "lsp")]
@@ -195,6 +196,7 @@ impl Action {
             "variables" => Some(Action::Variables),
             "terminate" => Some(Action::Terminate),
             "sessions" => Some(Action::Sessions),
+            "function_breakpoints" | "function_breakpoint" => Some(Action::FunctionBreakpoints),
             #[cfg(feature = "lsp")]
             "run_to_cursor" => Some(Action::RunToCursor),
             #[cfg(feature = "lsp")]
@@ -226,13 +228,12 @@ fn resolve_launch_adapter(
     } else {
         let cwd_path = std::path::Path::new(cwd);
         let prog_path = std::path::Path::new(program);
-        config::select_launch_adapter(prog_path, cwd_path, None)
-            .ok_or_else(|| {
-                ToolError::Msg(format!(
-                    "no debug adapter found for {program}. \
+        config::select_launch_adapter(prog_path, cwd_path, None).ok_or_else(|| {
+            ToolError::Msg(format!(
+                "no debug adapter found for {program}. \
                      Install one (lldb-dap, gdb, dlv, debugpy, etc.) or specify --adapter"
-                ))
-            })
+            ))
+        })
     }
 }
 
@@ -245,13 +246,12 @@ fn resolve_attach_adapter(
         config::resolve_adapter(name)
             .ok_or_else(|| ToolError::Msg(format!("adapter not found on PATH: {name}")))
     } else {
-        config::select_attach_adapter(None, port)
-            .ok_or_else(|| {
-                ToolError::Msg(
-                    "no debug adapter found for attach. Install gdb, lldb-dap, or specify --adapter"
-                        .into(),
-                )
-            })
+        config::select_attach_adapter(None, port).ok_or_else(|| {
+            ToolError::Msg(
+                "no debug adapter found for attach. Install gdb, lldb-dap, or specify --adapter"
+                    .into(),
+            )
+        })
     }
 }
 
@@ -327,6 +327,13 @@ impl Tool for DebugTool {
                 let cwd = args.cwd.as_deref().unwrap_or(".");
                 let adapter = resolve_launch_adapter(program, cwd, args.adapter.as_deref())?;
 
+                if adapter.connect_mode == ConnectMode::Socket {
+                    return Err(ToolError::Msg(
+                        "socket-mode adapters are not yet supported. Use a stdio-mode adapter instead."
+                            .into(),
+                    ));
+                }
+
                 let program_args = args.args.unwrap_or_default();
                 let summary = mgr
                     .launch(
@@ -340,6 +347,7 @@ impl Tool for DebugTool {
                         Some(adapter.launch_defaults.clone()),
                         &signal,
                         timeout,
+                        adapter.languages.clone(),
                     )
                     .await?;
 
@@ -350,6 +358,13 @@ impl Tool for DebugTool {
                 let cwd = args.cwd.as_deref().unwrap_or(".");
                 let adapter = resolve_attach_adapter(args.adapter.as_deref(), args.port)?;
 
+                if adapter.connect_mode == ConnectMode::Socket {
+                    return Err(ToolError::Msg(
+                        "socket-mode adapters are not yet supported. Use a stdio-mode adapter instead."
+                            .into(),
+                    ));
+                }
+
                 let summary = mgr
                     .attach(
                         &adapter.name,
@@ -358,8 +373,11 @@ impl Tool for DebugTool {
                         cwd,
                         args.pid,
                         args.port,
+                        args.host,
+                        Some(adapter.attach_defaults.clone()),
                         &signal,
                         timeout,
+                        adapter.languages.clone(),
                     )
                     .await?;
 
@@ -368,19 +386,17 @@ impl Tool for DebugTool {
 
             Action::SetBreakpoints => {
                 let file = required_nonblank(args.file.as_deref(), "file", "set_breakpoints")?;
-                let line = args
-                    .line
-                    .ok_or_else(|| ToolError::Msg("`line` is required for set_breakpoints".into()))?;
+                let line = args.line.ok_or_else(|| {
+                    ToolError::Msg("`line` is required for set_breakpoints".into())
+                })?;
 
                 let bp = SourceBreakpoint {
-                    line,
+                    line: line as i64,
                     condition: args.condition,
                     ..Default::default()
                 };
 
-                let results = mgr
-                    .set_breakpoints(file, vec![bp], timeout)
-                    .await?;
+                let results = mgr.set_breakpoints(file, vec![bp], timeout).await?;
 
                 Ok(format_breakpoints_result(file, line, &results))
             }
@@ -388,9 +404,7 @@ impl Tool for DebugTool {
             Action::RemoveBreakpoints => {
                 let file = required_nonblank(args.file.as_deref(), "file", "remove_breakpoints")?;
 
-                let results = mgr
-                    .set_breakpoints(file, vec![], timeout)
-                    .await?;
+                let results = mgr.set_breakpoints(file, vec![], timeout).await?;
 
                 Ok(format!(
                     "Removed all breakpoints from {} ({} remaining in adapter)",
@@ -406,11 +420,14 @@ impl Tool for DebugTool {
             }
 
             Action::StepOver => {
-                let thread_id = args
-                    .thread_id
-                    .ok_or_else(|| ToolError::Msg("`thread_id` is required for step_over".into()))?;
+                let thread_id = args.thread_id.ok_or_else(|| {
+                    ToolError::Msg("`thread_id` is required for step_over".into())
+                })?;
                 let summary = mgr.step_over(thread_id, &signal, timeout).await?;
-                Ok(format!("Step over complete.\n{}", format_sessions(&summary)))
+                Ok(format!(
+                    "Step over complete.\n{}",
+                    format_sessions(&summary)
+                ))
             }
 
             Action::StepIn => {
@@ -449,9 +466,9 @@ impl Tool for DebugTool {
             }
 
             Action::StackTrace => {
-                let thread_id = args
-                    .thread_id
-                    .ok_or_else(|| ToolError::Msg("`thread_id` is required for stack_trace".into()))?;
+                let thread_id = args.thread_id.ok_or_else(|| {
+                    ToolError::Msg("`thread_id` is required for stack_trace".into())
+                })?;
                 let frames = mgr.stack_trace(thread_id, args.levels, timeout).await?;
 
                 let output = serde_json::to_string_pretty(&frames)
@@ -496,8 +513,8 @@ impl Tool for DebugTool {
                 })?;
                 let vars = mgr.variables(variable_ref, timeout).await?;
 
-                let output = serde_json::to_string_pretty(&vars)
-                    .unwrap_or_else(|_| format!("{:?}", vars));
+                let output =
+                    serde_json::to_string_pretty(&vars).unwrap_or_else(|_| format!("{:?}", vars));
                 Ok(format!(
                     "Variables (ref {}):\n{}",
                     variable_ref,
@@ -512,7 +529,10 @@ impl Tool for DebugTool {
                     Ok("Disconnected with restart.".into())
                 } else {
                     let summary = mgr.terminate(timeout).await?;
-                    Ok(format!("Debug session terminated.\n{}", format_sessions(&summary)))
+                    Ok(format!(
+                        "Debug session terminated.\n{}",
+                        format_sessions(&summary)
+                    ))
                 }
             }
 
@@ -524,33 +544,57 @@ impl Tool for DebugTool {
                 }
             }
 
+            Action::FunctionBreakpoints => {
+                let function_name = required_nonblank(
+                    args.function.as_deref(),
+                    "function",
+                    "function_breakpoints",
+                )?;
+                let fb = FunctionBreakpoint {
+                    name: function_name.to_string(),
+                    condition: args.condition,
+                    ..Default::default()
+                };
+
+                let results = mgr.set_function_breakpoints(vec![fb], timeout).await?;
+
+                Ok(format!(
+                    "Function breakpoint set on {} ({} breakpoints in adapter)",
+                    function_name,
+                    results.len()
+                ))
+            }
+
             #[cfg(feature = "lsp")]
             Action::RunToCursor => {
                 let file = required_nonblank(args.file.as_deref(), "file", "run_to_cursor")?;
                 let line = args
                     .line
                     .ok_or_else(|| ToolError::Msg("`line` is required for run_to_cursor".into()))?;
-                let lsp = self.lsp_manager.as_ref().ok_or_else(|| {
-                    ToolError::Msg("LSP not available for run_to_cursor".into())
-                })?;
+                let lsp = self
+                    .lsp_manager
+                    .as_ref()
+                    .ok_or_else(|| ToolError::Msg("LSP not available for run_to_cursor".into()))?;
 
                 run_to_cursor(mgr, lsp, file, line, args.thread_id, &signal, timeout).await
             }
 
             #[cfg(feature = "lsp")]
             Action::RestartFrame => {
-                let frame_id = args
-                    .frame_id
-                    .ok_or_else(|| ToolError::Msg("`frame_id` is required for restart_frame".into()))?;
+                let frame_id = args.frame_id.ok_or_else(|| {
+                    ToolError::Msg("`frame_id` is required for restart_frame".into())
+                })?;
                 mgr.restart_frame(frame_id, timeout).await?;
-                Ok(format!("Restarted frame {frame_id}. Re-executing from frame start."))
+                Ok(format!(
+                    "Restarted frame {frame_id}. Re-executing from frame start."
+                ))
             }
 
             #[cfg(feature = "lsp")]
             Action::BacktraceDiagnostics => {
-                let thread_id = args
-                    .thread_id
-                    .ok_or_else(|| ToolError::Msg("`thread_id` is required for backtrace_diagnostics".into()))?;
+                let thread_id = args.thread_id.ok_or_else(|| {
+                    ToolError::Msg("`thread_id` is required for backtrace_diagnostics".into())
+                })?;
                 let lsp = self.lsp_manager.as_ref().ok_or_else(|| {
                     ToolError::Msg("LSP not available for backtrace_diagnostics".into())
                 })?;
@@ -560,12 +604,13 @@ impl Tool for DebugTool {
 
             #[cfg(feature = "lsp")]
             Action::ErrorAnalysis => {
-                let thread_id = args
-                    .thread_id
-                    .ok_or_else(|| ToolError::Msg("`thread_id` is required for error_analysis".into()))?;
-                let lsp = self.lsp_manager.as_ref().ok_or_else(|| {
-                    ToolError::Msg("LSP not available for error_analysis".into())
+                let thread_id = args.thread_id.ok_or_else(|| {
+                    ToolError::Msg("`thread_id` is required for error_analysis".into())
                 })?;
+                let lsp = self
+                    .lsp_manager
+                    .as_ref()
+                    .ok_or_else(|| ToolError::Msg("LSP not available for error_analysis".into()))?;
 
                 error_analysis(mgr, lsp, thread_id, timeout).await
             }
@@ -578,10 +623,7 @@ impl Tool for DebugTool {
 // ---------------------------------------------------------------------------
 
 fn format_launch_summary(s: &crate::dap::types::SessionSummary, adapter: &str) -> String {
-    let mut out = format!(
-        "Launched with {adapter} (session {}).\n",
-        s.id
-    );
+    let mut out = format!("Launched with {adapter} (session {}).\n", s.id);
     if let Some(reason) = &s.stop_reason {
         out.push_str(&format!("Program stopped: {reason}"));
         if let Some(tid) = s.thread_id {
@@ -650,20 +692,23 @@ fn format_continue_outcome(o: &crate::dap::types::ContinueOutcome) -> String {
 }
 
 fn format_sessions(s: &crate::dap::types::SessionSummary) -> String {
-    let mut out = format!(
-        "Session {} ({}) — {:?}",
-        s.id, s.adapter_name, s.status
-    );
+    let mut out = format!("Session {} ({}) — {:?}", s.id, s.adapter_name, s.status);
     if let Some(reason) = &s.stop_reason {
         out.push_str(&format!("\nStop reason: {reason}"));
         if let Some(tid) = s.thread_id {
             out.push_str(&format!(" (thread {tid})"));
         }
     }
+    if !s.languages.is_empty() {
+        out.push_str(&format!("\nLanguages: {}", s.languages.join(", ")));
+    }
     out.push_str(&format!(
         "\nBreakpoints: {} file, {} function",
         s.breakpoint_count, s.function_breakpoint_count
     ));
+    if s.capabilities.is_some() {
+        out.push_str("\nCapabilities: loaded");
+    }
     out
 }
 
@@ -687,11 +732,19 @@ async fn run_to_cursor(
     timeout: Duration,
 ) -> Result<String, ToolError> {
     // Set a breakpoint at the target line.
-    let bp = SourceBreakpoint { line, column: None, condition: None, log_message: None, hit_condition: None };
+    let bp = SourceBreakpoint {
+        line: line as i64,
+        column: None,
+        condition: None,
+        log_message: None,
+        hit_condition: None,
+    };
     mgr.set_breakpoints(file, vec![bp], timeout).await?;
 
     // Continue to the breakpoint.
-    let outcome = mgr.continue_(thread_id.unwrap_or(0), signal, timeout).await?;
+    let outcome = mgr
+        .continue_(thread_id.unwrap_or(0), signal, timeout)
+        .await?;
 
     // Get hover info from LSP at the stopped location.
     let mut result = format_continue_outcome(&outcome);
@@ -700,8 +753,7 @@ async fn run_to_cursor(
             let path = Path::new(file);
             let hover_results = lsp.hover(path, line.saturating_sub(1), 0).await;
             if !hover_results.is_empty() {
-                let hover_json =
-                    serde_json::to_string_pretty(&hover_results).unwrap_or_default();
+                let hover_json = serde_json::to_string_pretty(&hover_results).unwrap_or_default();
                 result.push_str(&format!("\n\nHover info at {file}:{line}:\n{hover_json}"));
             }
         }
@@ -734,13 +786,17 @@ async fn backtrace_diagnostics(
 
                     let p = std::path::PathBuf::from(path);
                     // Touch file to ensure LSP server is aware of it.
-                    lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify).await;
+                    lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify)
+                        .await;
 
                     let diags = all_diags.get(&p).map(|v| v.as_slice()).unwrap_or(&[]);
                     if diags.is_empty() {
                         out.push_str(&format!("  [{i}] {frame_loc} — no diagnostics\n"));
                     } else {
-                        out.push_str(&format!("  [{i}] {frame_loc} — {} diagnostics:\n", diags.len()));
+                        out.push_str(&format!(
+                            "  [{i}] {frame_loc} — {} diagnostics:\n",
+                            diags.len()
+                        ));
                         for d in diags.iter().take(5) {
                             let severity = format!("{:?}", d.severity);
                             out.push_str(&format!(
@@ -778,7 +834,8 @@ async fn error_analysis(
             if let Some(ref path) = source.path {
                 if seen_files.insert(path.clone()) {
                     let p = std::path::PathBuf::from(path);
-                    lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify).await;
+                    lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify)
+                        .await;
 
                     let frame_loc = match source.name.as_deref() {
                         Some(name) => format!("{name}:{}", frame.line),
@@ -788,19 +845,19 @@ async fn error_analysis(
                     out.push_str(&format!("Frame [{i}]: {frame_loc}\n"));
 
                     let diags = all_diags.get(&p).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let error_diags: Vec<_> = diags.iter().filter(|d| {
-                        matches!(d.severity, Some(lsp_types::DiagnosticSeverity::ERROR))
-                    }).collect();
+                    let error_diags: Vec<_> = diags
+                        .iter()
+                        .filter(|d| {
+                            matches!(d.severity, Some(lsp_types::DiagnosticSeverity::ERROR))
+                        })
+                        .collect();
 
                     if error_diags.is_empty() {
                         out.push_str("  No error diagnostics in this file.\n");
                     } else {
                         for d in error_diags.iter().take(5) {
                             let bp_line = d.range.start.line + 1;
-                            out.push_str(&format!(
-                                "  Error at line {bp_line}: {}\n",
-                                d.message
-                            ));
+                            out.push_str(&format!("  Error at line {bp_line}: {}\n", d.message));
                             out.push_str(&format!(
                                 "    → debug set_breakpoints file={path} line={bp_line}\n"
                             ));

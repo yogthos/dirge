@@ -247,6 +247,7 @@ async fn run_compaction_pass(
 /// `handle_compress` does for the /compress slash command. Auto-
 /// fold is the high-frequency path; without the fire, plugin
 /// providers' extracted insights are silently dropped.
+#[allow(clippy::too_many_arguments)]
 async fn run_compaction_pass_with_focus(
     current_context: &mut Context,
     summarize_fn: &Option<crate::agent::compression::SummarizeFn>,
@@ -505,6 +506,7 @@ async fn restore_working_files(
 /// pass after the cheap `prune_tool_outputs` pre-pass — see
 /// `crate::agent::compression::SummarizeFn` for the contract. Pass
 /// `None` to disable LLM-summary compaction.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_loop(
     prompts: Vec<LoopMessage>,
     mut context: Context,
@@ -589,6 +591,7 @@ pub async fn run_agent_loop(
 /// Owns `current_context`, `new_messages`, `config` — pi mutates
 /// these as the run proceeds; in Rust we own them by value and
 /// return `new_messages` at the end.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_loop(
     mut current_context: Context,
     mut new_messages: Vec<LoopMessage>,

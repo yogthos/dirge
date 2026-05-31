@@ -515,7 +515,7 @@ pub(crate) async fn run_memory_curator_review(
 ///
 /// Reuses `spawn_memory_curator_runner` (memory-only allow-list)
 /// + the `AbortRunnerOnDrop` guard, and writes `LLM_REPORT.md`
-/// under `.dirge/memory/.cross_session_reports/{ts}/`.
+///   under `.dirge/memory/.cross_session_reports/{ts}/`.
 pub(crate) async fn run_cross_session_extraction(
     agent: AnyAgent,
     paths: crate::extras::dirge_paths::ProjectPaths,

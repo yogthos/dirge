@@ -1681,7 +1681,7 @@ pub(crate) fn wrap_input(
 
         if li == cursor_line_idx {
             let col = cursor_display_col;
-            let (vr, vc) = if col > 0 && col == display_width && col.is_multiple_of(wrap_width) {
+            let (vr, vc) = if col > 0 && col == display_width && col % wrap_width == 0 {
                 // End of a line that exactly fills the last row — stay on
                 // the filled row, position cursor past its last char.
                 (col / wrap_width - 1, wrap_width)

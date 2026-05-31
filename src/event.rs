@@ -32,6 +32,7 @@ pub enum ToolContent {
 /// (IMPROVEMENTS_PLAN #5). A spike in `PruneAndFailedSummary` is an
 /// early warning that the summarizer is broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum CompactionKind {
     /// Pruning only — no LLM summarizer ran (none wired, circuit breaker
     /// open, or the middle was empty).

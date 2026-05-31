@@ -120,7 +120,7 @@ semantic-cpp = ["semantic", "dep:tree-sitter-cpp"]
 semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
-dap = ["dep:which"]
+dap = ["dep:which", "dep:dap"]
 experimental-ui-tab-slash = []
 experimental-ui-terminal-tab = []
 
@@ -239,6 +239,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # which: locate debug adapter binaries on the system PATH at session
 # startup rather than requiring explicit paths in config.
 which = { version = "8", optional = true }
+# dap: Debug Adapter Protocol types from dap-rs. Replaces our hand-rolled
+# types in src/dap/types.rs. The `client` feature enables Deserialize on
+# response/event types so we can deserialize adapter responses.
+dap = { version = "0.4.1-alpha1", features = ["client"], optional = true }
 # YAML parser for skill frontmatter (replaces hand-rolled parser in
 # `src/extras/skills/format.rs`). `yaml-rust2` is the maintained fork
 # of the abandoned `yaml-rust` crate, fully YAML 1.2 compliant.

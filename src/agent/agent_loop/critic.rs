@@ -109,8 +109,8 @@ pub fn parse_verdict(response: &str) -> Option<String> {
         // Everything after the first line is the issue list; fall back to
         // the whole response if the model put issues on the first line.
         let rest = trimmed
-            .splitn(2, '\n')
-            .nth(1)
+            .split_once('\n')
+            .map(|(_, x)| x)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(trimmed);

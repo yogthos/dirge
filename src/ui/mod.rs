@@ -125,7 +125,7 @@ use tool_display::*;
 // config, session, context, hooks, plugin manager, …) is threaded in
 // explicitly so the TUI loop owns no globals. Refactoring into a
 // context struct is tracked separately; silence the lint.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn run_interactive(
     client: AnyClient,
     mut agent: AnyAgent,

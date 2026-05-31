@@ -1,9 +1,9 @@
 mod agent;
 mod cli;
 mod config;
+mod context;
 #[cfg(feature = "dap")]
 mod dap;
-mod context;
 mod event;
 mod extras;
 mod fs_atomic;
