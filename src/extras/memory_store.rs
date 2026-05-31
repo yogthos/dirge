@@ -197,7 +197,13 @@ impl MemoryStore {
 
     /// Add a new entry. Returns error if the entry already exists
     /// (exact match) or the char budget would be exceeded.
-    pub fn add(&mut self, entry: &str) -> Result<(), String> {
+    /// Add an entry. Returns the number of OLD entries that were evicted to
+    /// make room (usually 0). dirge-mc0p: when the char budget is full, the
+    /// store COMPACTS — it evicts the oldest entries (front of the list)
+    /// until the new entry fits — instead of failing the write. A fresh
+    /// memory worth saving shouldn't be lost because older, staler memories
+    /// filled the budget; the oldest are the most likely to be obsolete.
+    pub fn add(&mut self, entry: &str) -> Result<usize, String> {
         // Scan for injection threats.
         scan_for_threats(entry)?;
 
@@ -220,23 +226,34 @@ impl MemoryStore {
             return Err("Duplicate entry — already exists in memory".to_string());
         }
 
-        // Check char budget.
-        let new_total: usize =
-            self.entries.iter().map(|e| e.len() + 3).sum::<usize>() + entry.len();
-        if new_total > self.char_limit {
-            let current: usize = self.entries.iter().map(|e| e.len() + 3).sum();
+        // Char budget. Only an entry larger than the WHOLE budget is
+        // genuinely unsaveable (and that's a real error — split it).
+        let entry_cost = entry.len();
+        if entry_cost > self.char_limit {
             return Err(format!(
-                "Char budget exceeded: {} used, {} limit, {} would be added",
-                current,
-                self.char_limit,
-                entry.len()
+                "Entry is {entry_cost} chars but the entire memory budget is {}; \
+                 split it into smaller entries.",
+                self.char_limit
             ));
+        }
+
+        // Compact: evict the oldest entries until the new one fits. (Each
+        // existing entry costs `len + 3` for its `\n§\n` delimiter; the new
+        // entry's own delimiter isn't counted, matching the prior accounting.)
+        let mut evicted = 0usize;
+        while !self.entries.is_empty() {
+            let current: usize = self.entries.iter().map(|e| e.len() + 3).sum();
+            if current + entry_cost <= self.char_limit {
+                break;
+            }
+            self.entries.remove(0); // oldest first
+            evicted += 1;
         }
 
         self.entries.push(entry);
         self.write_to_disk()?;
 
-        Ok(())
+        Ok(evicted)
     }
 
     /// Replace an entry found by substring match. If multiple
@@ -432,8 +449,16 @@ impl MemoryToolStore {
     pub fn add(&self, target: &str, content: &str) -> Result<serde_json::Value, String> {
         let store = self.store_for(target);
         let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
-        guard.add(content)?;
-        Ok(self.success_response(&guard, target, "Entry added."))
+        let evicted = guard.add(content)?;
+        let message = if evicted > 0 {
+            format!(
+                "Entry added; compacted {evicted} oldest entr{} to stay within the memory budget.",
+                if evicted == 1 { "y" } else { "ies" }
+            )
+        } else {
+            "Entry added.".to_string()
+        };
+        Ok(self.success_response(&guard, target, &message))
     }
 
     pub fn replace(
@@ -890,19 +915,53 @@ mod tests {
         assert!(err.contains("Security scan"), "got: {err}");
     }
 
+    /// A single entry larger than the WHOLE budget can never fit — that's a
+    /// real, unrecoverable error (split it), not a compaction case.
     #[test]
-    fn char_budget_exceeded_rejected() {
+    fn oversized_single_entry_is_rejected() {
         let (paths, _dir) = temp_project();
-        let tiny_limit = 20;
-        let mut store = MemoryStore::load(&paths, "MEMORY.md", tiny_limit).unwrap();
-
-        // This should fit.
+        let mut store = MemoryStore::load(&paths, "MEMORY.md", 20).unwrap();
         store.add("short").unwrap();
-
-        // This should exceed.
         let big = "a".repeat(50);
         let err = store.add(&big).unwrap_err();
-        assert!(err.contains("Char budget"), "got: {err}");
+        assert!(err.contains("entire memory budget"), "got: {err}");
+    }
+
+    /// dirge-mc0p: when the budget is full, adding a new (fitting) entry
+    /// COMPACTS — evicting the oldest entries — instead of failing the
+    /// write. The user reported the old behavior (the model just gives up
+    /// when the budget is exceeded); this is the correct behavior.
+    #[test]
+    fn add_over_budget_compacts_oldest_instead_of_failing() {
+        let (paths, _dir) = temp_project();
+        let limit = 30; // ~2 of these 11-char entries (+3 delimiter each)
+        let mut store = MemoryStore::load(&paths, "MEMORY.md", limit).unwrap();
+
+        assert_eq!(store.add("oldest-aaaa").unwrap(), 0, "first fits, no evict");
+        assert_eq!(
+            store.add("middle-bbbb").unwrap(),
+            0,
+            "second fits, no evict"
+        );
+
+        // The third would overflow — it must EVICT the oldest, not error.
+        let evicted = store.add("newest-cccc").unwrap();
+        assert!(evicted >= 1, "over-budget add must compact, not fail");
+
+        let live = store.live_entries();
+        assert!(
+            live.iter().any(|e| e.contains("newest-cccc")),
+            "the new entry must be saved"
+        );
+        assert!(
+            !live.iter().any(|e| e.contains("oldest-aaaa")),
+            "the oldest entry must be evicted"
+        );
+        let used: usize = live.iter().map(|e| e.len() + 3).sum();
+        assert!(
+            used <= limit,
+            "store stays within budget: used {used} <= {limit}"
+        );
     }
 
     #[test]
