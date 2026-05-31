@@ -745,3 +745,72 @@ fn extend_loop_tools_without_dynamic_search_only_grows_registry() {
     assert!(agent.tool_def_filter.is_none());
     assert!(agent.tool_search_registry.is_none());
 }
+
+/// dirge-tpx6 end-to-end: a background-injected tool, under
+/// `dynamic_tool_search`, travels the WHOLE path through the real
+/// request-def + filter functions: built into the per-request def list →
+/// HIDDEN until discovered → discoverable by `tool_search` ranking the
+/// live registry → VISIBLE once the loaded-set is marked → dispatchable
+/// by name. Composes the pieces no single unit test covers.
+#[cfg(feature = "mcp")]
+#[test]
+fn injected_tool_is_gated_then_visible_then_dispatchable() {
+    use crate::agent::agent_loop::loop_tool_to_rig_definition;
+    use crate::agent::agent_loop::rig_stream_factory::filter_tool_defs;
+    use crate::agent::tools::tool_search::{ToolMeta, rank_tools};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    let filter: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let registry: Arc<Mutex<Vec<ToolMeta>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut agent =
+        build_openai_any_agent().with_dynamic_tool_search(filter.clone(), registry.clone());
+
+    // Background injection of an MCP-style tool.
+    agent.extend_loop_tools(vec![Arc::new(NamedTool("mcp_demo"))]);
+
+    // The per-request tool-def list `spawn_runner` builds from loop_tools
+    // includes it (so dispatch can resolve it once the model calls it).
+    let defs: Vec<_> = agent
+        .loop_tools
+        .iter()
+        .map(|t| loop_tool_to_rig_definition(t.as_ref()))
+        .collect();
+    assert!(
+        defs.iter().any(|d| d.name == "mcp_demo"),
+        "injected tool must be in the def list"
+    );
+
+    // GATED: before discovery the request filter hides it (not loaded).
+    let before = filter_tool_defs(&defs, Some(&filter));
+    assert!(
+        !before.iter().any(|d| d.name == "mcp_demo"),
+        "must be hidden until discovered via tool_search"
+    );
+
+    // DISCOVERABLE: tool_search ranks the LIVE registry and finds it.
+    {
+        let reg = registry.lock().unwrap();
+        let hits = rank_tools(&reg, "mcp_demo", 5);
+        assert!(
+            hits.iter().any(|m| m.name == "mcp_demo"),
+            "tool_search must be able to discover the injected tool"
+        );
+    }
+
+    // tool_search marks a hit loaded — simulate that single effect.
+    filter.lock().unwrap().insert("mcp_demo".to_string());
+
+    // VISIBLE: now the def ships on the next request.
+    let after = filter_tool_defs(&defs, Some(&filter));
+    assert!(
+        after.iter().any(|d| d.name == "mcp_demo"),
+        "must ship in the request once discovered"
+    );
+
+    // DISPATCHABLE: the loop resolves the call by name in loop_tools.
+    assert!(
+        agent.loop_tools.iter().any(|t| t.name() == "mcp_demo"),
+        "dispatch must find the tool by name"
+    );
+}
