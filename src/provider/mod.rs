@@ -2071,7 +2071,17 @@ fn build_critic_fn(
         let model_name = model_name.clone();
         Box::pin(async move {
             let model = client.completion_model(model_name);
-            summarize::summarize_with_model(model, prompt).await
+            // dirge-0g6i: distinct retry/telemetry label so the critic's
+            // calls aren't conflated with the summarizer's. (Same preamble
+            // as the summarizer path — the critic's instructions live in
+            // the prompt body.)
+            summarize::oneshot_with_model(
+                model,
+                "critic",
+                "You are a conversation summarizer.",
+                prompt,
+            )
+            .await
         })
             as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
     }))
@@ -2103,7 +2113,8 @@ pub fn build_approval_fn(
         Box::pin(async move {
             let model = client.completion_model(model_name);
             let prompt = build_evaluator_prompt(&req);
-            let raw = summarize::oneshot_with_model(model, EVALUATOR_PREAMBLE, prompt).await?;
+            let raw = summarize::oneshot_with_model(model, "approval", EVALUATOR_PREAMBLE, prompt)
+                .await?;
             Ok::<ApprovalDecision, anyhow::Error>(parse_decision(&raw))
         })
             as std::pin::Pin<

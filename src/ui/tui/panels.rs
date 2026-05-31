@@ -1016,6 +1016,45 @@ mod tests {
         );
     }
 
+    /// dirge-sb2n: with N files the MODIFIED box is content-sized — 2
+    /// borders + one row per file — NOT pane-filling. Complements
+    /// `modified_box_paints_three_rows_when_empty` (the empty case) and
+    /// pins the user-visible symptom from the report: 4 files paint a
+    /// 6-row box on a tall panel.
+    #[test]
+    fn modified_box_grows_to_content_height_with_files() {
+        let mut data = PanelData::default();
+        data.modified = vec![
+            "src/verify.ts".into(),
+            "test/todatests.test.ts".into(),
+            "src/graph.ts".into(),
+            "src/interpreter.ts".into(),
+        ];
+        let layout = Layout::new(160, 40, 1);
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(RightPanel::new(&data), layout.right_panel))
+            .unwrap();
+        let backend = terminal.backend().clone();
+        let row = |y: u16| -> String {
+            (layout.right_panel.x..layout.right_panel.x + layout.right_panel.width)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        let title_y = (layout.right_panel.y..layout.right_panel.y + layout.right_panel.height)
+            .find(|&y| row(y).contains("[MODIFIED]"))
+            .expect("MODIFIED title");
+        let bottom_y = (title_y + 1..layout.right_panel.y + layout.right_panel.height)
+            .find(|&y| row(y).contains('╰'))
+            .expect("MODIFIED bottom border");
+        assert_eq!(
+            bottom_y - title_y,
+            5,
+            "4 files → 6-row box (2 borders + 4 rows), not pane-filling"
+        );
+    }
+
     /// CPU/MEM bar formatting.
     #[test]
     fn bar_formatting() {
