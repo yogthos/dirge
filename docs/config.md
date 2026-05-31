@@ -442,11 +442,18 @@ Per-server fields (all optional):
 
 | Field            | Type             | Description |
 | ---------------- | ---------------- | ----------- |
-| `command`        | string[]         | argv to launch the server. Replaces the built-in default. |
-| `extensions`     | string[]         | *Reserved.* Currently ignored — see "Known limitations" below. |
-| `env`            | object           | extra env vars for the child process. |
-| `initialization` | object           | sent as `initializationOptions` in the LSP `initialize` request. |
-| `disabled`       | boolean          | `true` removes the server entirely. |
+| `command`           | string[] | argv to launch the server. Replaces the built-in default. |
+| `extensions`        | string[] | **Replaces** the server's built-in extension list. |
+| `extend_extensions` | string[] | **Appends** to the built-in list (deduped). e.g. route `.janet` to `clojure-lsp` without re-listing clj/cljs/cljc/edn/bb. Accepts `extendExtensions` too. |
+| `env`               | object   | extra env vars for the child process. |
+| `initialization`    | object   | sent as `initializationOptions` in the LSP `initialize` request. |
+| `disabled`          | boolean  | `true` removes the server entirely. |
+
+Example — make `clojure-lsp` also handle Janet files (keeps the built-in Clojure extensions):
+
+```json
+{ "lsp": { "clojure-lsp": { "extend_extensions": ["janet"] } } }
+```
 
 CLI flag: `--no-lsp` (overrides the config; same effect as `lsp: false`).
 

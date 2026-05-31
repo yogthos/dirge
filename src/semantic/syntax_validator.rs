@@ -214,10 +214,110 @@ pub fn check_syntax(path: &Path, content: &str) -> Result<(), Vec<SyntaxError>> 
     Err(errors)
 }
 
+/// Lisp-family extensions whose delimiter balance is worth summarizing.
+/// A tree-sitter "syntax error at L:C" is nearly useless for an
+/// unbalanced paren; a balance summary points straight at the culprit.
+fn is_lisp_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+            .as_deref(),
+        Some(
+            "clj"
+                | "cljs"
+                | "cljc"
+                | "cljd"
+                | "edn"
+                | "bb"
+                | "janet"
+                | "jdn"
+                | "fnl"
+                | "lisp"
+                | "el"
+                | "scm"
+                | "rkt"
+        )
+    )
+}
+
+/// Scan Lisp source for a delimiter imbalance and return a concrete,
+/// actionable summary — the model should never have to count parens by
+/// hand. Quote/char-literal/comment aware (`"…"`, `\(`, `; …`). Returns
+/// `None` when delimiters are balanced (then the real error is elsewhere).
+pub fn lisp_delimiter_summary(content: &str) -> Option<String> {
+    let mut stack: Vec<(char, usize, usize)> = Vec::new(); // (open, line, col)
+    let (mut line, mut col) = (1usize, 1usize);
+    let mut in_string = false;
+    let mut in_comment = false;
+    let mut skip_next = false; // consume the char after `\` (char literal / escape)
+    for c in content.chars() {
+        if skip_next {
+            skip_next = false;
+        } else if in_comment {
+            if c == '\n' {
+                in_comment = false;
+            }
+        } else if in_string {
+            match c {
+                '\\' => skip_next = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '\\' => skip_next = true,
+                '"' => in_string = true,
+                ';' => in_comment = true,
+                '(' | '[' | '{' => stack.push((c, line, col)),
+                ')' | ']' | '}' => {
+                    let want = match c {
+                        ')' => '(',
+                        ']' => '[',
+                        _ => '{',
+                    };
+                    match stack.last() {
+                        Some(&(open, _, _)) if open == want => {
+                            stack.pop();
+                        }
+                        _ => {
+                            return Some(format!(
+                                "Delimiter imbalance: unexpected `{c}` at line {line}, col {col} \
+                                 with no matching open — remove an extra closer, or add the \
+                                 missing opener before it."
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if c == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    stack.first().map(|&(open, l, c)| {
+        let close = match open {
+            '(' => ')',
+            '[' => ']',
+            _ => '}',
+        };
+        format!(
+            "Delimiter imbalance: {n} unclosed — the `{open}` opened at line {l}, col {c} is \
+             never closed; add {n} matching `{close}` (do not count by hand — fix this delimiter).",
+            n = stack.len()
+        )
+    })
+}
+
 /// Convenience wrapper: format a `Vec<SyntaxError>` as a single
 /// multi-line string suitable for inclusion in a tool error
-/// message. Call sites do not need to format individually.
-pub fn format_errors(path: &Path, errors: &[SyntaxError]) -> String {
+/// message. For Lisp files a delimiter-balance summary is appended so
+/// the model gets actionable paren feedback instead of a bare line:col.
+pub fn format_errors(path: &Path, content: &str, errors: &[SyntaxError]) -> String {
     let mut out = format!(
         "Syntax check failed for {}: {} error(s) detected by tree-sitter. \
          Fix and re-submit. (This is a pre-write guard — the file was NOT modified.)\n",
@@ -233,6 +333,13 @@ pub fn format_errors(path: &Path, errors: &[SyntaxError]) -> String {
             "  …(truncated at {} errors; fix the listed issues and re-check)\n",
             MAX_ERRORS,
         ));
+    }
+    if is_lisp_ext(path)
+        && let Some(summary) = lisp_delimiter_summary(content)
+    {
+        out.push_str("  ");
+        out.push_str(&summary);
+        out.push('\n');
     }
     out
 }
@@ -287,8 +394,46 @@ mod tests {
         let path = PathBuf::from("/tmp/x.rs");
         let result = check_syntax(&path, "fn main( { ");
         let errors = result.expect_err("expected errors");
-        let rendered = format_errors(&path, &errors);
+        let rendered = format_errors(&path, "fn main( { ", &errors);
         assert!(rendered.contains("/tmp/x.rs"));
         assert!(rendered.contains("error(s) detected"));
+    }
+
+    #[test]
+    fn lisp_summary_points_at_first_unclosed_open() {
+        // `(defn f [x` — one unclosed `(` and one unclosed `[`.
+        let s = lisp_delimiter_summary("(defn f [x\n  (+ x 1)").expect("imbalanced");
+        assert!(s.contains("unclosed"), "{s}");
+        assert!(s.contains("line 1"), "should point at the first open: {s}");
+    }
+
+    #[test]
+    fn lisp_summary_flags_extra_closer() {
+        let s = lisp_delimiter_summary("(+ 1 2))").expect("extra closer");
+        assert!(s.contains("unexpected"), "{s}");
+        assert!(s.contains("no matching open"), "{s}");
+    }
+
+    #[test]
+    fn lisp_summary_is_none_when_balanced() {
+        assert!(lisp_delimiter_summary("(defn f [x] (+ x 1))").is_none());
+        // Parens inside a string and a char literal don't count toward
+        // balance — the outer form here is balanced.
+        assert!(lisp_delimiter_summary(r#"(str "a(b)c" \()"#).is_none());
+        // A trailing comment's parens are ignored too.
+        assert!(lisp_delimiter_summary("(+ 1 2) ; ) ) )").is_none());
+    }
+
+    #[cfg(feature = "semantic-clojure")]
+    #[test]
+    fn format_errors_appends_delimiter_summary_for_clojure() {
+        let path = PathBuf::from("/tmp/x.cljs");
+        let content = "(defn f [x] (+ x 1)"; // one unclosed `(`
+        let errors = check_syntax(&path, content).expect_err("expected errors");
+        let rendered = format_errors(&path, content, &errors);
+        assert!(
+            rendered.contains("Delimiter imbalance"),
+            "Clojure error should carry the paren-balance hint: {rendered}"
+        );
     }
 }

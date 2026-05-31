@@ -108,7 +108,7 @@ impl Tool for WriteTool {
         #[cfg(feature = "semantic")]
         if let Err(errors) = crate::semantic::syntax_validator::check_syntax(path, &args.content) {
             return Err(ToolError::Msg(
-                crate::semantic::syntax_validator::format_errors(path, &errors),
+                crate::semantic::syntax_validator::format_errors(path, &args.content, &errors),
             ));
         }
         if let Some(parent) = path.parent() {

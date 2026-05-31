@@ -473,9 +473,9 @@ mod tests {
     /// Max retries exceeded → final Error surfaces.
     #[tokio::test]
     async fn surfaces_error_after_max_retries() {
-        // Default policy has 3 max retries. 4 consecutive Network
-        // errors → first 3 retried, 4th surfaces.
-        let attempts: Vec<Vec<StreamEvent>> = (0..5)
+        // Default policy has 5 max retries. 6 consecutive Network
+        // errors → first 5 retried, 6th surfaces.
+        let attempts: Vec<Vec<StreamEvent>> = (0..6)
             .map(|_| {
                 vec![StreamEvent::Error {
                     error: "network: connection timed out".to_string(),
@@ -497,12 +497,10 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(600)).await;
         let events = task.await.unwrap();
 
-        // 4 inner calls total: 0, 1, 2 retried; 3rd surfaces.
-        // Policy: max_retries = 3 means attempts < 3 retries.
-        // Attempt counter: 0 fails → retry (attempts=1); 1 fails →
-        // retry (attempts=2); 2 fails → retry (attempts=3); 3
-        // fails → !should_retry → surface. Total: 4 inner calls.
-        assert_eq!(counter.load(Ordering::SeqCst), 4);
+        // max_retries = 5: attempts 0..=4 retry, attempt 5 surfaces.
+        // 0 fails → retry; 1,2,3,4 fail → retry; 5 fails →
+        // !should_retry → surface. Total: 6 inner calls.
+        assert_eq!(counter.load(Ordering::SeqCst), 6);
         assert!(matches!(events.last(), Some(StreamEvent::Error { .. })));
     }
 

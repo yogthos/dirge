@@ -94,7 +94,9 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
     // syntactically-broken files. See docs/AGENTIC_LOOP_PLAN.md §2.
     #[cfg(feature = "semantic")]
     if let Err(errors) = crate::semantic::syntax_validator::check_syntax(p, content) {
-        return Err(crate::semantic::syntax_validator::format_errors(p, &errors));
+        return Err(crate::semantic::syntax_validator::format_errors(
+            p, content, &errors,
+        ));
     }
     crate::fs_atomic::atomic_write(p, content.as_bytes())
         .await
@@ -166,6 +168,7 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     {
         return Err(crate::semantic::syntax_validator::format_errors(
             std::path::Path::new(path),
+            &to_write,
             &errors,
         ));
     }

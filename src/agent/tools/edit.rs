@@ -314,6 +314,7 @@ impl Tool for EditTool {
             return Err(ToolError::Msg(
                 crate::semantic::syntax_validator::format_errors(
                     std::path::Path::new(&resolved_path),
+                    &output,
                     &errors,
                 ),
             ));

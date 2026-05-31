@@ -59,7 +59,13 @@ pub struct RecoveryPolicy {
 impl Default for RecoveryPolicy {
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            // Transient provider blips ("error sending request", 5xx, rate
+            // limits) are common enough that 3 retries (~7s of backoff)
+            // still surfaced hard failures to the user. 5 retries with the
+            // exponential schedule below waits ~1+2+4+8+16 ≈ 31s before
+            // giving up, which rides out the typical short outage without
+            // stalling the agent indefinitely.
+            max_retries: 5,
             backoff_base: Duration::from_secs(1),
         }
     }
@@ -551,6 +557,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn default_budget_retries_transient_failures_up_to_five_times() {
+        let p = RecoveryPolicy::default();
+        assert_eq!(p.max_retries(), 5);
+        // A transient (network) error is retryable up to, but not past,
+        // the budget.
+        assert!(p.should_retry(0, ErrorKind::Network));
+        assert!(p.should_retry(4, ErrorKind::Network));
+        assert!(!p.should_retry(5, ErrorKind::Network));
+        // Non-retryable kinds never retry, regardless of budget.
+        assert!(!p.should_retry(0, ErrorKind::Auth));
+    }
+
     // dirge-6cvc: the shared retry helper — success, immediate bail on a
     // non-retryable error, and retry-then-succeed on a transient one.
     #[tokio::test]
@@ -877,11 +896,11 @@ mod tests {
     fn test_retry_policy() {
         let policy = RecoveryPolicy::default();
 
-        // Network errors are retryable
+        // Network errors are retryable up to the budget (5).
         assert!(policy.should_retry(0, ErrorKind::Network));
-        assert!(policy.should_retry(1, ErrorKind::Network));
         assert!(policy.should_retry(2, ErrorKind::Network));
-        assert!(!policy.should_retry(3, ErrorKind::Network));
+        assert!(policy.should_retry(4, ErrorKind::Network));
+        assert!(!policy.should_retry(5, ErrorKind::Network));
 
         // Rate limits are retryable
         assert!(policy.should_retry(0, ErrorKind::RateLimit));

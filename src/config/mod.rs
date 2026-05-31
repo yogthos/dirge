@@ -155,6 +155,12 @@ pub struct ToolsConfig {
 pub struct LspServerConfig {
     pub command: Option<Vec<String>>,
     pub extensions: Option<Vec<String>>,
+    /// Extensions to ADD to the server's built-in list (additive — does
+    /// not replace). e.g. `"extend_extensions": ["janet"]` on
+    /// `clojure-lsp` keeps clj/cljs/… and also routes `.janet` files to
+    /// it. Accepts `extendExtensions` too.
+    #[serde(alias = "extendExtensions")]
+    pub extend_extensions: Option<Vec<String>>,
     pub env: Option<HashMap<String, String>>,
     pub initialization: Option<serde_json::Value>,
     pub disabled: Option<bool>,
@@ -164,6 +170,9 @@ pub struct LspServerConfig {
 impl crate::lsp::server::AsExtensionOverride for LspServerConfig {
     fn extensions(&self) -> Option<&[String]> {
         self.extensions.as_deref()
+    }
+    fn extend_extensions(&self) -> Option<&[String]> {
+        self.extend_extensions.as_deref()
     }
     fn disabled(&self) -> bool {
         self.disabled.unwrap_or(false)

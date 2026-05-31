@@ -297,13 +297,26 @@ pub fn apply_extension_overrides<C>(
             to_remove.push(id.clone());
             continue;
         }
-        if let Some(exts) = ovr.extensions() {
-            let normalized: Vec<String> = exts
-                .iter()
+        let normalize = |exts: &[String]| -> Vec<String> {
+            exts.iter()
                 .map(|e| e.trim_start_matches('.').to_lowercase())
-                .collect();
+                .collect()
+        };
+        if let Some(exts) = ovr.extensions() {
             if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
-                s.extensions = normalized;
+                s.extensions = normalize(exts);
+            }
+        }
+        // Additive: append extra extensions (deduped), keeping the
+        // built-in (or just-replaced) list. e.g. add `janet` to
+        // clojure-lsp without re-listing clj/cljs/cljc/edn/bb.
+        if let Some(extra) = ovr.extend_extensions()
+            && let Some(s) = servers.iter_mut().find(|s| s.id == id)
+        {
+            for ext in normalize(extra) {
+                if !s.extensions.contains(&ext) {
+                    s.extensions.push(ext);
+                }
             }
         }
     }
@@ -315,6 +328,12 @@ pub fn apply_extension_overrides<C>(
 /// fixtures without dragging the config module into here.
 pub trait AsExtensionOverride {
     fn extensions(&self) -> Option<&[String]>;
+    /// Extensions to ADD to the server's list (vs. `extensions` which
+    /// replaces it). Lets a user attach e.g. `janet` to clojure-lsp
+    /// without re-listing every built-in extension.
+    fn extend_extensions(&self) -> Option<&[String]> {
+        None
+    }
     fn disabled(&self) -> bool;
 }
 
@@ -323,17 +342,44 @@ mod override_tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[derive(Default)]
     struct StubOverride {
         extensions: Option<Vec<String>>,
+        extend_extensions: Option<Vec<String>>,
         disabled: bool,
     }
     impl AsExtensionOverride for StubOverride {
         fn extensions(&self) -> Option<&[String]> {
             self.extensions.as_deref()
         }
+        fn extend_extensions(&self) -> Option<&[String]> {
+            self.extend_extensions.as_deref()
+        }
         fn disabled(&self) -> bool {
             self.disabled
         }
+    }
+
+    /// Additive `extend_extensions` keeps the built-in list and appends
+    /// the extras (deduped) — e.g. route `.janet` to clojure-lsp without
+    /// re-listing clj/cljs/cljc/edn/bb.
+    #[test]
+    fn extend_extensions_appends_without_replacing() {
+        let mut servers = builtin_servers();
+        let mut overrides: HashMap<String, StubOverride> = HashMap::new();
+        overrides.insert(
+            "clojure-lsp".to_string(),
+            StubOverride {
+                extend_extensions: Some(vec!["janet".to_string(), "CLJ".to_string()]),
+                ..Default::default()
+            },
+        );
+        apply_extension_overrides(&mut servers, &overrides);
+        let clj = servers.iter().find(|s| s.id == "clojure-lsp").unwrap();
+        assert!(clj.extensions.contains(&"clj".to_string()), "kept builtins");
+        assert!(clj.extensions.contains(&"janet".to_string()), "added janet");
+        // Normalized + deduped: "CLJ" → "clj" already present, no dup.
+        assert_eq!(clj.extensions.iter().filter(|e| *e == "clj").count(), 1);
     }
 
     /// Regression: `apply_extension_overrides` actually replaces a
@@ -348,6 +394,7 @@ mod override_tests {
             "rust".to_string(),
             StubOverride {
                 extensions: Some(vec!["rs".to_string(), "rlib".to_string()]),
+                extend_extensions: None,
                 disabled: false,
             },
         );
@@ -365,6 +412,7 @@ mod override_tests {
             "rust".to_string(),
             StubOverride {
                 extensions: None,
+                extend_extensions: None,
                 disabled: true,
             },
         );
@@ -383,6 +431,7 @@ mod override_tests {
             "kotlin-lsp".to_string(),
             StubOverride {
                 extensions: Some(vec!["kt".to_string()]),
+                extend_extensions: None,
                 disabled: false,
             },
         );
@@ -400,6 +449,7 @@ mod override_tests {
             "rust".to_string(),
             StubOverride {
                 extensions: Some(vec![".RS".to_string(), "Rlib".to_string()]),
+                extend_extensions: None,
                 disabled: false,
             },
         );
