@@ -803,6 +803,36 @@ async fn main() -> anyhow::Result<()> {
     // (the checker is built inside `build_channels`).
     crate::permission::apply_prompt_deny(&permission, &context.current_prompt_deny_tools);
 
+    // dirge-0g6i: wire optional LLM auto-approval. When `approval_provider`
+    // is set, a permission prompt is judged by that model instead of the
+    // human (the evaluator is global, read by the `enforce` chokepoint).
+    // Opt-in — `resolve_role(Approval)` has no default fallback. A build
+    // failure or unmatched alias leaves the human-prompt path intact.
+    if cfg.approval_provider.is_some() {
+        match cfg.resolve_role(config::ConfigRole::Approval) {
+            Some((alias, entry)) => {
+                match provider::build_approval_fn(&alias, &entry, &cfg.providers_map()) {
+                    Ok(f) => {
+                        if let Some(perm) = &permission {
+                            perm.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .set_approval_fn(f);
+                            eprintln!(
+                                "info: approval_provider '{alias}' enabled — permission prompts will be auto-evaluated by the LLM"
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "warning: approval_provider '{alias}' configured but client build failed: {e}; falling back to human prompts"
+                    ),
+                }
+            }
+            None => eprintln!(
+                "error: approval_provider is configured but does not match any entry in `providers` or any built-in; falling back to human prompts"
+            ),
+        }
+    }
+
     let completion_model = client.completion_model(model.to_string());
 
     if cli.print {

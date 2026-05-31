@@ -78,6 +78,11 @@ pub struct PermissionChecker {
     /// Mirrored into the engine's `PolicyCtx`; this copy backs
     /// `any_prompt_denied` (the MCP concrete-name probe).
     prompt_deny_tools: Vec<String>,
+    /// dirge-0g6i: optional LLM auto-approval evaluator. When set (via
+    /// `approval_provider`), the `enforce` chokepoint asks it instead of
+    /// the human on an `Ask` decision. Per-checker (not global) so it's
+    /// session-scoped and unit-testable in isolation.
+    approval_fn: Option<crate::permission::approval::ApprovalFn>,
     /// The unified authorization engine — the source of truth for every
     /// runtime decision.
     engine: engine::Engine,
@@ -111,8 +116,22 @@ impl PermissionChecker {
             session_allowlist: Vec::new(),
             mode,
             prompt_deny_tools: Vec::new(),
+            approval_fn: None,
             engine,
         }
+    }
+
+    /// dirge-0g6i: install the LLM auto-approval evaluator (built from
+    /// `approval_provider`). When present, the `enforce` chokepoint routes
+    /// an otherwise-`Ask` decision to it instead of prompting the human.
+    pub fn set_approval_fn(&mut self, f: crate::permission::approval::ApprovalFn) {
+        self.approval_fn = Some(f);
+    }
+
+    /// The configured evaluator, if any. Clones the `Arc` out so the
+    /// caller can `.await` it WITHOUT holding the checker lock.
+    pub fn approval_fn(&self) -> Option<crate::permission::approval::ApprovalFn> {
+        self.approval_fn.clone()
     }
 
     /// Engine-backed decision for the `enforce` chokepoint. Normalizes

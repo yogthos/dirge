@@ -101,6 +101,7 @@ pub enum ConfigRole {
     Summarization,
     Subagent,
     Critic,
+    Approval,
 }
 
 /// One VSCode-style key binding: bind a key chord to a named command.
@@ -279,6 +280,11 @@ pub struct Config {
     /// the verifier escalates to a bounded LLM critique at finalization
     /// on substantive runs. Unset (default) = no critic, no cost.
     pub critic_provider: Option<String>,
+    /// dirge-0g6i: optional provider for LLM auto-approval. When set, a
+    /// permission prompt is routed to this model (with a safety prompt)
+    /// which replies ALLOW/DENY instead of asking the human. Unset
+    /// (default) = human prompts as usual. See docs/permissions.md.
+    pub approval_provider: Option<String>,
     /// UI color theme. Known built-in values: `phosphor` (default,
     /// 80s CRT green) and `plain` (white/cyan).
     ///
@@ -369,6 +375,9 @@ impl Config {
             // No fallback to the default provider: the critic is opt-in,
             // so it resolves only when `critic_provider` is explicitly set.
             ConfigRole::Critic => self.critic_provider.as_deref(),
+            // Likewise opt-in: auto-approval resolves only when
+            // `approval_provider` is explicitly set (no default fallback).
+            ConfigRole::Approval => self.approval_provider.as_deref(),
         };
         let alias = role_name?.to_string();
         if let Some(map) = providers

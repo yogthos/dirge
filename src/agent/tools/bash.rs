@@ -1676,5 +1676,102 @@ mod tests {
                 "quoted operator is literal — echo is allowed as one segment"
             );
         }
+
+        // --- dirge-0g6i: LLM auto-approval at the enforce chokepoint. The
+        // evaluator lives on the checker (no global), so each test wires
+        // its own stub and stays isolated.
+
+        use crate::permission::approval::{ApprovalDecision, ApprovalFn, ApprovalRequest};
+        use std::future::Future;
+        use std::pin::Pin;
+
+        fn checker_with_approval(stub: ApprovalFn) -> Arc<Mutex<PermissionChecker>> {
+            let config = PermissionConfig::default();
+            let mut c = PermissionChecker::new(
+                &config,
+                SecurityMode::Standard,
+                Some(std::path::PathBuf::from("/work/proj")),
+            );
+            c.set_approval_fn(stub);
+            Arc::new(Mutex::new(c))
+        }
+
+        fn approve_always() -> ApprovalFn {
+            std::sync::Arc::new(|_req: ApprovalRequest| {
+                Box::pin(async { Ok(ApprovalDecision::Allow) })
+                    as Pin<Box<dyn Future<Output = anyhow::Result<ApprovalDecision>> + Send>>
+            })
+        }
+
+        /// Evaluator ALLOW auto-approves an otherwise-prompting command
+        /// (no `ask_tx` needed).
+        #[tokio::test]
+        async fn approval_provider_allows_a_prompting_command() {
+            let perm = checker_with_approval(approve_always());
+            // `npx foo` is not default-allowed → would Ask; evaluator allows.
+            assert!(
+                check_bash_segments(&Some(perm), &None, "npx foo")
+                    .await
+                    .is_ok(),
+                "evaluator ALLOW must auto-approve"
+            );
+        }
+
+        /// Evaluator DENY rejects with the reason, never falling through to
+        /// a human prompt.
+        #[tokio::test]
+        async fn approval_provider_denies_with_reason() {
+            let stub: ApprovalFn = std::sync::Arc::new(|_req: ApprovalRequest| {
+                Box::pin(async { Ok(ApprovalDecision::Deny("writes outside project".into())) })
+                    as Pin<Box<dyn Future<Output = anyhow::Result<ApprovalDecision>> + Send>>
+            });
+            let perm = checker_with_approval(stub);
+            let res = check_bash_segments(&Some(perm), &None, "npx foo").await;
+            assert!(res.is_err(), "evaluator DENY must reject");
+            assert!(
+                format!("{res:?}").contains("writes outside project"),
+                "rejection must carry the evaluator's reason: {res:?}"
+            );
+        }
+
+        /// A hard deny is final — auto-approval only intercepts Ask, so an
+        /// allow-everything evaluator cannot unlock `rm -rf /`.
+        #[tokio::test]
+        async fn approval_provider_cannot_override_a_hard_deny() {
+            let perm = checker_with_approval(approve_always());
+            assert!(
+                check_bash_segments(&Some(perm), &None, "rm -rf /")
+                    .await
+                    .is_err(),
+                "a hard deny must not be reachable by the approval evaluator"
+            );
+        }
+
+        /// The evaluator receives the full command + a per-claim resource
+        /// summary so it can judge compounds precisely.
+        #[tokio::test]
+        async fn approval_provider_receives_command_and_resources() {
+            let seen: Arc<Mutex<Option<(String, usize)>>> = Arc::new(Mutex::new(None));
+            let seen2 = seen.clone();
+            let stub: ApprovalFn = std::sync::Arc::new(move |req: ApprovalRequest| {
+                *seen2.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((req.command.clone(), req.resources.len()));
+                Box::pin(async { Ok(ApprovalDecision::Allow) })
+                    as Pin<Box<dyn Future<Output = anyhow::Result<ApprovalDecision>> + Send>>
+            });
+            let perm = checker_with_approval(stub);
+            // Two prompting segments → aggregate Ask → evaluator sees both.
+            let _ = check_bash_segments(&Some(perm), &None, "npx foo && mycli bar").await;
+            let (cmd, n) = seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("evaluator should have been called");
+            assert_eq!(cmd, "npx foo && mycli bar");
+            assert!(
+                n >= 2,
+                "both command segments should be summarized; got {n}"
+            );
+        }
     }
 }

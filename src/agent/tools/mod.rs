@@ -308,6 +308,57 @@ async fn handle_ask_inner(
     }
 }
 
+/// dirge-0g6i: if an `approval_provider` LLM is configured, let it judge
+/// an otherwise-`Ask` decision instead of prompting the human. Shared by
+/// both [`enforce`] (single scope) and [`enforce_request`] (multi-claim
+/// bash) so the evaluation path isn't duplicated. Returns:
+///
+/// - `Some(Ok(()))` → auto-approved; caller proceeds.
+/// - `Some(Err(..))` → auto-denied (with the evaluator's reason).
+/// - `None` → no evaluator configured, OR the evaluator call errored →
+///   caller falls back to the human prompt (fail-open to the human,
+///   never silently allow).
+async fn try_auto_approve(
+    perm: &PermCheck,
+    tool: &str,
+    command: &str,
+    resources: Vec<String>,
+) -> Option<Result<(), ToolError>> {
+    use crate::permission::approval::{ApprovalDecision, ApprovalRequest};
+    // One lock: pull the evaluator (clone the Arc) + working dir, then
+    // drop the lock BEFORE the await so we never hold it across the LLM
+    // call. `None` evaluator → caller falls back to the human prompt.
+    let (f, working_dir) = {
+        let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+        match g.approval_fn() {
+            Some(f) => (f, g.working_dir().to_string()),
+            None => return None,
+        }
+    };
+    let req = ApprovalRequest {
+        tool: tool.to_string(),
+        command: command.to_string(),
+        working_dir,
+        resources,
+    };
+    match f(req).await {
+        Ok(ApprovalDecision::Allow) => {
+            tracing::info!(target: "dirge::permission", tool, command, "auto-approval: ALLOW");
+            Some(Ok(()))
+        }
+        Ok(ApprovalDecision::Deny(reason)) => {
+            tracing::info!(target: "dirge::permission", tool, command, %reason, "auto-approval: DENY");
+            Some(Err(ToolError::Msg(format!(
+                "Auto-approval denied by approval_provider: {reason}"
+            ))))
+        }
+        Err(e) => {
+            tracing::warn!(target: "dirge::permission", error = %e, "approval_provider call failed; falling back to human prompt");
+            None
+        }
+    }
+}
+
 /// Scope arg passed to the [`enforce`] chokepoint. Discriminates
 /// path-style checks (`Path` / `PathResolve`, route through
 /// `PermissionChecker::check_path`, glob with `*` excluding `/`) from
@@ -405,6 +456,14 @@ pub async fn enforce(
         Effect::Allow => Ok(resolved),
         Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
         Effect::Ask => {
+            // dirge-0g6i: optional LLM auto-approval before the human prompt.
+            if let Some(outcome) = try_auto_approve(perm, tool, raw_scope, Vec::new()).await {
+                outcome?; // Deny → propagate; Allow → fall through.
+                perm.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .note_allowed_scope(tool, raw_scope, is_path);
+                return Ok(resolved);
+            }
             let Some(tx) = ask_tx else {
                 return Err(ToolError::Msg(
                     "Permission denied (non-interactive mode)".to_string(),
@@ -451,6 +510,19 @@ pub async fn enforce_request(
         Effect::Allow => Ok(()),
         Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
         Effect::Ask => {
+            // dirge-0g6i: optional LLM auto-approval. The evaluator sees a
+            // per-claim danger summary (operation + in/out-of-project) so
+            // it can judge bash compounds and redirect targets precisely.
+            let resources = crate::permission::approval::summarize_claims(&req.claims);
+            if let Some(outcome) =
+                try_auto_approve(perm, &req.tool, &req.display_input, resources).await
+            {
+                outcome?; // Deny → propagate; Allow → fall through.
+                perm.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .note_allowed_request(&req);
+                return Ok(());
+            }
             let Some(tx) = ask_tx else {
                 return Err(ToolError::Msg(
                     "Permission denied (non-interactive mode)".to_string(),

@@ -139,6 +139,50 @@ Set with `--standard` (default), `--accept-all`, `--restrictive`, or
 | **Restrictive** | every write/edit (incl. in-project, memory/skill writes) Asks |
 | **Yolo** | allow everything — except a prompt's `deny_tools`, which still wins |
 
+### LLM auto-approval (`approval_provider`)
+
+Instead of pausing for **you** on every `Ask`, dirge can route the decision
+to a separate model that judges whether the operation is safe and
+reasonable, and answers `ALLOW` or `DENY` automatically. Opt in by setting
+`approval_provider` to a provider alias:
+
+```json
+{
+  "approval_provider": "deepseek-flash",
+  "providers": {
+    "deepseek-flash": {
+      "provider_type": "deepseek",
+      "model": "deepseek-v4-flash",
+      "api_key": "${DEEPSEEK_API_KEY}"
+    }
+  }
+}
+```
+
+How it works:
+
+- It only intercepts the **Ask** outcome. Hard **Deny** rules (e.g.
+  `rm -rf /**`) and builtin **Allow**s are unaffected — the evaluator can
+  never override a deny, and never sees an already-allowed action.
+- The evaluator is given the command, the working directory, and a
+  per-resource danger summary (each path tagged *inside* / *outside* the
+  project), plus a fixed safety rubric. It is told to **deny when in
+  doubt**. The rubric flags, among others: deleting or modifying files
+  outside the project or a temp dir; committing/pushing in a repo outside
+  the project (or any `git push`); fetching-and-running remote code;
+  privilege escalation (`sudo`), disk/device ops (`dd`/`mkfs`); and reading
+  or transmitting credentials.
+- **Fail-safe.** An unparseable verdict counts as DENY. If the evaluator
+  call itself errors (network, bad key), dirge falls back to prompting
+  **you** — it never silently allows on failure.
+- It's a side-LLM call per prompt, so there's latency and token cost; it's
+  off unless `approval_provider` is set. Like `critic_provider`, it has no
+  fallback to your default provider — set it explicitly.
+
+This is orthogonal to the security mode: in `--yolo` nothing prompts so the
+evaluator is never consulted; in the other modes it stands in for the human
+on each `Ask`.
+
 ## "Allow always" and the session allowlist
 
 Choosing **(a) allow always** at a prompt adds a session-scoped grant

@@ -67,21 +67,35 @@ pub(crate) fn serialize_conversation(messages: &[SessionMessage]) -> String {
 /// turns (which often set up the task).
 pub(crate) async fn summarize_with_model(
     model: super::AnyModel,
+    prompt: String,
+) -> anyhow::Result<String> {
+    oneshot_with_model(model, "You are a conversation summarizer.", prompt).await
+}
+
+/// Generic one-shot LLM call over any `AnyModel` variant with a caller-
+/// supplied system preamble. Factored out of `summarize_with_model` so
+/// every side-LLM role (summarizer, critic, approval evaluator) shares
+/// the same dispatch + retry/stream-drain path instead of duplicating
+/// the 8-arm variant match. The summarizer-sized prompt budget is
+/// applied here too (a no-op for the tiny approval/critic prompts).
+pub(crate) async fn oneshot_with_model(
+    model: super::AnyModel,
+    preamble: &'static str,
     mut prompt: String,
 ) -> anyhow::Result<String> {
-    const SUMMARIZER_PROMPT_BUDGET_BYTES: usize = 128 * 1024; // ~32k tokens
-    if prompt.len() > SUMMARIZER_PROMPT_BUDGET_BYTES {
-        prompt = head_tail_truncate(&prompt, SUMMARIZER_PROMPT_BUDGET_BYTES);
+    const ONESHOT_PROMPT_BUDGET_BYTES: usize = 128 * 1024; // ~32k tokens
+    if prompt.len() > ONESHOT_PROMPT_BUDGET_BYTES {
+        prompt = head_tail_truncate(&prompt, ONESHOT_PROMPT_BUDGET_BYTES);
     }
     match model {
-        super::AnyModel::OpenRouter(m) => run_summarizer(m, prompt).await,
-        super::AnyModel::OpenAI(m) => run_summarizer(m, prompt).await,
-        super::AnyModel::Anthropic(m) => run_summarizer(m, prompt).await,
-        super::AnyModel::Gemini(m) => run_summarizer(m, prompt).await,
-        super::AnyModel::DeepSeek(m) => run_summarizer(m, prompt).await,
-        super::AnyModel::Glm(m) => run_summarizer(m, prompt).await,
-        super::AnyModel::Ollama(m) => run_summarizer(m, prompt).await,
-        super::AnyModel::Custom(m) => run_summarizer(m, prompt).await,
+        super::AnyModel::OpenRouter(m) => run_oneshot(m, preamble, prompt).await,
+        super::AnyModel::OpenAI(m) => run_oneshot(m, preamble, prompt).await,
+        super::AnyModel::Anthropic(m) => run_oneshot(m, preamble, prompt).await,
+        super::AnyModel::Gemini(m) => run_oneshot(m, preamble, prompt).await,
+        super::AnyModel::DeepSeek(m) => run_oneshot(m, preamble, prompt).await,
+        super::AnyModel::Glm(m) => run_oneshot(m, preamble, prompt).await,
+        super::AnyModel::Ollama(m) => run_oneshot(m, preamble, prompt).await,
+        super::AnyModel::Custom(m) => run_oneshot(m, preamble, prompt).await,
     }
 }
 
@@ -131,7 +145,7 @@ pub(crate) fn head_tail_truncate(prompt: &str, budget: usize) -> String {
     )
 }
 
-async fn run_summarizer<M>(model: M, prompt: String) -> anyhow::Result<String>
+async fn run_oneshot<M>(model: M, preamble: &'static str, prompt: String) -> anyhow::Result<String>
 where
     M: rig::completion::CompletionModel + Clone + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
@@ -144,12 +158,12 @@ where
     // stream error as `Err(String)` so the helper can classify it; an
     // empty-but-clean response is returned as `Ok(String::new())` and
     // rejected (non-retryable) below.
-    let response = run_with_retry(&policy, "summarizer", || {
+    let response = run_with_retry(&policy, "oneshot-llm", || {
         let model = model.clone();
         let prompt = prompt.clone();
         async move {
             let agent = rig::agent::AgentBuilder::new(model)
-                .preamble("You are a conversation summarizer.")
+                .preamble(preamble)
                 .build();
 
             let mut stream = agent
@@ -175,10 +189,10 @@ where
         }
     })
     .await
-    .map_err(|msg| anyhow::anyhow!("Compression failed: {msg}"))?;
+    .map_err(|msg| anyhow::anyhow!("one-shot LLM call failed: {msg}"))?;
 
     if response.is_empty() {
-        anyhow::bail!("Compression returned empty response");
+        anyhow::bail!("one-shot LLM call returned empty response");
     }
     Ok(response)
 }

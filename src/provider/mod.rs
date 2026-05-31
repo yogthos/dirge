@@ -2077,6 +2077,41 @@ fn build_critic_fn(
     }))
 }
 
+/// dirge-0g6i: build the LLM auto-approval evaluator from a resolved
+/// `approval_provider`. Mirrors [`build_critic_fn`] — same client + model
+/// resolution and the SAME shared one-shot helper
+/// (`summarize::oneshot_with_model`) — but with the approval system
+/// preamble and a verdict parser. Returns an `ApprovalFn` the permission
+/// chokepoint calls instead of prompting the human.
+pub fn build_approval_fn(
+    alias: &str,
+    entry: &ProviderEntry,
+    providers: &HashMap<String, ProviderEntry>,
+) -> anyhow::Result<crate::permission::approval::ApprovalFn> {
+    use crate::permission::approval::{
+        ApprovalDecision, ApprovalRequest, EVALUATOR_PREAMBLE, build_evaluator_prompt,
+        parse_decision,
+    };
+    let client = std::sync::Arc::new(create_client(alias, None, providers)?);
+    let model_name = entry
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model_for(alias).to_string());
+    Ok(std::sync::Arc::new(move |req: ApprovalRequest| {
+        let client = client.clone();
+        let model_name = model_name.clone();
+        Box::pin(async move {
+            let model = client.completion_model(model_name);
+            let prompt = build_evaluator_prompt(&req);
+            let raw = summarize::oneshot_with_model(model, EVALUATOR_PREAMBLE, prompt).await?;
+            Ok::<ApprovalDecision, anyhow::Error>(parse_decision(&raw))
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<ApprovalDecision>> + Send>,
+            >
+    }))
+}
+
 /// dirge-z73i: build a stream_fn for the background-review path,
 /// routed through `ConfigRole::Review`. Only the memory + skill tools
 /// are baked into the request — the review fork's `loop_tools` is
