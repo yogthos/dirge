@@ -637,6 +637,29 @@ const HARNESS_LSP_INIT: &str = r#"
 (defn harness/lsp-diagnostics [file] (harness/lsp "diagnostics" file))
 "#;
 
+/// dirge-l6bf: neuter the Janet escape hatches that can terminate or
+/// destabilize the HOST process. Every hook / command / tool handler is
+/// already run inside a Janet `(try ...)` (see `mod.rs`), so an ordinary
+/// Janet error in a plugin is caught and surfaced as a
+/// `[plugin] … errored` notification — dirge survives. The one thing that
+/// bypasses that net is a plugin calling a function that exits the OS
+/// process directly (e.g. `os/exit` → C `exit()`), which would take down
+/// all of dirge. We rebind those symbols in the shared plugin env to raise
+/// a NORMAL, catchable Janet error instead, so a buggy or hostile plugin
+/// can never quit/crash the tool. Runs after the harness preludes and
+/// before any plugin file is loaded, so plugins compile against the
+/// shadowed bindings. dirge itself never calls `os/exit` from Janet.
+const HARNESS_SANDBOX: &str = r#"
+(defn- dirge-disabled-fn [sym-name]
+  (fn [&] (error (string sym-name
+                        " is disabled in dirge plugins: a plugin cannot"
+                        " terminate or signal the host process"))))
+(each name ["os/exit" "os/proc-kill" "os/sigaction"]
+  (def sym (symbol name))
+  (when (get (curenv) sym)
+    (put (curenv) sym @{:value (dirge-disabled-fn name)})))
+"#;
+
 /// A plugin LSP query, forwarded from the worker thread to the tokio-side
 /// drainer (which owns the `LspManager`). `request` is a JSON object
 /// `{op, file, line, char, query}`; the drainer runs the query and sends
@@ -946,6 +969,13 @@ fn worker_loop(
     }
     if let Err(e) = client.run(HARNESS_LSP_INIT) {
         let _ = init_tx.send(Err(format!("harness lsp init failed: {e}")));
+        return;
+    }
+    // dirge-l6bf: disable host-terminating Janet functions. MUST run after
+    // the harness preludes and before any plugin loads, so plugin code
+    // compiles against the neutered bindings.
+    if let Err(e) = client.run(HARNESS_SANDBOX) {
+        let _ = init_tx.send(Err(format!("harness sandbox init failed: {e}")));
         return;
     }
 
@@ -1437,6 +1467,41 @@ mod tests {
         // `undefined-fn` is genuinely unknown.
         let r = worker.eval("(undefined-fn 1)");
         assert!(r.is_err(), "expected Err, got {r:?}");
+    }
+
+    /// dirge-l6bf: a plugin must NOT be able to terminate the host process.
+    /// `os/exit` (and friends) are neutered to raise a catchable Janet error
+    /// rather than calling C `exit()`. Without the fix, this very test would
+    /// terminate the test binary mid-run.
+    #[test]
+    fn os_exit_cannot_kill_the_host() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+
+        // os/exit raises instead of calling C exit(). (At the top level
+        // janetrs renders the error as a Janet stack trace; the exact
+        // message is asserted in `neutered_os_exit_is_catchable_by_plugin_try`
+        // where the raw error value is visible to a Janet `(try ...)`.)
+        let r = worker.eval("(os/exit 0)");
+        assert!(r.is_err(), "os/exit must raise, not exit; got {r:?}");
+
+        // The worker — and therefore the host — is still alive.
+        assert_eq!(worker.eval("(+ 1 2)").unwrap(), "3");
+
+        // The other host-control escape hatches are neutered too.
+        assert!(worker.eval("(os/proc-kill nil)").is_err());
+        assert!(worker.eval("(os/sigaction :term (fn [&] nil))").is_err());
+    }
+
+    /// The catchable error means the existing per-hook `(try ...)` wrapping
+    /// swallows a plugin's `os/exit` exactly like any other plugin error.
+    #[test]
+    fn neutered_os_exit_is_catchable_by_plugin_try() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let r = worker
+            .eval(r#"(try (os/exit 1) ([err] (string "caught: " err)))"#)
+            .unwrap();
+        assert!(r.contains("caught:"), "got {r}");
+        assert!(r.contains("disabled in dirge plugins"), "got {r}");
     }
 
     #[test]
