@@ -741,9 +741,18 @@ async fn main() -> anyhow::Result<()> {
 
     let client = provider::create_client(&provider, resolved_key.as_deref(), &cfg.providers_map())?;
 
+    // MCP connection. `connect_all` can take seconds — an `npx -y <pkg>`
+    // cold start, ×N servers — so blocking on it before the UI draws was
+    // the dominant time-to-first-frame cost. The non-interactive paths
+    // (--print / --loop) build their agent up front and genuinely need
+    // the tools synchronously, so they still connect here. The
+    // interactive TUI instead DEFERS: it builds the agent WITHOUT MCP
+    // tools, draws immediately, and a background task spawned just before
+    // `run_interactive` connects + injects the tools once ready
+    // (dirge-x949). ACP / no-tools don't use MCP on this path.
     #[cfg(feature = "mcp")]
     let mcp_manager = if let Some(servers) = &cfg.mcp_servers {
-        if !cli.resolve_no_tools(&cfg) {
+        if !cli.resolve_no_tools(&cfg) && (cli.print || cli.loop_mode) {
             Some(extras::mcp::McpClientManager::connect_all(servers).await)
         } else {
             None
@@ -863,6 +872,15 @@ async fn main() -> anyhow::Result<()> {
         // Kill any detached background shells the run started so they don't
         // outlive this headless process (they're in their own process group).
         crate::agent::tools::bg_shell::global().kill_all();
+        // dirge-x949: --print connects MCP synchronously (above), so shut
+        // it down here. The interactive path instead hands its manager to
+        // run_interactive, which owns the shutdown; the old shared
+        // post-run shutdown is gone because `mcp_manager` is conditionally
+        // moved into run_interactive and can't be named afterward.
+        #[cfg(feature = "mcp")]
+        if let Some(mgr) = mcp_manager {
+            mgr.shutdown().await;
+        }
     } else {
         #[cfg(feature = "loop")]
         if cli.loop_mode {
@@ -1054,6 +1072,45 @@ async fn main() -> anyhow::Result<()> {
         // painter read snapshots without crossing the channel.
         let sysload = crate::ui::sysload::spawn_poller(std::time::Duration::from_secs(2));
 
+        // dirge-x949: background MCP loading. Connect the servers and
+        // collect their tools OFF the critical path so the UI draws
+        // immediately; the wrapped tools + the connected manager are sent
+        // back to the select loop, which injects the tools into the live
+        // agent (the next prompt's clone picks them up) and lights up the
+        // MCP panel. `permission` / `ask_tx` are cloned here because
+        // `run_interactive` consumes the originals just below.
+        // The loader delivers the connected manager + wrapped tools on
+        // `ready`, then pings the untyped `wake` channel — a
+        // `tokio::select!` arm can't be `#[cfg]`-gated on the mcp-only
+        // payload type, so the select loop wakes on `()` and drains the
+        // payload in a cfg'd block.
+        #[cfg(feature = "mcp")]
+        let (mcp_ready_rx, mcp_wake_rx) = if !cli.resolve_no_tools(&cfg)
+            && let Some(servers) = cfg.mcp_servers.clone()
+        {
+            let (ready_tx, ready_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let perm = permission.clone();
+            let ask = ask_tx.clone();
+            tokio::spawn(async move {
+                let mgr = extras::mcp::McpClientManager::connect_all(&servers).await;
+                let mcp_tools = mgr.collect_tools(perm, ask).await;
+                let wrapped = crate::agent::builder::wrap_mcp_tools(mcp_tools).await;
+                // Deliver the payload, then nudge the UI loop to drain it.
+                // If the receiver is gone (user quit before connect
+                // finished) the send fails harmlessly and the manager
+                // drops, killing the child processes.
+                if ready_tx.send((mgr, wrapped)).is_ok() {
+                    let _ = wake_tx.send(());
+                }
+            });
+            (Some(ready_rx), Some(wake_rx))
+        } else {
+            (None, None)
+        };
+        #[cfg(not(feature = "mcp"))]
+        let mcp_wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
+
         ui::run_interactive(
             client,
             agent,
@@ -1074,7 +1131,10 @@ async fn main() -> anyhow::Result<()> {
             lsp_manager,
             sandbox,
             #[cfg(feature = "mcp")]
-            mcp_manager.as_ref(),
+            mcp_manager,
+            #[cfg(feature = "mcp")]
+            mcp_ready_rx,
+            mcp_wake_rx,
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
             #[cfg(feature = "plugin")]
@@ -1096,11 +1156,11 @@ async fn main() -> anyhow::Result<()> {
         if let Some(mgr) = lsp_manager_for_shutdown.as_ref() {
             mgr.close_all_files().await;
         }
-    }
-
-    #[cfg(feature = "mcp")]
-    if let Some(mgr) = mcp_manager {
-        mgr.shutdown().await;
+        // dirge-x949: MCP shutdown moved INTO run_interactive — for the
+        // interactive path the connected manager is now owned there
+        // (delivered by the background loader), so it shuts the servers
+        // down before returning. The --print / --loop paths return earlier
+        // and let their MCP children die on process exit, as before.
     }
 
     Ok(())

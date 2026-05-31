@@ -864,6 +864,20 @@ impl AnyAgent {
         }
     }
 
+    /// dirge-x949: append tools to the live loop registry. Background
+    /// MCP loading uses this to inject server tools after the agent was
+    /// built (and the UI drawn) without them — the next
+    /// `clone().spawn_runner` forwards the grown registry to the loop
+    /// dispatch and the request's tool-definition list. Cheap: each
+    /// entry is an `Arc` bump.
+    #[cfg(feature = "mcp")]
+    pub fn extend_loop_tools(
+        &mut self,
+        more: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
+    ) {
+        self.loop_tools.extend(more);
+    }
+
     /// dirge-7tvq: install the `MemoryProvider` used for this session
     /// so lifecycle hooks (`on_session_end`, `on_pre_compress`) can
     /// dispatch through the trait. Called by `build_agent` once the

@@ -631,6 +631,34 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     }
 }
 
+/// dirge-x949: wrap a batch of freshly-collected MCP tools into the
+/// `LoopTool` adapters the agent loop dispatches against, applying the
+/// same built-in-name collision filter `build_loop_tools` uses. Pulled
+/// out so background MCP loading (see main.rs) can inject server tools
+/// into an already-running agent *after* the UI is drawn, instead of
+/// blocking startup on `connect_all` + `collect_tools`.
+#[cfg(feature = "mcp")]
+pub async fn wrap_mcp_tools(
+    mcp_tools: Vec<crate::extras::mcp::tool::McpTool>,
+) -> Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> {
+    use crate::agent::agent_loop::RigToolAdapter;
+    let builtin_names: &[&str] = tools::BUILTIN_TOOL_NAMES;
+    let mut out: Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> = Vec::new();
+    for mcp_tool in mcp_tools {
+        let name = mcp_tool.definition.name.to_string();
+        if builtin_names.contains(&name.as_str()) {
+            eprintln!(
+                "warning: MCP server '{}' exports tool '{}' which collides with a dirge built-in; skipping MCP version",
+                mcp_tool.server_name, name,
+            );
+            continue;
+        }
+        let adapter = RigToolAdapter::new(Box::new(mcp_tool)).await;
+        out.push(Arc::new(adapter));
+    }
+    out
+}
+
 // ============================================================
 // Phase 4.5h-4 — parallel LoopTool registry builder
 // ============================================================

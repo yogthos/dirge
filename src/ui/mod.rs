@@ -147,7 +147,26 @@ pub async fn run_interactive(
     mut lifecycle_rx: Option<crate::agent::tools::background::LifecycleReceiver>,
     #[cfg(feature = "lsp")] lsp_manager: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
     sandbox: Sandbox,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+    // dirge-x949: owned (not borrowed) so the background MCP loader can
+    // hand over the connected manager mid-session — it starts `None` for
+    // the interactive path and is filled in when `mcp_ready_rx` fires, so
+    // the panel lights up and `/mcp` works once servers are up.
+    #[cfg(feature = "mcp")] mut mcp_manager: Option<McpClientManager>,
+    // dirge-x949: background MCP loader → select-loop channel. Delivers
+    // the connected manager + its wrapped tools exactly once; the loop
+    // injects the tools into the live agent and adopts the manager.
+    #[cfg(feature = "mcp")] mut mcp_ready_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<(
+            McpClientManager,
+            Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
+        )>,
+    >,
+    // dirge-x949: untyped wake nudge from the background MCP loader. A
+    // `tokio::select!` arm can't be `#[cfg]`-gated on the mcp-only payload
+    // type, so the loader pings this `()` channel and the arm drains the
+    // payload from `mcp_ready_rx` in a cfg'd block. Unconditional so the
+    // arm compiles in non-mcp builds (always `None` there).
+    mut mcp_wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
     #[cfg(feature = "plugin")] plugin_manager: Option<
         &std::sync::Arc<std::sync::Mutex<PluginManager>>,
@@ -437,7 +456,7 @@ pub async fn run_interactive(
         session,
         Some(&sysload),
         #[cfg(feature = "mcp")]
-        mcp_manager,
+        mcp_manager.as_ref(),
         #[cfg(feature = "lsp")]
         lsp_manager.as_ref(),
     ));
@@ -619,7 +638,7 @@ pub async fn run_interactive(
             session,
             Some(&sysload),
             #[cfg(feature = "mcp")]
-            mcp_manager,
+            mcp_manager.as_ref(),
             #[cfg(feature = "lsp")]
             lsp_manager.as_ref(),
         ));
@@ -1452,7 +1471,7 @@ pub async fn run_interactive(
                                 // /help) have no UserMessage event, so we keep the echo.
                                 write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref()).await;
+                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref()).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -1464,7 +1483,7 @@ pub async fn run_interactive(
                                             instructions.as_deref(),
                                             &mut agent, &client, &mut renderer, session, cli, cfg, context,
                                             &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
-                                            #[cfg(feature = "mcp")] mcp_manager,
+                                            #[cfg(feature = "mcp")] mcp_manager.as_ref(),
                                             #[cfg(feature = "semantic")] semantic_manager,
                                             #[cfg(feature = "lsp")] lsp_manager.as_ref(),
                                         ).await;
@@ -1546,7 +1565,7 @@ pub async fn run_interactive(
                                                                                                 #[cfg(feature = "lsp")]
                                                                                                 lsp_manager.clone(),
                                                 sandbox.clone(),
-                                                #[cfg(feature = "mcp")] mcp_manager,
+                                                #[cfg(feature = "mcp")] mcp_manager.as_ref(),
                                                 #[cfg(feature = "semantic")] semantic_manager,
                                                 Some(session.id.to_string()),
                                             ).await;
@@ -1740,7 +1759,7 @@ pub async fn run_interactive(
                                         None,
                                         &mut agent, &client, &mut renderer, session, cli, cfg, context,
                                         &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
-                                        #[cfg(feature = "mcp")] mcp_manager,
+                                        #[cfg(feature = "mcp")] mcp_manager.as_ref(),
                                         #[cfg(feature = "semantic")] semantic_manager,
                                         #[cfg(feature = "lsp")] lsp_manager.as_ref(),
                                     ).await;
@@ -2051,7 +2070,7 @@ pub async fn run_interactive(
                             &mut agent_cancel,
                             &interjection_queue,
                             #[cfg(feature = "mcp")]
-                            mcp_manager,
+                            mcp_manager.as_ref(),
                             #[cfg(feature = "semantic")]
                             semantic_manager,
                             #[cfg(feature = "lsp")]
@@ -2136,7 +2155,7 @@ pub async fn run_interactive(
                             &mut agent_cancel,
                             &interjection_queue,
                             #[cfg(feature = "mcp")]
-                            mcp_manager,
+                            mcp_manager.as_ref(),
                             #[cfg(feature = "semantic")]
                             semantic_manager,
                             #[cfg(feature = "lsp")]
@@ -2391,7 +2410,7 @@ pub async fn run_interactive(
                             lsp_manager.clone(),
                             sandbox.clone(),
                             #[cfg(feature = "mcp")]
-                            mcp_manager,
+                            mcp_manager.as_ref(),
                             #[cfg(feature = "semantic")]
                             semantic_manager,
                             Some(session.id.to_string()),
@@ -3140,6 +3159,48 @@ pub async fn run_interactive(
                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                     is_running,
                 )?;
+            }
+            // dirge-x949: background MCP loader signalled readiness. The
+            // wake channel is untyped (`()`) because a `tokio::select!`
+            // arm can't be `#[cfg]`-gated on the mcp-only payload type, so
+            // the payload is drained from `mcp_ready_rx` in the cfg'd body
+            // below. The `if mcp_wake_rx.is_some()` guard makes the unwrap
+            // safe (select evaluates the guard before polling) and, once
+            // we clear the receiver in the body, DISABLES the arm so it
+            // doesn't suppress the `else` fallback or busy-loop on a closed
+            // channel. One-shot: the loader sends exactly once.
+            _ = async { mcp_wake_rx.as_mut().unwrap().recv().await }, if mcp_wake_rx.is_some() => {
+                mcp_wake_rx = None;
+                #[cfg(feature = "mcp")]
+                if let Some(rx) = mcp_ready_rx.as_mut()
+                    && let Ok((mgr, tools)) = rx.try_recv()
+                {
+                    let n = tools.len();
+                    // Inject the server tools into the live agent — the
+                    // next prompt's `agent.clone()` forwards them to the
+                    // loop + the request's tool defs — and adopt the
+                    // connected manager so the panel + `/mcp` see it.
+                    agent.extend_loop_tools(tools);
+                    mcp_manager = Some(mgr);
+                    mcp_ready_rx = None;
+                    tracing::info!("MCP ready: injected {n} tool(s) into the live agent");
+                    // Re-stage the panel data + repaint now so the MCP
+                    // sub-panel lights up immediately rather than on the
+                    // next event (the loop only renders inside arms).
+                    renderer.set_panel_data(build_panel_data(
+                        session,
+                        Some(&sysload),
+                        mcp_manager.as_ref(),
+                        #[cfg(feature = "lsp")]
+                        lsp_manager.as_ref(),
+                    ));
+                    renderer.render_viewport()?;
+                    renderer.draw_bottom(
+                        &input,
+                        &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
+                        is_running,
+                    )?;
+                }
             }
             Some(chat_evt) = subagent_chat_rx.recv() => {
                 // dirge-ov2 Phase E: subagent chat lifecycle.
@@ -3949,7 +4010,7 @@ pub async fn run_interactive(
                         lsp_manager.clone(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
-                        mcp_manager,
+                        mcp_manager.as_ref(),
                         #[cfg(feature = "semantic")]
                         semantic_manager,
                         Some(session.id.to_string()),
@@ -4005,6 +4066,16 @@ pub async fn run_interactive(
     // survive dirge's exit, orphaning servers/watchers and their ports.
     if let Some(store) = shell_store.as_ref() {
         store.kill_all();
+    }
+
+    // dirge-x949: gracefully shut down MCP servers. For the interactive
+    // path the connected manager is owned here (delivered by the
+    // background loader), so we close its child processes on the way out
+    // rather than relying on drop. `None` when MCP never finished
+    // connecting (or there were no servers) — nothing to do.
+    #[cfg(feature = "mcp")]
+    if let Some(mgr) = mcp_manager.take() {
+        mgr.shutdown().await;
     }
 
     Ok(())
