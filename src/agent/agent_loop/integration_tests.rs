@@ -1504,3 +1504,71 @@ async fn nqr_unlimited_when_max_turns_none() {
         }
     }
 }
+
+// dirge-st8r — a fresh USER steering message resets the turn budget so
+// active human steering isn't killed by the runaway-loop cost cap.
+
+/// With max_turns=3 and a stream that loops forever, the run normally
+/// stops after exactly 3 turns. A single user steer mid-run resets the
+/// counter, buying a fresh budget — so the stream is invoked MORE than 3
+/// times. (Genuine runaway loops are still caught by the storm breaker;
+/// the cap is only a cost ceiling for autonomous runs.)
+#[tokio::test]
+async fn st8r_user_steering_resets_turn_budget() {
+    let tool = std::sync::Arc::new(RecordingTool::new("echo"));
+    let mut ctx = empty_context();
+    ctx.tools.push(tool.clone());
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls_clone = calls.clone();
+    let stream: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
+        let n = calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = format!("call-{n}");
+        Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message: tool_use_response(&id, "echo", serde_json::json!({"i": n})),
+            usage: None,
+        }]))
+    });
+
+    // Steering hook: deliver ONE user message on its 3rd invocation
+    // (after a couple of turns, post the pre-loop poll), then nothing.
+    // Mirrors a human interjecting mid-run.
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polls_clone = polls.clone();
+    let steering: crate::agent::agent_loop::hooks::GetSteeringMessagesFn =
+        std::sync::Arc::new(move || {
+            let n = polls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 2 {
+                    vec![user("keep going — focus on the parser")]
+                } else {
+                    Vec::new()
+                }
+            })
+        });
+
+    let mut cfg = build_config();
+    cfg.max_turns = Some(3);
+    cfg.get_steering_messages = Some(steering);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let _ = run_agent_loop(
+        vec![user("start")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &stream,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let total = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        total > 3,
+        "user steering must reset the turn budget — expected >3 stream calls (cap=3), got {total}"
+    );
+}

@@ -62,15 +62,20 @@ use super::types::{Context, LoopConfig};
 /// Kept as a free fn so the inner/outer steering-poll sites stay
 /// terse. Returns an empty Vec when neither source has anything to
 /// inject — preserves the legacy fast path byte-for-byte.
-async fn poll_steering_and_reminder(config: &LoopConfig) -> Vec<LoopMessage> {
+/// Returns the polled messages plus whether any came from genuine USER
+/// steering (the interjection queue) — the file-touch reminder doesn't
+/// count. The bool drives the turn-budget reset (dirge-st8r): active human
+/// steering gets a fresh budget; ambient reminders do not.
+async fn poll_steering_and_reminder(config: &LoopConfig) -> (Vec<LoopMessage>, bool) {
     let mut out = match &config.get_steering_messages {
         Some(get) => get().await,
         None => Vec::new(),
     };
+    let had_user_steering = !out.is_empty();
     if let Some(tracker) = &config.file_touch_tracker {
         out.extend(tracker.poll_reminder());
     }
-    out
+    (out, had_user_steering)
 }
 
 /// Build a `StormBreaker` from `LoopConfig`, merging custom
@@ -633,7 +638,8 @@ pub async fn run_loop(
     // Pi line 167: initial steering poll.
     // Phase 4 part 2: composes with the file-touch tracker's
     // reminder poll when configured.
-    let mut pending_messages: Vec<LoopMessage> = poll_steering_and_reminder(&config).await;
+    let (mut pending_messages, _initial_user_steering): (Vec<LoopMessage>, bool) =
+        poll_steering_and_reminder(&config).await;
 
     // dirge-nqr: count assistant turns so a hard cap can stop a
     // runaway run. `max_turns = None` means unlimited (legacy).
@@ -1245,7 +1251,20 @@ pub async fn run_loop(
 
             // Pi line 253: refresh steering for next iteration.
             // Phase 4 part 2: also polls the file-touch tracker.
-            pending_messages = poll_steering_and_reminder(&config).await;
+            let (next_pending, had_user_steering) = poll_steering_and_reminder(&config).await;
+            pending_messages = next_pending;
+
+            // dirge-st8r: a fresh USER steering message means the human is
+            // actively driving the run — give them a fresh turn budget
+            // rather than killing their work with the runaway-loop cap.
+            // Genuine runaway loops are caught by the storm breaker, not
+            // this counter; the cap is a cost ceiling for AUTONOMOUS runs,
+            // and an explicit human interjection is a choice to continue.
+            // Only the user's own queued steering resets it — file-touch
+            // reminders and plugin/critic follow-ups do not.
+            if had_user_steering {
+                turns_taken = 0;
+            }
 
             // dirge-nqr: cap reached → emit a system-visible note,
             // append a user-facing message into the transcript so the
