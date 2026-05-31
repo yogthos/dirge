@@ -222,10 +222,12 @@ adapters fail with a clear error. Use `lldb-dap` or `gdb` for Go/C/C++ for now.
 - **No data/instruction breakpoints**: source breakpoints only in v1.
 - **Janet, Bash**: no built-in adapters exist for these languages. The agent
 can still attach via `adapter: "custom-adapter"` if one is available on PATH.
-- **No interactive TUI panel**: the debugger is agent-driven only. A TUI panel
-with a sidebar showing frames/variables is tracked as `dirge-jjul`.
-- **No DAP↔LSP bridge**: run-to-cursor and backtrace→diagnostics integration
-tracked as `dirge-x5hr`.
+- **Interactive TUI debug panel**: when a DAP session is active, toggle
+`/panel debug` to see threads, frames, variables, breakpoints, and program
+output in a right-side panel. `/panel auto` switches back to the system panel.
+- **DAP↔LSP bridge**: the `debug` tool includes `run_to_cursor`,
+`restart_frame`, `backtrace_diagnostics`, and `error_analysis` actions
+(when both `dap` and `lsp` features are enabled).
 
 ## Example session transcript
 

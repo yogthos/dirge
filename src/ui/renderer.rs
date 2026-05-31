@@ -913,6 +913,11 @@ impl Renderer {
         self.right_panel_mode = mode;
     }
 
+    /// Set only the right panel mode (used by `/panel debug`).
+    pub fn set_right_panel_mode(&mut self, mode: PanelMode) {
+        self.right_panel_mode = mode;
+    }
+
     /// Apply a parsed `/display` selection (or the `display` config
     /// value): each listed side panel is forced on, each omitted one
     /// forced off — an explicit user choice, so `On`/`Off` rather than

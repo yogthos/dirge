@@ -209,7 +209,11 @@ pub(super) async fn cmd_panel(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         }
     };
     if let Some(mode) = new_mode {
-        ctx.renderer.set_panel_mode(mode);
+        if mode == PanelMode::Debug {
+            ctx.renderer.set_right_panel_mode(mode);
+        } else {
+            ctx.renderer.set_panel_mode(mode);
+        }
         ctx.renderer.render_viewport()?;
     }
     // Both sides share a mode after /panel; report the left as the
