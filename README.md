@@ -163,3 +163,5 @@ This project builds on and is deeply indebted to:
 
 - [**zerostack**](https://github.com/gi-dellav/zerostack) by Giuseppe Della Vedova — the original minimal coding agent that dirge was forked from. Provides the core agent architecture, permission system, TUI, and prompt infrastructure.
 - [**maki**](https://github.com/tontinton/maki) by Tony Solomonik — a feature-rich Rust coding agent. The Claude-compatible skills system, bash tree-sitter permissions, memory tool, bang commands (`!`/`!!`), `/cd` command, `/btw` query, rewind picker, and task/subagent tool were all ported from maki.
+- [**Hermes Agent**](https://github.com/NousResearch/hermes-agent) by Nous Research — a reasoning-aware coding agent with structured thinking patterns.
+- [**pi coding-agent**](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) by Earendil Works — a developer agent with robust tool-use and workflow automation.
