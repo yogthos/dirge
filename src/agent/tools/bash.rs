@@ -529,6 +529,18 @@ impl Tool for BashTool {
             cache.clear();
         }
 
+        // dirge-sb2n: surface files this command created / edited /
+        // deleted in the MODIFIED panel. write/edit/apply_patch already
+        // call `mark_modified`; bash bypassed it entirely, so heredoc
+        // creates (`cat > voxel.html <<'EOF'`), `rm` deletes and `mv`
+        // renames never propagated. Reuse the same path extractors the
+        // permission layer runs. Only mark on success so a failed
+        // command doesn't record phantom edits.
+        #[cfg(feature = "semantic-bash")]
+        if output.exit_code == 0 {
+            mark_bash_mutations(self.permission.as_ref(), &command);
+        }
+
         // Phase 3 / part 2: hand the (post-cap) buffer to the
         // disk-backed-output relay. Below the inline budget the
         // relay is a no-op and the exit-code line is appended
@@ -543,6 +555,44 @@ impl Tool for BashTool {
         };
         let outcome = crate::agent::tools::output_relay::relay_if_large("bash", result, &exit_note);
         Ok(outcome.text)
+    }
+}
+
+/// dirge-sb2n: paths a bash command mutates — output-redirect targets
+/// (`> f`, `cat > f <<'EOF'`) plus the positional args of file-mutating
+/// commands (`rm`/`mv`/`cp`/`touch`/…). Reuses the same tree-sitter
+/// extractors the permission layer runs (`extract_redirect_targets` +
+/// `extract_mutation_paths`) so there's no second parser to keep in sync.
+#[cfg(feature = "semantic-bash")]
+fn bash_mutation_targets(command: &str) -> Vec<String> {
+    let mut targets = bash::extract_redirect_targets(command);
+    targets.extend(bash::extract_mutation_paths(command));
+    targets
+}
+
+/// dirge-sb2n: record each path a successful bash command touched into
+/// the shared modified-files tracker so it shows up in the MODIFIED
+/// panel, the same way write/edit/apply_patch do. Relative paths are
+/// resolved against the agent's working dir (from the permission
+/// checker) so they canonicalize to the same absolute path the other
+/// tools record. `/dev/*` and `/proc/*` redirect targets are skipped —
+/// they're not real edits.
+#[cfg(feature = "semantic-bash")]
+fn mark_bash_mutations(permission: Option<&PermCheck>, command: &str) {
+    let base = permission.map(|p| {
+        let g = p.lock().unwrap_or_else(|e| e.into_inner());
+        std::path::PathBuf::from(g.working_dir())
+    });
+    for target in bash_mutation_targets(command) {
+        if target.starts_with("/dev/") || target.starts_with("/proc/") {
+            continue;
+        }
+        let p = std::path::Path::new(&target);
+        let abs = match &base {
+            Some(b) if p.is_relative() => b.join(p),
+            _ => p.to_path_buf(),
+        };
+        crate::agent::tools::modified::mark_modified(&abs);
     }
 }
 
@@ -1367,5 +1417,77 @@ mod tests {
             result.is_err(),
             "second segment without /dev/null redirect must still prompt; got {result:?}",
         );
+    }
+
+    // dirge-sb2n — bash file-mutation propagation. Files created /
+    // deleted / renamed via bash must surface in the MODIFIED panel the
+    // same way write/edit/apply_patch do.
+
+    /// Heredoc create (`cat > voxel.html <<'EOF' … EOF`) — the exact
+    /// shape that prompted this fix — yields the redirect target so it
+    /// can be marked modified.
+    #[cfg(feature = "semantic-bash")]
+    #[test]
+    fn bash_mutation_targets_heredoc_create() {
+        let cmd = "cat > voxel.html <<'EOF'\n<html></html>\nEOF";
+        let t = bash_mutation_targets(cmd);
+        assert!(t.iter().any(|p| p == "voxel.html"), "got {t:?}");
+    }
+
+    /// Plain output redirect creates a file → tracked.
+    #[cfg(feature = "semantic-bash")]
+    #[test]
+    fn bash_mutation_targets_redirect_create() {
+        let t = bash_mutation_targets("echo hi > notes.txt");
+        assert!(t.iter().any(|p| p == "notes.txt"), "got {t:?}");
+    }
+
+    /// `rm` delete → the deleted path is tracked.
+    #[cfg(feature = "semantic-bash")]
+    #[test]
+    fn bash_mutation_targets_rm_delete() {
+        let t = bash_mutation_targets("rm -rf build/old.o");
+        assert!(t.iter().any(|p| p == "build/old.o"), "got {t:?}");
+    }
+
+    /// `mv` rename → both source and destination are tracked.
+    #[cfg(feature = "semantic-bash")]
+    #[test]
+    fn bash_mutation_targets_mv_rename() {
+        let t = bash_mutation_targets("mv a.txt b.txt");
+        assert!(t.iter().any(|p| p == "a.txt"), "src missing, got {t:?}");
+        assert!(t.iter().any(|p| p == "b.txt"), "dst missing, got {t:?}");
+    }
+
+    /// End-to-end: a `BashTool::call` that creates a file via redirect
+    /// records the (canonicalized) path in the shared modified tracker,
+    /// so it appears in the MODIFIED panel. Uses a unique absolute path
+    /// and asserts membership only, so it's robust to other tests
+    /// sharing the global `MODIFIED_FILES` set.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_create_propagates_to_modified_tracker() {
+        use crate::agent::tools::BashArgs;
+        let dir = std::env::temp_dir().join("dirge-sb2n-bash-create");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("created-by-bash.txt");
+        let _ = std::fs::remove_file(&file);
+
+        let tool = BashTool::new(None, None, crate::sandbox::Sandbox::new(false));
+        tool.call(BashArgs {
+            command: format!("echo hi > {}", file.display()),
+            timeout: None,
+            background: None,
+        })
+        .await
+        .expect("bash create");
+
+        let canonical = std::fs::canonicalize(&file).expect("file should exist");
+        let recent = crate::agent::tools::modified::recent(256);
+        assert!(
+            recent.contains(&canonical),
+            "bash-created file should be tracked; looking for {canonical:?} in {recent:?}",
+        );
+        let _ = std::fs::remove_file(&file);
     }
 }

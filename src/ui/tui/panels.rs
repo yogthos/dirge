@@ -477,8 +477,16 @@ pub fn compute_modified_rect(data: &PanelData, area: Rect) -> Option<Rect> {
     if remaining < 3 {
         return None;
     }
+    // dirge-sb2n: size to content like TODOS — two border rows plus one
+    // row per modified file (min 1 for the "(none)" placeholder) — capped
+    // at the space that actually remains. So an empty list is a single
+    // line, not a tall blank box, and the panel grows as files are added;
+    // only when the list overflows does it fill `remaining` and switch to
+    // the scroll-footer view. Mirrored in `RightPanel::render`.
+    let natural = (2 + data.modified.len().max(1)) as u16;
+    let height = natural.min(remaining);
     let inner_w = area.width.saturating_sub(RIGHT_PANEL_TRAILING_PAD);
-    Some(Rect::new(area.x, y, inner_w, remaining))
+    Some(Rect::new(area.x, y, inner_w, height))
 }
 
 /// Right-panel top padding (rows). Mirrors LEFT_PANEL_TOP_PAD so
@@ -574,13 +582,17 @@ impl<'a> Widget for RightPanel<'a> {
         let modified_top = y;
         let remaining = (area.y + area.height).saturating_sub(modified_top);
         if remaining >= 3 {
-            let rect = Rect::new(area.x, modified_top, inner_w, remaining);
-            // Re-build the MODIFIED panel with its true row budget
-            // applied so a `+N older` footer can substitute for
-            // overflow.
-            let inner_rows = (remaining as usize).saturating_sub(2);
-            let mut p = SubPanel::new("MODIFIED").border_style(self.style);
             let total = self.data.modified.len();
+            // dirge-sb2n: size to content (2 borders + one row per file,
+            // min 1 for "(none)") capped at the remaining space, matching
+            // TODOS — an empty list is a single line, not a tall blank
+            // box. Mirrors `compute_modified_rect`. Only when the list
+            // overflows does `height == remaining` and the scroll-footer
+            // path below take over.
+            let height = ((2 + total.max(1)) as u16).min(remaining);
+            let rect = Rect::new(area.x, modified_top, inner_w, height);
+            let inner_rows = (height as usize).saturating_sub(2);
+            let mut p = SubPanel::new("MODIFIED").border_style(self.style);
             if total == 0 {
                 p = p.line("· (none)", dim);
             } else if total <= inner_rows {
@@ -917,6 +929,91 @@ mod tests {
             }
         }
         assert!(found_server, "expected MCP server name in right panel");
+    }
+
+    /// dirge-sb2n (A): the MODIFIED sub-panel collapses to a single
+    /// content line (3 rows incl. borders) when the list is empty —
+    /// matching the TODOS "(none)" behaviour — instead of expanding to
+    /// fill all the remaining vertical space.
+    #[test]
+    fn modified_rect_collapses_to_one_line_when_empty() {
+        let data = PanelData::default(); // modified is empty
+        let area = Rect::new(0, 0, 40, 30);
+        let rect = compute_modified_rect(&data, area).expect("rect");
+        assert_eq!(
+            rect.height, 3,
+            "empty MODIFIED should be 3 rows (1 content line), got {}",
+            rect.height
+        );
+    }
+
+    /// dirge-sb2n (A): the box grows with the file count — two border
+    /// rows plus one row per modified file — while it still fits.
+    #[test]
+    fn modified_rect_grows_with_file_count() {
+        let mut data = PanelData::default();
+        data.modified = vec!["a.rs".into(), "b.rs".into(), "c.rs".into()];
+        let area = Rect::new(0, 0, 40, 30);
+        let rect = compute_modified_rect(&data, area).expect("rect");
+        assert_eq!(rect.height, 5, "3 files → 2 borders + 3 rows");
+    }
+
+    /// dirge-sb2n (A): when the list is longer than the room left, the
+    /// box caps at the remaining space (the scroll-footer path takes
+    /// over) rather than overflowing the panel or its natural height.
+    #[test]
+    fn modified_rect_caps_at_remaining_space() {
+        let mut data = PanelData::default();
+        data.modified = (0..100).map(|i| format!("f{i}.rs")).collect();
+        let area = Rect::new(0, 0, 40, 30);
+        let rect = compute_modified_rect(&data, area).expect("rect");
+        assert!(
+            rect.y + rect.height <= area.y + area.height,
+            "must stay within the panel"
+        );
+        assert!(
+            rect.height < (2 + 100),
+            "must cap below natural height when overflowing, got {}",
+            rect.height
+        );
+        assert!(rect.height >= 3);
+    }
+
+    /// dirge-sb2n (A): the rendered MODIFIED box is exactly 3 rows tall
+    /// when empty — top border (with the [MODIFIED] title), one "(none)"
+    /// content line, bottom border — proving the render path agrees with
+    /// `compute_modified_rect` and the box no longer paints a tall blank
+    /// region. Pins the actual user-visible symptom.
+    #[test]
+    fn modified_box_paints_three_rows_when_empty() {
+        let data = PanelData::default(); // everything empty
+        let layout = Layout::new(160, 40, 1);
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(RightPanel::new(&data), layout.right_panel))
+            .unwrap();
+        let backend = terminal.backend().clone();
+
+        let row = |y: u16| -> String {
+            (layout.right_panel.x..layout.right_panel.x + layout.right_panel.width)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        let y_range = layout.right_panel.y..(layout.right_panel.y + layout.right_panel.height);
+        let title_y = y_range
+            .clone()
+            .find(|&y| row(y).contains("[MODIFIED]"))
+            .expect("MODIFIED title should render");
+        // The first bottom-border row at or after the title closes the box.
+        let bottom_y = (title_y + 1..layout.right_panel.y + layout.right_panel.height)
+            .find(|&y| row(y).contains('╰'))
+            .expect("MODIFIED box should have a bottom border");
+        assert_eq!(
+            bottom_y - title_y,
+            2,
+            "empty MODIFIED box should be 3 rows (top, (none), bottom)"
+        );
     }
 
     /// CPU/MEM bar formatting.
