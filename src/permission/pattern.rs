@@ -29,7 +29,25 @@ impl Pattern {
     fn compile(pattern: &str, path_style: bool) -> Self {
         let expanded = expand_home(pattern);
         let regex_str = glob_to_regex(&expanded, path_style);
-        let regex = Regex::new(&regex_str).unwrap_or_else(|_| Regex::new("^$").unwrap());
+        // dirge-9zbd: command-style patterns match against whole bash
+        // command segments, whose arguments routinely contain embedded
+        // newlines — e.g. `npx tsx -e "import x\nimport y"`, `python3 -c
+        // "...\n..."`, heredoc-ish bodies. Compile them DOTALL so `*`
+        // (→ `.*`) spans those newlines, matching shell-glob intent where
+        // `*` is any char including `\n`. WITHOUT this, a session grant
+        // like `npx *` (`^npx(?: .*)?$`) silently fails to match any
+        // multi-line invocation and the agent re-prompts forever despite
+        // "allow always". Path patterns stay line-sensitive: filesystem
+        // paths don't legitimately contain newlines, and letting `**` span
+        // them would weaken path scoping in deny rules.
+        let regex = if path_style {
+            Regex::new(&regex_str)
+        } else {
+            regex::RegexBuilder::new(&regex_str)
+                .dot_matches_new_line(true)
+                .build()
+        }
+        .unwrap_or_else(|_| Regex::new("^$").unwrap());
         Pattern {
             regex,
             original: pattern.to_string(),
@@ -177,6 +195,39 @@ mod tests {
         assert!(!pat.matches("egit"));
     }
 
+    /// dirge-9zbd: a trailing ` **` on a command rule makes args optional,
+    /// just like ` *`. So `cargo test **` matches BOTH bare `cargo test`
+    /// and `cargo test --all`. Before this, `cargo test **` compiled to
+    /// `^cargo test .*$` and the bare command re-prompted.
+    #[test]
+    fn command_double_star_makes_args_optional() {
+        let pat = Pattern::new_command("cargo test **");
+        assert!(pat.matches("cargo test"), "bare command must match");
+        assert!(pat.matches("cargo test --all"));
+        assert!(pat.matches("cargo test --all --features x"));
+        // Still head-anchored.
+        assert!(!pat.matches("cargo testx"));
+        assert!(!pat.matches("xcargo test"));
+        // `npx **` matches bare `npx` and any args (incl. multi-line).
+        let npx = Pattern::new_command("npx **");
+        assert!(npx.matches("npx"));
+        assert!(npx.matches("npx tsx -e \"a\nb\""));
+    }
+
+    /// A `/**`-suffixed COMMAND deny pattern (no space before `**`) keeps
+    /// requiring the prefix — the optional-args rewrite must not fire for
+    /// it, or `rm -rf /**` would also match bare `rm -rf`.
+    #[test]
+    fn command_slash_double_star_is_not_made_optional() {
+        let pat = Pattern::new_command("rm -rf /**");
+        assert!(pat.matches("rm -rf /etc"));
+        assert!(pat.matches("rm -rf /"));
+        // Must NOT match `rm -rf` with no slash-path (that's a different,
+        // non-denied command — e.g. `rm -rf ./local`).
+        assert!(!pat.matches("rm -rf"));
+        assert!(!pat.matches("rm -rf ./local"));
+    }
+
     // Regex metachars in pattern text must be escaped, not interpreted.
     #[test]
     fn special_chars_are_escaped() {
@@ -185,6 +236,42 @@ mod tests {
         // Without escaping, `(unit)` would be a regex group and not require
         // the literal parens.
         assert!(!pat.matches("npm test unit"));
+    }
+
+    /// dirge-9zbd: a command-style grant must match a multi-line command.
+    /// Models constantly emit `npx tsx -e "<multi-line script>"`,
+    /// `python3 -c "...\n..."`, etc. The command regex is DOTALL so `*`
+    /// spans the embedded newlines; without it, "allow always" never
+    /// sticks and the agent re-prompts on every multi-line invocation.
+    #[test]
+    fn command_pattern_spans_embedded_newlines() {
+        let pat = Pattern::new_command("npx *");
+        // Single-line — always worked.
+        assert!(pat.matches("npx tsx -e \"console.log(1)\""));
+        // Multi-line `-e` script — the exact reported failure.
+        let multi = "npx tsx -e \"import { readFileSync } from 'fs';\n\
+                     import { runRiggingTest } from './src/index.ts';\n\
+                     runRiggingTest();\"";
+        assert!(
+            pat.matches(multi),
+            "command grant must match a multi-line argument, got no match for:\n{multi}"
+        );
+        // Other common multi-line shapes.
+        assert!(Pattern::new_command("python3 *").matches("python3 -c \"import sys\nprint(1)\""));
+        assert!(Pattern::new_command("node *").matches("node -e \"const x = 1;\nconsole.log(x)\""));
+        // Still anchored to the head — a multi-line command that doesn't
+        // start with `npx` must NOT match.
+        assert!(!pat.matches("node -e \"x\nnpx y\""));
+    }
+
+    /// Path patterns stay line-sensitive (a `\n` in a path is pathological;
+    /// `**` must not silently span it and broaden a deny/allow scope).
+    #[test]
+    fn path_pattern_does_not_span_newlines() {
+        let pat = Pattern::new("/etc/**");
+        assert!(pat.matches("/etc/passwd"));
+        // A newline-bearing "path" must not be swallowed by `**`.
+        assert!(!pat.matches("/etc/x\n/home/victim"));
     }
 
     /// PERM-4: `/etc/**` should match the bare directory and all
@@ -218,10 +305,21 @@ fn glob_to_regex(pattern: &str, path_style: bool) -> String {
     // `src/` (the directory itself, no file) match a per-file
     // rule. Command tools use shell-style globbing where the
     // optional-trailing-arg semantic is the user expectation.
-    if !path_style && pattern.ends_with(" *") && !pattern.ends_with("\\ *") {
-        let head = &pattern[..pattern.len() - 2];
-        let head_regex = glob_to_regex_inner(head, path_style);
-        return format!("^{head_regex}(?: .*)?$");
+    // dirge-9zbd: also covers a trailing ` **`. For COMMAND patterns `*`
+    // and `**` both compile to `.*`, so `cargo test *` and `cargo test **`
+    // are equivalent — the only purpose of this rewrite is making the
+    // trailing args OPTIONAL. Without it, `cargo test **` compiled to
+    // `^cargo test .*$`, which requires a trailing space, so the BARE
+    // command `cargo test` (no args) silently re-prompted — and most
+    // `default_bash_rules` entries use the ` **` form.
+    if !path_style && !pattern.ends_with("\\ *") {
+        if let Some(head) = pattern
+            .strip_suffix(" **")
+            .or_else(|| pattern.strip_suffix(" *"))
+        {
+            let head_regex = glob_to_regex_inner(head, path_style);
+            return format!("^{head_regex}(?: .*)?$");
+        }
     }
     // PERM-4: a user-written `/etc/**` should match BOTH the
     // directory itself and everything beneath it. Default inner

@@ -21,8 +21,15 @@ pub(crate) fn is_placeholder_pattern(p: &str) -> bool {
 /// body further right is irrelevant (the first significant head appears
 /// before it).
 fn significant_bash_head(command: &str) -> Option<&str> {
+    // Only prefixes that are THEMSELVES auto-allowed by
+    // `default_bash_rules` belong here — skipping a prefix that still
+    // needs approval would make the suggested pattern miss it and the
+    // agent would keep re-prompting on that segment (dirge-9zbd). So
+    // `source`/`.` are intentionally NOT here: they execute arbitrary
+    // script code and are not auto-allowed, so the suggestion should
+    // target them.
     const BENIGN: &[&str] = &[
-        "cd", "pushd", "popd", "export", "set", "source", ".", ":", "true", "env",
+        "cd", "pushd", "popd", "export", "set", "unset", ":", "true", "env",
     ];
     command
         .split(|c| matches!(c, '&' | '|' | ';' | '\n'))
@@ -187,6 +194,24 @@ mod tests {
         assert_eq!(suggest_pattern("bash", "cargo test --all"), "cargo *");
         // cd-only (no significant segment) falls back to the first token.
         assert_eq!(suggest_pattern("bash", "cd /tmp"), "cd *");
+    }
+
+    /// dirge-9zbd: `source`/`.` execute arbitrary script code and are NOT
+    /// auto-allowed, so they must NOT be skipped — the suggestion targets
+    /// them, so granting it covers the (otherwise un-allowed) source while
+    /// any default-allowed sibling (`python …`) already passes.
+    #[test]
+    fn source_is_the_suggestion_target_not_skipped() {
+        assert_eq!(
+            suggest_pattern("bash", "source venv/bin/activate && python app.py"),
+            "source *"
+        );
+        assert_eq!(suggest_pattern("bash", ". ./env.sh && cargo run"), ". *");
+        // But genuinely-benign, auto-allowed prefixes ARE still skipped.
+        assert_eq!(
+            suggest_pattern("bash", "export TOKEN=x && unset Y && mycli run"),
+            "mycli *"
+        );
     }
 
     // Non-empty inputs still produce the expected suggestion.

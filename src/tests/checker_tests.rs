@@ -164,19 +164,22 @@ fn doom_loop_deny_names_the_call() {
 #[test]
 fn doom_loop_triggers_after_three_repeated_calls() {
     let mut checker = make_checker(SecurityMode::Standard);
-    checker.check("bash", "ls");
-    checker.check("bash", "ls");
-    let result = checker.check("bash", "ls");
+    // Use a command that genuinely Asks (not in the default allow rules).
+    // dirge-9zbd: bare `ls` is now auto-Allowed by `ls **` (the rewrite
+    // makes ` **` args optional), so it never reaches the doom-loop path.
+    checker.check("bash", "frobnicate xyz");
+    checker.check("bash", "frobnicate xyz");
+    let result = checker.check("bash", "frobnicate xyz");
     assert!(matches!(result, CheckResult::Ask));
 }
 
 #[test]
 fn doom_loop_does_not_trigger_before_three() {
     let mut checker = make_checker(SecurityMode::Standard);
-    // M4 (dirge-ojn): bare `ls` no longer matches the `ls **`
-    // default rule (which requires args) and falls to the new
-    // default Ask. Use a form that matches the allow rule so the
-    // doom-loop count, not the underlying action, drives the test.
+    // `ls -la` matches the `ls **` default allow rule. Two identical
+    // allowed calls stay Allowed — the doom-loop counter only escalates
+    // repeated *Ask* calls, not allowed ones. (dirge-9zbd: bare `ls` is
+    // also Allowed now, but keep the args form to be explicit.)
     checker.check("bash", "ls -la");
     let result = checker.check("bash", "ls -la");
     assert!(matches!(result, CheckResult::Allowed));

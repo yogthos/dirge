@@ -1490,4 +1490,191 @@ mod tests {
         );
         let _ = std::fs::remove_file(&file);
     }
+
+    // ============================================================
+    // dirge-9zbd — deterministic bash permission-gating corpus.
+    //
+    // These pin the END-TO-END gating for the kinds of commands models
+    // actually emit: compound `&&`/`|`/`;`/`||`, `cd` into another
+    // project, and multi-line `-e`/`-c` scripts. No LLM involved — pure
+    // deterministic rule evaluation. The headline invariant: picking
+    // "allow always" (the pattern the UI suggests) MUST make that exact
+    // command stop prompting. That invariant was silently broken for
+    // every multi-line command (the regex wasn't DOTALL) and for
+    // compounds whose benign prefix wasn't auto-allowed.
+    // ============================================================
+    #[cfg(feature = "semantic-bash")]
+    mod gating_corpus {
+        use super::*;
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+        use std::sync::{Arc, Mutex};
+
+        /// Fresh Standard-mode checker with a FIXED synthetic working dir
+        /// so external-path classification is deterministic wherever the
+        /// suite runs. (None of the corpus commands touch real files.)
+        fn checker() -> Arc<Mutex<PermissionChecker>> {
+            let config = PermissionConfig::default();
+            let c = PermissionChecker::new(
+                &config,
+                SecurityMode::Standard,
+                Some(std::path::PathBuf::from("/work/proj")),
+            );
+            Arc::new(Mutex::new(c))
+        }
+
+        /// Default gating, no grant. `Ok` = auto-allowed, `Err` = the
+        /// command would prompt (Ask) or is denied — there's no `ask_tx`
+        /// so an Ask surfaces as `Err`.
+        async fn gated(cmd: &str) -> bool {
+            check_bash_segments(&Some(checker()), &None, cmd)
+                .await
+                .is_ok()
+        }
+
+        /// The full "allow always" round-trip: suggest the pattern the UI
+        /// would (`suggest_pattern`), store it as the session would
+        /// (`add_session_allowlist`), then re-check the SAME command.
+        /// Returns whether the command is now allowed.
+        async fn grant_then_recheck(cmd: &str) -> bool {
+            let perm = checker();
+            let pat = crate::ui::permission_ui::suggest_pattern("bash", cmd);
+            perm.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add_session_allowlist("bash".to_string(), &pat);
+            check_bash_segments(&Some(perm), &None, cmd).await.is_ok()
+        }
+
+        /// The exact screenshot command: `cd <external> && npx tsx -e
+        /// "<multi-line script>"`. `npx` runs arbitrary remote code, so it
+        /// is NOT default-allowed — it must prompt ONCE. The bug was that
+        /// "allow always" (`npx *`) then never matched because the regex
+        /// wasn't DOTALL; with the fix the grant sticks on the multi-line
+        /// command. (`cd` to the external project is auto-allowed.)
+        #[tokio::test]
+        async fn reported_multiline_npx_compound_prompts_then_grant_sticks() {
+            let cmd = "cd /Users/yogthos/src/rignet && npx tsx -e \"\
+                import { readFileSync } from 'fs';\n\
+                import { runRiggingTest } from './src/index.ts';\n\
+                runRiggingTest();\"";
+            assert!(
+                !gated(cmd).await,
+                "npx runs arbitrary code — it must prompt the first time"
+            );
+            assert!(
+                grant_then_recheck(cmd).await,
+                "ALLOW-ALWAYS MUST STICK on the multi-line compound (the reported bug)"
+            );
+        }
+
+        /// Arbitrary-code interpreters prompt once, then the "allow always"
+        /// grant must stick — including for multi-line `-e`/`-c` scripts,
+        /// the exact class the newline bug broke.
+        #[tokio::test]
+        async fn multiline_interpreter_scripts_prompt_then_grant_sticks() {
+            for cmd in [
+                "npx tsx -e \"console.log(1)\"",
+                "npx tsx -e \"const a = 1;\nconsole.log(a)\"",
+                "node -e \"const x = 1;\nconsole.log(x)\"",
+                "python3 -c \"import sys\nprint(sys.argv)\"",
+                "python -c \"x = 1\nprint(x)\"",
+            ] {
+                assert!(
+                    !gated(cmd).await,
+                    "interpreter must prompt (not default-allowed): {cmd:?}"
+                );
+                assert!(
+                    grant_then_recheck(cmd).await,
+                    "allow-always must stick on multi-line interpreter cmd: {cmd:?}"
+                );
+            }
+        }
+
+        /// Compounds whose every segment is default-allowed auto-allow —
+        /// across `&&`, `|`, `;`, `||`.
+        #[tokio::test]
+        async fn all_default_compounds_auto_allowed() {
+            for cmd in [
+                "git add . && git commit -m \"msg\"",
+                "cargo fmt && cargo test",
+                "cd subdir && npm run build",
+                "ls -la | grep foo",
+                "cat a.txt; echo done",
+                "cargo build || echo failed",
+                "export RUST_LOG=debug && cargo test",
+                "pushd app && npm run build && popd",
+            ] {
+                assert!(
+                    gated(cmd).await,
+                    "all-default compound must auto-allow: {cmd:?}"
+                );
+            }
+        }
+
+        /// THE INVARIANT: a non-default command (including multi-line and
+        /// compound-with-benign-prefix) must FIRST prompt, then stop
+        /// prompting once "allow always" stores the suggested pattern.
+        #[tokio::test]
+        async fn allow_always_sticks_for_custom_commands() {
+            for cmd in [
+                "mycli run --fast",
+                // Multi-line — the DOTALL case end-to-end.
+                "mycli gen -e \"line1\nline2\nline3\"",
+                // Compound: benign (auto-allowed) prefix + custom multi-line.
+                "cd /some/external/project && mycli build -e \"a\nb\"",
+                "export TOKEN=x && mycli deploy",
+            ] {
+                assert!(
+                    !gated(cmd).await,
+                    "expected an initial prompt (not in defaults): {cmd:?}"
+                );
+                assert!(
+                    grant_then_recheck(cmd).await,
+                    "ALLOW-ALWAYS MUST STICK — command still prompts after grant: {cmd:?}"
+                );
+            }
+        }
+
+        /// `source`/`.` run arbitrary script code: NOT auto-allowed, and
+        /// the suggestion targets them (not a later segment), so granting
+        /// makes the whole `source x && <default-allowed-cmd>` pass. Paired
+        /// with a project-scoped `cargo test` (auto-allowed) so the only
+        /// gate is `source` — granting `source *` must clear it.
+        #[tokio::test]
+        async fn source_is_gated_but_grant_sticks() {
+            let cmd = "source ./env.sh && cargo test";
+            assert!(!gated(cmd).await, "source must prompt by default");
+            assert!(
+                grant_then_recheck(cmd).await,
+                "granting the suggested `source *` must make the command pass"
+            );
+        }
+
+        /// Security: denies and dangerous segments are NOT unlocked by an
+        /// "allow always" on a sibling segment.
+        #[tokio::test]
+        async fn dangerous_segments_stay_gated_even_after_grant() {
+            for cmd in [
+                "rm -rf /",
+                "npx foo && rm -rf /",
+                "cargo build && sudo rm -rf /var",
+            ] {
+                assert!(!gated(cmd).await, "must not auto-allow: {cmd:?}");
+                assert!(
+                    !grant_then_recheck(cmd).await,
+                    "allow-always must NOT unlock a denied/dangerous segment: {cmd:?}"
+                );
+            }
+        }
+
+        /// Operators inside quotes are literal — the dangerous text must
+        /// stay part of one safe command, not split into its own claim.
+        #[tokio::test]
+        async fn quoted_operators_do_not_split_into_claims() {
+            // The `&&` and `rm -rf /` are inside the echo string.
+            assert!(
+                gated("echo \"a && rm -rf /\"").await,
+                "quoted operator is literal — echo is allowed as one segment"
+            );
+        }
+    }
 }

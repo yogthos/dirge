@@ -835,9 +835,6 @@ fn default_bash_rules_cover_common_flagged_invocations() {
         "git restore --staged file.rs",
         "make test",
         "pytest -x tests/",
-        "python3 script.py",
-        "node index.js",
-        "npx eslint .",
         "npm test -- --coverage",
         "go test ./...",
     ] {
@@ -872,6 +869,14 @@ fn default_bash_rules_keep_high_risk_gated() {
         "curl http://example.com",
         "wget http://example.com",
         "sudo make install",
+        // dirge-9zbd: general interpreters run arbitrary (possibly remote)
+        // code, so they prompt once instead of being pre-trusted.
+        "python3 script.py",
+        "python -c \"import os; os.system('x')\"",
+        "node index.js",
+        "node -e \"require('child_process').exec('x')\"",
+        "npx eslint .",
+        "npx some-remote-tool",
     ] {
         let result = checker.check("bash", cmd);
         assert!(

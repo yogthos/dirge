@@ -149,7 +149,13 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
     // friction that drove the "permissions are too aggressive"
     // complaint.
     //
-    // Intentionally NOT auto-allowed:
+    // Intentionally NOT auto-allowed (each gets one permission dialog;
+    // "allow always" then persists the grant for the session):
+    //   - `npx`, `node`, `python`, `python3` — general interpreters that
+    //     run ARBITRARY code (`-e`/`-c` inline scripts, remote `npx`
+    //     packages, any `*.py`/`*.js` file). Not guaranteed to operate
+    //     within the working folder, so unlike `cargo`/`go`/`make`/`pytest`
+    //     (which run the project's OWN code) they aren't pre-trusted.
     //   - `git push **`           — side effect outside the project
     //   - `git rebase/reset/stash`— destructive, can lose work
     //   - `npm install **`, `pip install **` — executes install
@@ -181,6 +187,23 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
         ("date **", Action::Allow),
         ("whoami", Action::Allow),
         ("hostname", Action::Allow),
+        // Benign shell builtins — set env vars / navigate / no-ops, no
+        // filesystem or code-execution side effects (a `$(...)` inside
+        // would flip the whole command to the complex/whole-command
+        // check, not these rules). These MUST stay in sync with the
+        // `significant_bash_head` skip-list (dirge-9zbd): that function
+        // skips these prefixes when suggesting an "allow always" pattern,
+        // so a compound like `export X=1 && cd app && <cmd>` resolves to
+        // `<cmd> *` — which only covers the whole command if the skipped
+        // prefixes are themselves auto-allowed. `*` (not `**`) so a bare
+        // builtin with no args (`pushd`, `:`) also matches.
+        ("export *", Action::Allow),
+        ("set *", Action::Allow),
+        ("unset *", Action::Allow),
+        ("pushd *", Action::Allow),
+        ("popd *", Action::Allow),
+        (": *", Action::Allow),
+        ("true *", Action::Allow),
         // Git — local read/write inside the repo
         ("git status **", Action::Allow),
         ("git log **", Action::Allow),
@@ -221,17 +244,27 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
         ("cp **", Action::Allow),
         ("ln **", Action::Allow),
         ("chmod **", Action::Allow),
-        // Node / npm / yarn / pnpm — runners (NOT installers)
+        // Node / npm / yarn / pnpm — PROJECT-SCOPED runners only.
+        // `npm run`/`npm test` execute scripts defined in the repo's
+        // package.json (same trust model as editing project files);
+        // `npm ls` is read-only.
+        //
+        // `npx` and `node` are intentionally NOT here: `npx <pkg>` fetches
+        // and runs ARBITRARY remote packages, and `node -e "…"` /
+        // `node any.js` runs arbitrary JavaScript — neither is guaranteed
+        // to stay in the working folder, so each gets one permission
+        // dialog. After "allow always" the grant sticks (incl. multi-line
+        // scripts — dirge-9zbd).
         ("npm test **", Action::Allow),
         ("npm run **", Action::Allow),
         ("npm ls **", Action::Allow),
-        ("npx **", Action::Allow),
-        ("node **", Action::Allow),
         ("yarn run **", Action::Allow),
         ("pnpm run **", Action::Allow),
-        // Python — runners + read-only pip
-        ("python **", Action::Allow),
-        ("python3 **", Action::Allow),
+        // Python — project-scoped tools + read-only pip. The bare
+        // `python`/`python3` interpreters are intentionally NOT allowed
+        // (`python -c "…"` / `python any.py` runs arbitrary code) — they
+        // prompt once. `pytest`/`ruff`/`black`/`mypy` operate on the
+        // project tree (same trust as editing it).
         ("pytest **", Action::Allow),
         ("ruff **", Action::Allow),
         ("black **", Action::Allow),
