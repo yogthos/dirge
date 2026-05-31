@@ -2054,8 +2054,9 @@ fn build_escalation_stream_fn(
 
 /// F6 tier 3: build the bounded-critic callback. Constructs a fresh
 /// client for the critic alias and returns a [`CriticFn`] that runs one
-/// completion (via `summarize_with_model`) per call. No tools — the
-/// critic only reads a transcript and returns a verdict.
+/// completion (via `summarize::oneshot_with_model`, with the critic's own
+/// role preamble + telemetry label) per call. No tools — the critic only
+/// reads a transcript and returns a verdict.
 fn build_critic_fn(
     alias: &str,
     entry: &ProviderEntry,
@@ -2071,14 +2072,13 @@ fn build_critic_fn(
         let model_name = model_name.clone();
         Box::pin(async move {
             let model = client.completion_model(model_name);
-            // dirge-0g6i: distinct retry/telemetry label so the critic's
-            // calls aren't conflated with the summarizer's. (Same preamble
-            // as the summarizer path — the critic's instructions live in
-            // the prompt body.)
+            // Distinct retry/telemetry label + a role-appropriate system
+            // preamble (the critic's response FORMAT still rides in the
+            // prompt body, next to the transcript).
             summarize::oneshot_with_model(
                 model,
                 "critic",
-                "You are a conversation summarizer.",
+                crate::agent::agent_loop::critic::CRITIC_PREAMBLE,
                 prompt,
             )
             .await

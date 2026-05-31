@@ -27,21 +27,32 @@ pub type CriticFn = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> + Send + Sync,
 >;
 
-/// System/instruction preamble for the critic. Asks for a strict,
-/// parseable verdict so we can act on it deterministically.
-const CRITIC_INSTRUCTIONS: &str = "\
-You are a strict code-review critic. You are given a user's request and a transcript of what an \
-assistant just did to satisfy it. Judge ONLY whether the task is actually complete and correct — \
-not style. Be skeptical: unverified claims, partial work, ignored edge cases, and \"done\" without \
-evidence are NOT complete.\n\n\
+/// System preamble for the critic: establishes its role and the strict,
+/// skeptical stance. Passed as the LLM system prompt by `build_critic_fn`
+/// (replacing the stray "conversation summarizer" preamble) so the model
+/// knows what it is BEFORE it sees the transcript. The exact response
+/// FORMAT lives in [`build_prompt`] instead — right next to the material
+/// being judged.
+pub const CRITIC_PREAMBLE: &str = "\
+You are a strict code-review critic for an autonomous coding agent. You are given a user's request \
+and a transcript of what the assistant just did to satisfy it. Judge ONLY whether the task is \
+actually complete and correct — not style. Be skeptical: unverified claims, partial work, ignored \
+edge cases, and \"done\" without evidence are NOT complete. If you are genuinely unsure, pass — do \
+not block on speculation.";
+
+/// Response-format instruction. Kept in the user prompt (not the system
+/// preamble) so the strict verdict shape sits directly beside the
+/// transcript the critic is judging.
+const CRITIC_FORMAT: &str = "\
 Respond in EXACTLY this format and nothing else:\n\
 On the first line, either `VERDICT: COMPLETE` or `VERDICT: INCOMPLETE`.\n\
-If INCOMPLETE, follow with a short bullet list of the specific, concrete issues to fix.\n\
-If you are unsure, answer COMPLETE (do not block on speculation).";
+If INCOMPLETE, follow with a short bullet list of the specific, concrete issues to fix.";
 
-/// Build the critic prompt from a transcript of the run.
+/// Build the critic prompt from a transcript of the run. The role lives
+/// in [`CRITIC_PREAMBLE`] (the system slot); this carries the format +
+/// the transcript.
 pub fn build_prompt(transcript: &str) -> String {
-    format!("{CRITIC_INSTRUCTIONS}\n\n--- transcript ---\n{transcript}\n--- end transcript ---")
+    format!("{CRITIC_FORMAT}\n\n--- transcript ---\n{transcript}\n--- end transcript ---")
 }
 
 /// Parse the critic's raw response into a verdict. `Some(issues)` means
@@ -127,6 +138,21 @@ mod tests {
         assert!(p.contains("VERDICT: COMPLETE"));
         assert!(p.contains("VERDICT: INCOMPLETE"));
         assert!(p.contains("edited foo.rs"));
+    }
+
+    /// The system preamble states the critic's ROLE (not the summarizer's),
+    /// and the response FORMAT is kept out of it (it lives in the prompt).
+    #[test]
+    fn preamble_establishes_critic_role_without_format() {
+        let lower = CRITIC_PREAMBLE.to_ascii_lowercase();
+        assert!(lower.contains("critic"), "preamble must name the role");
+        assert!(
+            !lower.contains("summarizer"),
+            "preamble must not be the summarizer's"
+        );
+        // Format lives in the prompt, not the system preamble.
+        assert!(!CRITIC_PREAMBLE.contains("VERDICT:"));
+        assert!(build_prompt("t").contains("VERDICT:"));
     }
 
     #[tokio::test]
