@@ -34,23 +34,31 @@ pub struct SyntaxError {
     /// syntax error) or a MISSING node (tree-sitter inferred a
     /// missing token like `;`).
     pub is_missing: bool,
+    /// For MISSING nodes, the token tree-sitter expected — its node
+    /// kind, e.g. `"}"`, `")"`, `";"`. This is computed by the grammar,
+    /// so it's accurate for every language. `None` for ERROR nodes.
+    pub expected: Option<String>,
 }
 
 impl SyntaxError {
-    /// Format for inclusion in a tool-error message.
+    /// Format for inclusion in a tool-error message. Names the expected
+    /// token for MISSING nodes ("missing `}`") so the feedback is
+    /// actionable across every tree-sitter language, not just Lisp.
     pub fn render(&self) -> String {
-        let kind = if self.is_missing {
-            "missing token"
-        } else {
-            "syntax error"
-        };
-        format!(
-            "  {kind} at {line}:{col}: {snippet}",
-            kind = kind,
-            line = self.line,
-            col = self.column,
-            snippet = self.snippet,
-        )
+        match (self.is_missing, self.expected.as_deref()) {
+            (true, Some(tok)) if !tok.is_empty() && tok != "ERROR" => format!(
+                "  missing `{}` at {}:{}: {}",
+                tok, self.line, self.column, self.snippet
+            ),
+            (true, _) => format!(
+                "  missing token at {}:{}: {}",
+                self.line, self.column, self.snippet
+            ),
+            (false, _) => format!(
+                "  syntax error at {}:{}: {}",
+                self.line, self.column, self.snippet
+            ),
+        }
     }
 }
 
@@ -126,11 +134,19 @@ fn collect_errors(tree: &tree_sitter::Tree, source: &str) -> Vec<SyntaxError> {
         if node.is_error() || node.is_missing() {
             let start = node.start_position();
             let snippet = snippet_for(node, source);
+            // For a MISSING node, `kind()` is the token the grammar
+            // expected (e.g. "}") — the most actionable detail we have.
+            let expected = if node.is_missing() {
+                Some(node.kind().to_string())
+            } else {
+                None
+            };
             errors.push(SyntaxError {
                 line: start.row + 1,
                 column: start.column + 1,
                 snippet,
                 is_missing: node.is_missing(),
+                expected,
             });
             // Skip walking deeper inside an error node — the
             // children are noise once the parent is known to be
@@ -214,99 +230,248 @@ pub fn check_syntax(path: &Path, content: &str) -> Result<(), Vec<SyntaxError>> 
     Err(errors)
 }
 
-/// Lisp-family extensions whose delimiter balance is worth summarizing.
-/// A tree-sitter "syntax error at L:C" is nearly useless for an
-/// unbalanced paren; a balance summary points straight at the culprit.
-fn is_lisp_ext(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_lowercase)
-            .as_deref(),
-        Some(
-            "clj"
-                | "cljs"
-                | "cljc"
-                | "cljd"
-                | "edn"
-                | "bb"
-                | "janet"
-                | "jdn"
-                | "fnl"
-                | "lisp"
-                | "el"
-                | "scm"
-                | "rkt"
-        )
-    )
+/// Per-language lexing rules for the delimiter-balance scan — just
+/// enough to skip comments / strings / char-literals so the real
+/// `()[]{}` are counted correctly.
+///
+/// Configured only for languages whose comment + string forms are
+/// unambiguous to a simple scanner. JS/TS, Ruby, and Bash are
+/// deliberately omitted: regex literals (`/…/`) and heredocs can fool a
+/// non-parsing scanner into a *wrong* delimiter, and a misleading hint is
+/// worse than none — those languages still get the base tree-sitter error
+/// plus the named missing token. The scan only localizes an imbalance
+/// that tree-sitter already flagged.
+struct LexRules {
+    line_comments: &'static [&'static str],
+    /// `(open, close)` block-comment pairs.
+    block_comments: &'static [(&'static str, &'static str)],
+    nested_block_comments: bool,
+    /// `(open, close, supports_backslash_escape)`. Checked in order, so
+    /// longer delimiters (e.g. `"""`) must precede their prefixes (`"`).
+    strings: &'static [(&'static str, &'static str, bool)],
+    /// `'x'` single-char literals (C/C++/Rust/Go/Java). Rust lifetimes
+    /// (`'a`) are detected and treated as ordinary tokens.
+    char_squote: bool,
+    /// `\x` char literals (Lisp): the char after a backslash is escaped.
+    char_backslash: bool,
 }
 
-/// Scan Lisp source for a delimiter imbalance and return a concrete,
-/// actionable summary — the model should never have to count parens by
-/// hand. Quote/char-literal/comment aware (`"…"`, `\(`, `; …`). Returns
-/// `None` when delimiters are balanced (then the real error is elsewhere).
-pub fn lisp_delimiter_summary(content: &str) -> Option<String> {
-    let mut stack: Vec<(char, usize, usize)> = Vec::new(); // (open, line, col)
-    let (mut line, mut col) = (1usize, 1usize);
-    let mut in_string = false;
-    let mut in_comment = false;
-    let mut skip_next = false; // consume the char after `\` (char literal / escape)
-    for c in content.chars() {
-        if skip_next {
-            skip_next = false;
-        } else if in_comment {
-            if c == '\n' {
-                in_comment = false;
-            }
-        } else if in_string {
-            match c {
-                '\\' => skip_next = true,
-                '"' => in_string = false,
-                _ => {}
-            }
+const RULES_C: LexRules = LexRules {
+    line_comments: &["//"],
+    block_comments: &[("/*", "*/")],
+    nested_block_comments: false,
+    strings: &[("\"", "\"", true)],
+    char_squote: true,
+    char_backslash: false,
+};
+const RULES_RUST: LexRules = LexRules {
+    line_comments: &["//"],
+    block_comments: &[("/*", "*/")],
+    nested_block_comments: true,
+    // raw strings r#"…"# and r"…" precede the plain "…".
+    strings: &[
+        ("r#\"", "\"#", false),
+        ("r\"", "\"", false),
+        ("\"", "\"", true),
+    ],
+    char_squote: true,
+    char_backslash: false,
+};
+const RULES_GO: LexRules = LexRules {
+    line_comments: &["//"],
+    block_comments: &[("/*", "*/")],
+    nested_block_comments: false,
+    strings: &[("`", "`", false), ("\"", "\"", true)],
+    char_squote: true,
+    char_backslash: false,
+};
+const RULES_JAVA: LexRules = LexRules {
+    line_comments: &["//"],
+    block_comments: &[("/*", "*/")],
+    nested_block_comments: false,
+    strings: &[("\"\"\"", "\"\"\"", true), ("\"", "\"", true)],
+    char_squote: true,
+    char_backslash: false,
+};
+const RULES_PYTHON: LexRules = LexRules {
+    line_comments: &["#"],
+    block_comments: &[],
+    nested_block_comments: false,
+    strings: &[
+        ("\"\"\"", "\"\"\"", true),
+        ("'''", "'''", true),
+        ("\"", "\"", true),
+        ("'", "'", true),
+    ],
+    char_squote: false,
+    char_backslash: false,
+};
+const RULES_LISP: LexRules = LexRules {
+    line_comments: &[";"],
+    block_comments: &[],
+    nested_block_comments: false,
+    strings: &[("\"", "\"", true)],
+    char_squote: false,
+    char_backslash: true,
+};
+
+/// Lexing rules for a path's extension, or `None` when the delimiter
+/// scan isn't trustworthy for that language (or it's unknown).
+fn lex_rules_for_path(path: &Path) -> Option<&'static LexRules> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    Some(match ext.as_str() {
+        "rs" => &RULES_RUST,
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => &RULES_C,
+        "go" => &RULES_GO,
+        "java" => &RULES_JAVA,
+        "py" | "pyi" => &RULES_PYTHON,
+        "clj" | "cljs" | "cljc" | "cljd" | "edn" | "bb" | "janet" | "jdn" | "fnl" | "lisp"
+        | "el" | "scm" | "rkt" => &RULES_LISP,
+        _ => return None,
+    })
+}
+
+/// `true` when the bytes at `i` begin with `p`.
+fn starts_at(b: &[u8], i: usize, p: &str) -> bool {
+    b[i..].starts_with(p.as_bytes())
+}
+
+/// Advance `*i` by `count` bytes, updating `line`/`col` over the skipped
+/// bytes. Relative (not absolute) so call sites never read `i` while it's
+/// mutably borrowed in the same call.
+fn adv(b: &[u8], i: &mut usize, line: &mut usize, col: &mut usize, count: usize) {
+    let to = i.saturating_add(count).min(b.len());
+    while *i < to {
+        if b[*i] == b'\n' {
+            *line += 1;
+            *col = 1;
         } else {
-            match c {
-                '\\' => skip_next = true,
-                '"' => in_string = true,
-                ';' => in_comment = true,
-                '(' | '[' | '{' => stack.push((c, line, col)),
-                ')' | ']' | '}' => {
-                    let want = match c {
-                        ')' => '(',
-                        ']' => '[',
-                        _ => '{',
-                    };
-                    match stack.last() {
-                        Some(&(open, _, _)) if open == want => {
-                            stack.pop();
-                        }
-                        _ => {
-                            return Some(format!(
-                                "Delimiter imbalance: unexpected `{c}` at line {line}, col {col} \
-                                 with no matching open — remove an extra closer, or add the \
-                                 missing opener before it."
-                            ));
-                        }
+            *col += 1;
+        }
+        *i += 1;
+    }
+}
+
+/// Scan source for a delimiter imbalance under `rules`, returning a
+/// concrete, actionable summary — so the model never has to count
+/// delimiters by hand. Comment/string/char-literal aware. Returns `None`
+/// when delimiters balance (then the real error is elsewhere). All
+/// comment/string/delimiter syntax is ASCII, so a byte scan is safe.
+fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
+    let b = content.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    let (mut line, mut col) = (1usize, 1usize);
+    let mut stack: Vec<(u8, usize, usize)> = Vec::new(); // (open, line, col)
+
+    'outer: while i < n {
+        for lc in rules.line_comments {
+            if starts_at(b, i, lc) {
+                let to_eol = b[i..].iter().position(|&c| c == b'\n').unwrap_or(n - i);
+                adv(b, &mut i, &mut line, &mut col, to_eol);
+                continue 'outer;
+            }
+        }
+        for (open, close) in rules.block_comments {
+            if starts_at(b, i, open) {
+                adv(b, &mut i, &mut line, &mut col, open.len());
+                let mut depth = 1usize;
+                while i < n && depth > 0 {
+                    if rules.nested_block_comments && starts_at(b, i, open) {
+                        depth += 1;
+                        adv(b, &mut i, &mut line, &mut col, open.len());
+                    } else if starts_at(b, i, close) {
+                        depth -= 1;
+                        adv(b, &mut i, &mut line, &mut col, close.len());
+                    } else {
+                        adv(b, &mut i, &mut line, &mut col, 1);
                     }
                 }
-                _ => {}
+                continue 'outer;
             }
         }
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
+        for (open, close, esc) in rules.strings {
+            if starts_at(b, i, open) {
+                adv(b, &mut i, &mut line, &mut col, open.len());
+                while i < n {
+                    if *esc && b[i] == b'\\' {
+                        adv(b, &mut i, &mut line, &mut col, 2);
+                    } else if starts_at(b, i, close) {
+                        adv(b, &mut i, &mut line, &mut col, close.len());
+                        break;
+                    } else {
+                        adv(b, &mut i, &mut line, &mut col, 1);
+                    }
+                }
+                continue 'outer;
+            }
         }
+        if rules.char_backslash && b[i] == b'\\' {
+            adv(b, &mut i, &mut line, &mut col, 2);
+            continue 'outer;
+        }
+        if rules.char_squote && b[i] == b'\'' {
+            if b.get(i + 1) == Some(&b'\\') {
+                // '\…': skip to the closing quote, honoring escapes.
+                let mut j = i + 1;
+                while j < n {
+                    if b[j] == b'\\' {
+                        j += 2;
+                    } else if b[j] == b'\'' {
+                        j += 1;
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                let count = j - i;
+                adv(b, &mut i, &mut line, &mut col, count);
+                continue 'outer;
+            } else if b.get(i + 2) == Some(&b'\'') {
+                adv(b, &mut i, &mut line, &mut col, 3); // 'x'
+                continue 'outer;
+            } else {
+                // Rust lifetime ('a) or stray quote — an ordinary token.
+                adv(b, &mut i, &mut line, &mut col, 1);
+                continue 'outer;
+            }
+        }
+        match b[i] {
+            b'(' | b'[' | b'{' => stack.push((b[i], line, col)),
+            b')' | b']' | b'}' => {
+                let want = match b[i] {
+                    b')' => b'(',
+                    b']' => b'[',
+                    _ => b'{',
+                };
+                match stack.last() {
+                    Some(&(open, _, _)) if open == want => {
+                        stack.pop();
+                    }
+                    _ => {
+                        let c = b[i] as char;
+                        return Some(format!(
+                            "Delimiter imbalance: unexpected `{c}` at line {line}, col {col} \
+                             with no matching open — remove an extra closer, or add the missing \
+                             opener before it."
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        adv(b, &mut i, &mut line, &mut col, 1);
     }
+
     stack.first().map(|&(open, l, c)| {
+        let openc = open as char;
         let close = match open {
-            '(' => ')',
-            '[' => ']',
+            b'(' => ')',
+            b'[' => ']',
             _ => '}',
         };
         format!(
-            "Delimiter imbalance: {n} unclosed — the `{open}` opened at line {l}, col {c} is \
+            "Delimiter imbalance: {n} unclosed — the `{openc}` opened at line {l}, col {c} is \
              never closed; add {n} matching `{close}` (do not count by hand — fix this delimiter).",
             n = stack.len()
         )
@@ -314,9 +479,10 @@ pub fn lisp_delimiter_summary(content: &str) -> Option<String> {
 }
 
 /// Convenience wrapper: format a `Vec<SyntaxError>` as a single
-/// multi-line string suitable for inclusion in a tool error
-/// message. For Lisp files a delimiter-balance summary is appended so
-/// the model gets actionable paren feedback instead of a bare line:col.
+/// multi-line string suitable for inclusion in a tool error message. For
+/// languages with reliable lexing, a delimiter-balance summary is
+/// appended so the model gets an actionable "the `{` at line N is never
+/// closed" instead of a bare line:col.
 pub fn format_errors(path: &Path, content: &str, errors: &[SyntaxError]) -> String {
     let mut out = format!(
         "Syntax check failed for {}: {} error(s) detected by tree-sitter. \
@@ -334,8 +500,8 @@ pub fn format_errors(path: &Path, content: &str, errors: &[SyntaxError]) -> Stri
             MAX_ERRORS,
         ));
     }
-    if is_lisp_ext(path)
-        && let Some(summary) = lisp_delimiter_summary(content)
+    if let Some(rules) = lex_rules_for_path(path)
+        && let Some(summary) = delimiter_summary(content, rules)
     {
         out.push_str("  ");
         out.push_str(&summary);
@@ -348,6 +514,102 @@ pub fn format_errors(path: &Path, content: &str, errors: &[SyntaxError]) -> Stri
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ---- Generalized delimiter scanner (no tree-sitter needed) ----
+
+    #[test]
+    fn render_names_the_expected_missing_token() {
+        let e = SyntaxError {
+            line: 5,
+            column: 1,
+            snippet: "}".into(),
+            is_missing: true,
+            expected: Some("}".into()),
+        };
+        assert_eq!(e.render(), "  missing `}` at 5:1: }");
+        // ERROR node (not missing) keeps the generic phrasing.
+        let e2 = SyntaxError {
+            line: 1,
+            column: 1,
+            snippet: "@@@".into(),
+            is_missing: false,
+            expected: None,
+        };
+        assert!(e2.render().contains("syntax error at 1:1"));
+    }
+
+    /// The scanner must NOT cry imbalance on VALID code — each language's
+    /// strings / comments / char-literals / raw-strings / lifetimes hide
+    /// delimiters that would otherwise be miscounted. This is the safety
+    /// property: a false hint is worse than none.
+    #[test]
+    fn balanced_code_yields_no_summary_per_language() {
+        let rust = r####"
+fn demo<'a>(x: &'a str) -> char {
+    // a closing brace } in a line comment
+    let s = "string with ( and { and }";
+    let r = r#"raw with ) and ] and "#;
+    let c = '}';
+    let q = '\'';
+    /* block ) with nested /* { */ still ) */
+    if x.len() > 0 { '(' } else { ')' }
+}
+"####;
+        assert_eq!(delimiter_summary(rust, &RULES_RUST), None, "rust");
+
+        let c = r#"
+int main(void) {
+    char b = '{';      /* a ) in a block comment */
+    printf("a(b)[c]"); // a } in a line comment
+    return 0;
+}
+"#;
+        assert_eq!(delimiter_summary(c, &RULES_C), None, "c");
+
+        let go = "func f() {\n\ts := `raw ( { string`\n\tr := '}'\n\tm := map[int]int{}\n}\n";
+        assert_eq!(delimiter_summary(go, &RULES_GO), None, "go");
+
+        let java = "class A {\n  String t = \"\"\" ( { still fine \"\"\";\n  char c = ']';\n}\n";
+        assert_eq!(delimiter_summary(java, &RULES_JAVA), None, "java");
+
+        let py = "def f(x):\n    s = \"a{b}c\"\n    t = '''( { ['''\n    # comment with )\n    return [1, 2, {3: 4}]\n";
+        assert_eq!(delimiter_summary(py, &RULES_PYTHON), None, "python");
+
+        let lisp = r#"(defn f [x] (str "a(b)c" \( \) ))"#;
+        assert_eq!(delimiter_summary(lisp, &RULES_LISP), None, "lisp");
+    }
+
+    #[test]
+    fn unclosed_delimiter_is_localized_per_language() {
+        // Rust: unclosed `(` and `{` — points at the first unclosed.
+        let s = delimiter_summary("fn f() {\n    let x = (1 + 2;\n", &RULES_RUST)
+            .expect("rust imbalance");
+        assert!(s.contains("unclosed"), "{s}");
+
+        // C: extra `}`.
+        let s = delimiter_summary("int f() { return 0; }}\n", &RULES_C).expect("c extra");
+        assert!(
+            s.contains("unexpected") && s.contains("no matching open"),
+            "{s}"
+        );
+
+        // Python: unclosed `[`.
+        let s = delimiter_summary("xs = [1, 2,\n", &RULES_PYTHON).expect("py imbalance");
+        assert!(s.contains("unclosed"), "{s}");
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn format_errors_appends_summary_for_rust() {
+        let path = PathBuf::from("/tmp/x.rs");
+        let content = "fn f() {\n    let x = (1 + 2;\n"; // unclosed ( and {
+        let errors = check_syntax(&path, content).expect_err("expected errors");
+        let rendered = format_errors(&path, content, &errors);
+        assert!(
+            rendered.contains("Delimiter imbalance"),
+            "rust error should carry the balance hint now too: {rendered}"
+        );
+    }
 
     #[cfg(feature = "semantic-rust")]
     #[test]
@@ -402,26 +664,26 @@ mod tests {
     #[test]
     fn lisp_summary_points_at_first_unclosed_open() {
         // `(defn f [x` — one unclosed `(` and one unclosed `[`.
-        let s = lisp_delimiter_summary("(defn f [x\n  (+ x 1)").expect("imbalanced");
+        let s = delimiter_summary("(defn f [x\n  (+ x 1)", &RULES_LISP).expect("imbalanced");
         assert!(s.contains("unclosed"), "{s}");
         assert!(s.contains("line 1"), "should point at the first open: {s}");
     }
 
     #[test]
     fn lisp_summary_flags_extra_closer() {
-        let s = lisp_delimiter_summary("(+ 1 2))").expect("extra closer");
+        let s = delimiter_summary("(+ 1 2))", &RULES_LISP).expect("extra closer");
         assert!(s.contains("unexpected"), "{s}");
         assert!(s.contains("no matching open"), "{s}");
     }
 
     #[test]
     fn lisp_summary_is_none_when_balanced() {
-        assert!(lisp_delimiter_summary("(defn f [x] (+ x 1))").is_none());
+        assert!(delimiter_summary("(defn f [x] (+ x 1))", &RULES_LISP).is_none());
         // Parens inside a string and a char literal don't count toward
         // balance — the outer form here is balanced.
-        assert!(lisp_delimiter_summary(r#"(str "a(b)c" \()"#).is_none());
+        assert!(delimiter_summary(r#"(str "a(b)c" \()"#, &RULES_LISP).is_none());
         // A trailing comment's parens are ignored too.
-        assert!(lisp_delimiter_summary("(+ 1 2) ; ) ) )").is_none());
+        assert!(delimiter_summary("(+ 1 2) ; ) ) )", &RULES_LISP).is_none());
     }
 
     #[cfg(feature = "semantic-clojure")]
