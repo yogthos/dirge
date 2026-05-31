@@ -1323,4 +1323,82 @@ mod tests {
         assert_eq!(format_bar("MEM", 50.0), "MEM: [#####.....]  50%");
         assert_eq!(format_bar("CPU", 100.0), "CPU: [##########] 100%");
     }
+
+    /// DebugRightPanel renders VARIABLES and all sub-panel titles
+    /// when DebugPanelData is populated with session state.
+    #[cfg(feature = "dap")]
+    #[test]
+    fn debug_panel_renders_variables() {
+        use crate::dap::types::{DebugPanelData, SessionStatus, Variable};
+
+        let data = DebugPanelData {
+            session_summary: Some(crate::dap::types::SessionSummary {
+                id: "s1".into(),
+                adapter_name: "test".into(),
+                program: None,
+                status: SessionStatus::Stopped,
+                breakpoint_count: 1,
+                function_breakpoint_count: 2,
+                stop_reason: Some("breakpoint".into()),
+                thread_id: Some(1),
+            }),
+            threads: vec![],
+            frames: vec![],
+            variables: vec![
+                Variable {
+                    name: "x".into(),
+                    value: "42".into(),
+                    var_type: Some("i32".into()),
+                    presentation_hint: None,
+                    evaluate_name: None,
+                    variables_reference: 0,
+                    named_variables: None,
+                    indexed_variables: None,
+                    memory_reference: None,
+                },
+                Variable {
+                    name: "msg".into(),
+                    value: "\"hello\"".into(),
+                    var_type: Some("String".into()),
+                    presentation_hint: None,
+                    evaluate_name: None,
+                    variables_reference: 0,
+                    named_variables: None,
+                    indexed_variables: None,
+                    memory_reference: None,
+                },
+            ],
+            output: "hello\nworld\n".into(),
+            output_truncated: false,
+        };
+
+        let backend = TestBackend::new(30, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 30, 30);
+                f.render_widget(debug::DebugRightPanel::new(&data), area);
+            })
+            .unwrap();
+        let backend = terminal.backend().clone();
+
+        let dump: String = (0..30)
+            .map(|y| {
+                (0..30)
+                    .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(dump.contains("[VARIABLES]"), "VARIABLES title:\n{dump}");
+        assert!(dump.contains("msg = \"hello\""), "variable value:\n{dump}");
+        assert!(dump.contains(": String"), "variable type:\n{dump}");
+        assert!(dump.contains("x = 42"), "simple variable:\n{dump}");
+        assert!(dump.contains("source: 1  func: 2"), "bp counts:\n{dump}");
+        assert!(dump.contains("[DEBUG]"), "DEBUG title:\n{dump}");
+        assert!(dump.contains("[BREAKPOINTS]"), "BREAKPOINTS title:\n{dump}");
+        assert!(dump.contains("[OUTPUT]"), "OUTPUT title:\n{dump}");
+        assert!(dump.contains("hello"), "output:\n{dump}");
+    }
 }

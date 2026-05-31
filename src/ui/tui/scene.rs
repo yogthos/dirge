@@ -39,12 +39,13 @@ pub struct Scene<'a> {
     pub chat_selection: Option<SelectionRange>,
     /// Right panel data (MCP, LSP, TODOS, MODIFIED, sysload).
     pub panel_data: &'a PanelData,
-    /// Debug panel data. When `panel_mode` is `Debug` and this is
+    /// Debug panel data. When `right_panel_mode` is `Debug` and this is
     /// `Some`, the right panel shows debug info instead of system info.
     #[cfg(feature = "dap")]
     pub debug_panel_data: Option<&'a crate::dap::types::DebugPanelData>,
-    /// Current panel mode — determines which right-panel content to render.
-    pub panel_mode: PanelMode,
+    /// Current right-panel mode — determines whether to show the debug panel
+    /// or the normal system-info panel on the right side.
+    pub right_panel_mode: PanelMode,
     /// dirge-b11: how many entries to skip from the *top* of the
     /// MODIFIED list (most-recent-first). Carried in Scene so the
     /// renderer can paint the scrolled view; persisted across
@@ -105,17 +106,13 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
 
     // Right panel — stacked sub-panels. Skip on narrow terminals.
     if scene.show_right_panel && layout.right_panel.width >= 16 {
-        let is_debug = scene.panel_mode == PanelMode::Debug;
+        let is_debug = scene.right_panel_mode == PanelMode::Debug;
         #[cfg(feature = "dap")]
         if is_debug {
             if let Some(dbg_data) = scene.debug_panel_data {
                 use super::panels::debug::DebugRightPanel;
                 f.render_widget(DebugRightPanel::new(dbg_data), layout.right_panel);
             }
-        }
-        #[cfg(not(feature = "dap"))]
-        {
-            let _ = is_debug;
         }
         // Render normal right panel only when NOT in debug mode (or when
         // dap feature is off).
@@ -214,7 +211,7 @@ pub fn empty_scene<'a>(
         panel_data,
         #[cfg(feature = "dap")]
         debug_panel_data: None,
-        panel_mode: PanelMode::Auto,
+        right_panel_mode: PanelMode::Auto,
         modified_offset: 0,
         left_info,
         subagents,
@@ -322,7 +319,7 @@ mod tests {
             panel_data: &pd,
             #[cfg(feature = "dap")]
             debug_panel_data: None,
-            panel_mode: PanelMode::Auto,
+            right_panel_mode: PanelMode::Auto,
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
@@ -506,7 +503,7 @@ mod tests {
             panel_data: &pd,
             #[cfg(feature = "dap")]
             debug_panel_data: None,
-            panel_mode: PanelMode::Auto,
+            right_panel_mode: PanelMode::Auto,
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
@@ -536,7 +533,7 @@ mod tests {
             panel_data: &pd,
             #[cfg(feature = "dap")]
             debug_panel_data: None,
-            panel_mode: PanelMode::Auto,
+            right_panel_mode: PanelMode::Auto,
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,

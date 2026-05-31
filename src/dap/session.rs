@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -20,8 +20,10 @@ use crate::dap::client::DapRpc;
 use crate::dap::types::*;
 
 /// Global DAP session manager — set during `DebugTool` construction,
-/// read by the UI loop for debug panel snapshots.
-pub static DAP_MANAGER: OnceLock<std::sync::Arc<DapSessionManager>> = OnceLock::new();
+/// read by the UI loop for debug panel snapshots. Uses a std Mutex
+/// (not tokio) so it can be written from sync constructors and read
+/// from the UI loop without an async context.
+pub static DAP_MANAGER: StdMutex<Option<std::sync::Arc<DapSessionManager>>> = StdMutex::new(None);
 
 // ---------------------------------------------------------------------------
 // Output cap

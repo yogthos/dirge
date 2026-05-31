@@ -216,16 +216,18 @@ pub(super) async fn cmd_panel(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         }
         ctx.renderer.render_viewport()?;
     }
-    // Both sides share a mode after /panel; report the left as the
-    // representative. For per-side control, see /display.
-    let current = ctx.renderer.left_panel_mode();
+    // Report both sides independently since they're independently
+    // controlled (e.g. /panel debug only affects the right).
+    let left_mode = ctx.renderer.left_panel_mode();
+    let right_mode = ctx.renderer.right_panel_mode();
     let left = ctx.renderer.left_panel_visible();
     let right = ctx.renderer.right_panel_visible();
     ctx.renderer.write_line(
         &format!(
-            "panel mode: {:?} (left {}, right {}). Use /display for per-pane control.",
-            current,
+            "left panel: {:?} ({})  right panel: {:?} ({}). Use /display for per-pane control.",
+            left_mode,
             if left { "shown" } else { "hidden" },
+            right_mode,
             if right { "shown" } else { "hidden" },
         ),
         c_agent(),

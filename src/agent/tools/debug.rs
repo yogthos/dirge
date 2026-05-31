@@ -75,7 +75,7 @@ impl DebugTool {
         ask_tx: Option<AskSender>,
     ) -> Self {
         let session = Arc::new(DapSessionManager::new());
-        let _ = DAP_MANAGER.set(session.clone());
+        *DAP_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
         Self {
             permission,
             ask_tx,
@@ -92,7 +92,7 @@ impl DebugTool {
         lsp_manager: Arc<LspManager>,
     ) -> Self {
         let session = Arc::new(DapSessionManager::new());
-        let _ = DAP_MANAGER.set(session.clone());
+        *DAP_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
         Self {
             permission,
             ask_tx,

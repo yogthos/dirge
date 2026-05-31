@@ -12,7 +12,7 @@ cargo build --features dap
 
 ## The `debug` tool
 
-The agent gets one `debug` tool with 16 actions. Each action maps to standard
+The agent gets one `debug` tool with 20 actions. Each action maps to standard
 DAP requests — the agent selects the right action for the job.
 
 | Action | Required args | What it does |
@@ -33,10 +33,18 @@ DAP requests — the agent selects the right action for the job.
 | `variables` | `variable_ref` | Get variables within a scope |
 | `terminate` | — | Terminate the debuggee |
 | `sessions` | — | Show active debug session info |
+| `run_to_cursor` | `file`, `line` | Set bp at line, continue, show LSP hover at stop ⚡ |
+| `restart_frame` | `frame_id` | Re-execute current frame (edit-and-continue) ⚡ |
+| `backtrace_diagnostics` | `thread_id` | Stack trace with LSP diagnostics per frame ⚡ |
+| `error_analysis` | `thread_id` | Stack trace with error diagnostics + suggested breakpoints ⚡ |
 
 Optional args: `condition` (conditional breakpoints), `context` (eval context: watch/repl/hover),
 `levels` (stack frame count), `timeout` (5–300s, default 30), `stop_on_entry`
 (launch), `restart` (disconnect with restart).
+
+⚡ Actions with ⚡ require both `dap` and `lsp` features. They coordinate the
+debugger with LSP code intelligence for integrated run-to-cursor, diagnostic
+inspection, and error-location workflows.
 
 ## Built-in adapter set
 
@@ -154,7 +162,15 @@ debug variables { variable_ref: 1000 }
 → local variables at crash site
 ```
 
-### Run to cursor (with LSP)
+### Run to cursor (DAP↔LSP bridge)
+
+```
+debug run_to_cursor { file: "src/auth.py", line: 87 }
+→ stopped at src/auth.py:87
+→ Hover info at src/auth.py:87: { "type": "str", ... }
+```
+
+Or step-by-step (equivalent to what `run_to_cursor` does internally):
 
 ```
 debug launch { program: "test.py" }
@@ -213,6 +229,40 @@ debug continue
 → runs with fix applied
 ```
 
+### Backtrace with diagnostics (DAP↔LSP bridge)
+
+```
+debug backtrace_diagnostics { thread_id: 1 }
+→ Backtrace diagnostics for thread 1:
+  [0] src/parser.rs:87 — 3 diagnostics:
+    L42 — Error: expected ';', found '}'
+    L87 — Warning: unused variable 'x'
+    L102 — Error: type mismatch
+  [1] src/main.rs:15 — no diagnostics
+```
+
+### Error analysis with breakpoint suggestions
+
+```
+debug error_analysis { thread_id: 1 }
+→ Error analysis for thread 1:
+  Frame [0]: src/parser.rs:87
+    Error at line 42: expected ';', found '}'
+      → debug set_breakpoints file=src/parser.rs line=42
+    Error at line 102: type mismatch
+      → debug set_breakpoints file=src/parser.rs line=102
+```
+
+## Interactive features
+
+- **TUI debug panel**: when a DAP session is active, toggle
+`/panel debug` to see threads, frames, variables, breakpoints, and program
+output in a right-side panel. `/panel auto` switches back to the system panel.
+
+- **DAP↔LSP bridge**: the `debug` tool includes `run_to_cursor`,
+`restart_frame`, `backtrace_diagnostics`, and `error_analysis` actions
+(when both `dap` and `lsp` features are enabled).
+
 ## Limitations
 
 - **Socket-mode adapters**: `dlv` and `codelldb` ship with `connect_mode: "socket"`
@@ -222,12 +272,6 @@ adapters fail with a clear error. Use `lldb-dap` or `gdb` for Go/C/C++ for now.
 - **No data/instruction breakpoints**: source breakpoints only in v1.
 - **Janet, Bash**: no built-in adapters exist for these languages. The agent
 can still attach via `adapter: "custom-adapter"` if one is available on PATH.
-- **Interactive TUI debug panel**: when a DAP session is active, toggle
-`/panel debug` to see threads, frames, variables, breakpoints, and program
-output in a right-side panel. `/panel auto` switches back to the system panel.
-- **DAP↔LSP bridge**: the `debug` tool includes `run_to_cursor`,
-`restart_frame`, `backtrace_diagnostics`, and `error_analysis` actions
-(when both `dap` and `lsp` features are enabled).
 
 ## Example session transcript
 

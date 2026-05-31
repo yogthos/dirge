@@ -677,7 +677,7 @@ impl Renderer {
             show_left_panel,
             show_right_panel,
             frame_color,
-            panel_mode: *right_panel_mode,
+            right_panel_mode: *right_panel_mode,
             #[cfg(feature = "dap")]
             debug_panel_data: self.debug_panel_data.as_ref(),
         };
@@ -937,6 +937,10 @@ impl Renderer {
 
     pub fn left_panel_mode(&self) -> PanelMode {
         self.left_panel_mode
+    }
+
+    pub fn right_panel_mode(&self) -> PanelMode {
+        self.right_panel_mode
     }
 
     /// dirge-gek: replace the subagent panel data. UI loop calls this
