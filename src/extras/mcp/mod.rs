@@ -30,14 +30,35 @@ pub struct McpClientManager {
 
 impl McpClientManager {
     pub async fn connect_all(configs: &HashMap<String, config::McpServerConfig>) -> Self {
+        // Connect to every server CONCURRENTLY. This loop used to await
+        // each `client::connect` in turn, so startup paid the SUM of every
+        // server's spin-up before the first frame could draw — and each
+        // can be seconds (an `npx -y <pkg>` cold start) with a 10s init
+        // timeout on top. Running them together means startup waits only
+        // for the SLOWEST server instead of all of them in series, which
+        // is the dominant contributor to time-to-first-frame (dirge-lvag).
+        //
+        // `join_all` preserves input order, and the result-handling below
+        // stays a sequential pass, so log/insert order and the
+        // skip-failed-server behaviour are unchanged — only the network
+        // waits overlap.
+        let connect_results = futures::future::join_all(configs.iter().map(|(name, cfg)| {
+            let name = name.clone();
+            async move {
+                let result = client::connect(name.clone(), cfg).await;
+                (name, result)
+            }
+        }))
+        .await;
+
         let mut connections = HashMap::new();
         let mut reconnect_locks = HashMap::new();
-        for (name, cfg) in configs {
-            match client::connect(name.clone(), cfg).await {
+        for (name, result) in connect_results {
+            match result {
                 Ok(conn) => {
                     tracing::info!("Connected to MCP server '{}'", name);
                     connections.insert(name.clone(), conn);
-                    reconnect_locks.insert(name.clone(), Arc::new(Mutex::new(0u64)));
+                    reconnect_locks.insert(name, Arc::new(Mutex::new(0u64)));
                 }
                 Err(e) => {
                     // ALSO emit to stderr so users running without
@@ -164,5 +185,52 @@ impl McpClientManager {
             conn.shutdown().await;
             tracing::debug!("Disconnected from MCP server '{}'", name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn bogus_server() -> config::McpServerConfig {
+        // A command that can't spawn → `connect` returns Err fast (no
+        // 10s timeout), letting us exercise connect_all without a real
+        // MCP server.
+        config::McpServerConfig::Command {
+            command: "dirge-nonexistent-mcp-binary".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            allow_external_paths: false,
+        }
+    }
+
+    /// dirge-lvag: parallelizing connect_all must preserve the
+    /// skip-failed-server contract — a server that fails to connect is
+    /// dropped (no live connection) but its config is retained so it can
+    /// still be `/mcp reconnect`-ed, and the other servers are unaffected.
+    #[tokio::test]
+    async fn connect_all_skips_failed_servers_and_retains_configs() {
+        let mut configs = HashMap::new();
+        configs.insert("bogus-a".to_string(), bogus_server());
+        configs.insert("bogus-b".to_string(), bogus_server());
+
+        let mgr = McpClientManager::connect_all(&configs).await;
+
+        // Both failed → no live connections, but every config is kept
+        // (the manager is the source of truth for later reconnects).
+        assert_eq!(mgr.connections.len(), 0, "failed servers must not register");
+        assert_eq!(mgr.reconnect_locks.len(), 0);
+        assert_eq!(mgr.configs.len(), 2, "configs retained for /mcp reconnect");
+        assert!(mgr.connections_snapshot().is_empty());
+    }
+
+    /// Empty config set → an empty, well-formed manager (no panic, no
+    /// stray entries).
+    #[tokio::test]
+    async fn connect_all_empty_config_is_empty_manager() {
+        let mgr = McpClientManager::connect_all(&HashMap::new()).await;
+        assert!(mgr.connections.is_empty());
+        assert!(mgr.configs.is_empty());
     }
 }
