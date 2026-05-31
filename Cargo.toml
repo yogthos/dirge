@@ -3,7 +3,7 @@
 # taken on crates.io. The installed BINARY is still `dirge` (see [[bin]]),
 # so users run: `cargo install dirge-agent` then the `dirge` command.
 name = "dirge-agent"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 # edition 2024 was stabilized in Rust 1.85; pin the MSRV so older
 # toolchains get a clear error instead of a cryptic edition failure.
