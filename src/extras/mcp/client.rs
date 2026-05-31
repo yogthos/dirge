@@ -201,17 +201,77 @@ pub async fn list_tools(
 /// The task exits when the child closes stderr (process termination
 /// or stream EOF). No explicit cancel — the rmcp ChildWithCleanup
 /// Drop kills the child on shutdown, which closes stderr.
+/// Per-line byte cap. A buggy / runaway MCP child that writes gigabytes
+/// without a newline would otherwise grow dirge's read buffer until OOM.
+/// 16 KiB is generous for any real log line; past it we truncate, emit a
+/// single marker, and drain the rest of that line. (#5 fix.)
+const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
+
+/// Byte-at-a-time splitter for MCP child stderr. Accumulates a line until
+/// `\n`, capping at `max_line_bytes`. dirge-yb0a: once a line overflows the
+/// cap it emits ONE `...[truncated]` marker and then DRAINS (drops) the
+/// remaining bytes until the next newline — previously the truncation
+/// branch cleared the buffer but fell through to re-accumulate the SAME
+/// logical line, emitting a fresh `...[truncated]` chunk every 16 KiB.
+struct StderrLineSplitter {
+    buf: Vec<u8>,
+    draining: bool,
+    max_line_bytes: usize,
+}
+
+impl StderrLineSplitter {
+    fn new(max_line_bytes: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(1024),
+            draining: false,
+            max_line_bytes,
+        }
+    }
+
+    /// Feed one byte; returns a completed line ready to emit, if any.
+    fn push(&mut self, b: u8) -> Option<Vec<u8>> {
+        if b == b'\n' {
+            // End of line: emit the accumulated buffer unless we were
+            // draining an over-length line (whose marker already went out).
+            let line = if self.draining {
+                None
+            } else {
+                Some(std::mem::take(&mut self.buf))
+            };
+            self.buf.clear();
+            self.draining = false;
+            return line;
+        }
+        if self.draining {
+            return None; // dropping the remainder of an over-length line
+        }
+        if self.buf.len() >= self.max_line_bytes {
+            self.buf.extend_from_slice(b" ...[truncated]");
+            self.draining = true;
+            return Some(std::mem::take(&mut self.buf));
+        }
+        if self.buf.is_empty() && b == b'\r' {
+            return None; // strip leading CR (CRLF from a windows-y child)
+        }
+        self.buf.push(b);
+        None
+    }
+
+    /// EOF: return any pending partial line (none if mid-drain).
+    fn finish(self) -> Option<Vec<u8>> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(self.buf)
+        }
+    }
+}
+
 fn spawn_stderr_forwarder(server_name: String, stderr: ChildStderr) {
-    /// Per-line byte cap. A buggy / runaway MCP child that writes
-    /// gigabytes without a newline would otherwise grow dirge's
-    /// `read_line` buffer until OOM. 16 KiB is generous for any
-    /// real log line; past it we truncate and emit a marker.
-    /// (#5 fix.)
-    const MAX_LINE_BYTES: usize = 16 * 1024;
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut reader = tokio::io::BufReader::new(stderr);
-        let mut buf = Vec::with_capacity(1024);
+        let mut splitter = StderrLineSplitter::new(MAX_STDERR_LINE_BYTES);
         let mut byte_buf = [0u8; 4096];
         loop {
             let n = match reader.read(&mut byte_buf).await {
@@ -220,36 +280,14 @@ fn spawn_stderr_forwarder(server_name: String, stderr: ChildStderr) {
                 Err(_) => break,
             };
             for &b in &byte_buf[..n] {
-                if b == b'\n' {
-                    emit_mcp_line(&server_name, &buf);
-                    buf.clear();
-                    continue;
+                if let Some(line) = splitter.push(b) {
+                    emit_mcp_line(&server_name, &line);
                 }
-                if buf.len() >= MAX_LINE_BYTES {
-                    // Past the cap — finalise the line with a
-                    // truncation marker, then keep dropping
-                    // bytes until the next `\n` so the
-                    // overflow doesn't roll into the NEXT line.
-                    buf.extend_from_slice(b" ...[truncated]");
-                    emit_mcp_line(&server_name, &buf);
-                    buf.clear();
-                    // Skip bytes until next newline.
-                    // (Set buf to capacity already so we don't
-                    // grow; just discard until we see \n.)
-                    // We use a marker bool by reusing buf's len > 0:
-                    // simpler: just track a draining state.
-                    // For correctness, fall through to the
-                    // dropping branch below.
-                }
-                if buf.is_empty() && b == b'\r' {
-                    continue; // strip leading CR (CRLF from windows-y child)
-                }
-                buf.push(b);
             }
         }
         // Flush any pending partial line on EOF.
-        if !buf.is_empty() {
-            emit_mcp_line(&server_name, &buf);
+        if let Some(line) = splitter.finish() {
+            emit_mcp_line(&server_name, &line);
         }
     });
 }
@@ -309,4 +347,79 @@ fn parse_headers(
         result.insert(h_name, h_value);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive the splitter over a whole byte stream, collecting the lines it
+    /// would emit (as UTF-8-lossy strings for readable assertions).
+    fn split(data: &[u8], cap: usize) -> Vec<String> {
+        let mut s = StderrLineSplitter::new(cap);
+        let mut out = Vec::new();
+        for &b in data {
+            if let Some(line) = s.push(b) {
+                out.push(String::from_utf8_lossy(&line).into_owned());
+            }
+        }
+        if let Some(line) = s.finish() {
+            out.push(String::from_utf8_lossy(&line).into_owned());
+        }
+        out
+    }
+
+    #[test]
+    fn normal_lines_split_on_newline() {
+        assert_eq!(split(b"alpha\nbeta\n", 16), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn trailing_partial_line_flushed_on_eof() {
+        assert_eq!(split(b"alpha\npartial", 16), vec!["alpha", "partial"]);
+    }
+
+    #[test]
+    fn leading_cr_stripped() {
+        // The splitter strips only LEADING CR; a trailing CR before the
+        // newline is left for `emit_mcp_line`'s sanitizer to remove.
+        assert_eq!(split(b"\rhi\n", 16), vec!["hi"]);
+    }
+
+    /// dirge-yb0a: ONE runaway line past the cap emits exactly ONE
+    /// `...[truncated]` marker, then drains until the next newline — it does
+    /// NOT emit a fresh truncated chunk every `cap` bytes.
+    #[test]
+    fn overlong_line_truncates_once_then_drains() {
+        let mut data = vec![b'x'; 100]; // 100 'x' with cap 8 → would be 12+ chunks if buggy
+        data.push(b'\n');
+        let lines = split(&data, 8);
+        assert_eq!(lines.len(), 1, "exactly one emitted line, got {lines:?}");
+        assert!(lines[0].starts_with("xxxxxxxx"));
+        assert!(lines[0].ends_with("...[truncated]"));
+        assert_eq!(lines[0].matches("[truncated]").count(), 1);
+    }
+
+    /// After draining an over-length line, the FOLLOWING line is emitted
+    /// cleanly — the overflow does not roll into it.
+    #[test]
+    fn line_after_overlong_is_clean() {
+        let mut data = vec![b'x'; 50];
+        data.push(b'\n');
+        data.extend_from_slice(b"ok\n"); // shorter than the cap
+        let lines = split(&data, 8);
+        assert_eq!(lines.len(), 2, "got {lines:?}");
+        assert!(lines[0].ends_with("...[truncated]"));
+        assert_eq!(lines[1], "ok");
+    }
+
+    /// An over-length line that never sees a newline before EOF emits its
+    /// single truncation marker and nothing more (no partial-flush dup).
+    #[test]
+    fn overlong_line_at_eof_emits_once() {
+        let data = vec![b'x'; 100];
+        let lines = split(&data, 8);
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(lines[0].ends_with("...[truncated]"));
+    }
 }

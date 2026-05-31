@@ -404,7 +404,12 @@ async fn main() -> anyhow::Result<()> {
         .resolve_role(config::ConfigRole::Default)
         .and_then(|(_, e)| e.model);
     let model = if cli.model.is_none() && config_model.is_none() {
-        CompactString::new(provider::default_model_for(&provider))
+        // dirge-j3jd: resolve the alias's provider TYPE so a custom alias
+        // doesn't fall back to the OpenRouter default model id.
+        CompactString::new(provider::default_model_for_alias(
+            &provider,
+            &cfg.providers_map(),
+        ))
     } else {
         cli.resolve_model(&cfg)
     };

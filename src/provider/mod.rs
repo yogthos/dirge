@@ -60,6 +60,32 @@ pub fn default_model_for(provider_name: &str) -> &'static str {
     }
 }
 
+/// dirge-j3jd: default model for a provider ALIAS backed by a config/plugin
+/// entry. A custom alias (e.g. `my-openai` with `provider_type = "openai"`)
+/// is not a built-in name, so `default_model_for` on the bare alias would
+/// miss `parse_provider` and fall back to the OpenRouter `vendor/model`
+/// default — an invalid id for OpenAI/Anthropic/etc. Resolve the entry's
+/// effective provider TYPE first.
+pub fn default_model_for_entry(alias: &str, entry: &ProviderEntry) -> &'static str {
+    default_model_for(&Config::provider_type_of(alias, entry))
+}
+
+/// dirge-j3jd: default model for a provider alias, resolving its entry from
+/// `providers` first. Falls back to treating the alias as a built-in name
+/// when no entry is declared.
+pub fn default_model_for_alias(
+    alias: &str,
+    providers: &HashMap<String, ProviderEntry>,
+) -> &'static str {
+    match providers
+        .get(alias)
+        .or_else(|| providers.get(&alias.to_ascii_lowercase()))
+    {
+        Some(entry) => default_model_for_entry(alias, entry),
+        None => default_model_for(alias),
+    }
+}
+
 pub fn parse_provider(name: &str) -> Option<ProviderKind> {
     match name.to_lowercase().as_str() {
         "openrouter" => Some(ProviderKind::OpenRouter),
@@ -102,8 +128,20 @@ pub fn resolve_provider_info(
         // a base_url. Built-in providers (e.g. `"deepseek": {}`)
         // legitimately have no base_url — they fall through to the
         // provider's default endpoint.
+        // dirge-8sku: a CONFIG-declared entry is the user's own trusted
+        // intent — aliasing a built-in name with a custom base_url (e.g.
+        // `ollama`/`openai` pointed at a local proxy) is documented and
+        // legitimate, so the built-in-name collision guard is NOT enforced
+        // here. It exists only to stop an UNTRUSTED plugin from shadowing a
+        // built-in to intercept credentials (enforced in the plugin branch
+        // below). The URL-scheme (https / allow_insecure) check still runs.
         if let Some(url) = entry.base_url.as_deref()
-            && let Err(err) = validate_custom_provider(name, url, entry.allow_insecure)
+            && let Err(err) = validate_custom_provider(
+                name,
+                url,
+                entry.allow_insecure,
+                /* enforce_builtin_collision */ false,
+            )
         {
             tracing::error!(
                 target: "dirge::provider",
@@ -139,8 +177,16 @@ pub fn resolve_provider_info(
     if let Some(entry) = plugin_provider(name).or_else(|| plugin_provider(&lower)) {
         let ptype = Config::provider_type_of(name, &entry);
         let kind = parse_provider(&ptype)?;
+        // dirge-8sku: plugin providers are UNTRUSTED — enforce the
+        // built-in-name collision guard so a plugin can't register e.g.
+        // "openai" to silently intercept the user's OpenAI credentials.
         if let Some(url) = entry.base_url.as_deref()
-            && let Err(err) = validate_custom_provider(name, url, entry.allow_insecure)
+            && let Err(err) = validate_custom_provider(
+                name,
+                url,
+                entry.allow_insecure,
+                /* enforce_builtin_collision */ true,
+            )
         {
             tracing::error!(
                 target: "dirge::provider",
@@ -202,17 +248,23 @@ fn validate_custom_provider(
     name: &str,
     base_url: &str,
     allow_insecure: bool,
+    enforce_builtin_collision: bool,
 ) -> Result<(), String> {
-    let lower = name.to_ascii_lowercase();
-    if BUILTIN_PROVIDER_NAMES
-        .iter()
-        .any(|b| b.eq_ignore_ascii_case(&lower))
-    {
-        return Err(format!(
-            "Custom provider '{}' collides with built-in provider name. \
-             Choose a different name.",
-            name
-        ));
+    // dirge-8sku: only UNTRUSTED (plugin) providers are blocked from
+    // shadowing a built-in name; a user's own config may legitimately
+    // alias one (e.g. `ollama` → openai backend + local base_url).
+    if enforce_builtin_collision {
+        let lower = name.to_ascii_lowercase();
+        if BUILTIN_PROVIDER_NAMES
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(&lower))
+        {
+            return Err(format!(
+                "Custom provider '{}' collides with built-in provider name. \
+                 Choose a different name.",
+                name
+            ));
+        }
     }
     // URL scheme validation: only https:// is safe by default.
     // http:// sends plaintext over the network — every prompt,
@@ -2043,7 +2095,7 @@ fn build_escalation_stream_fn(
     let model_name = entry
         .model
         .clone()
-        .unwrap_or_else(|| default_model_for(alias).to_string());
+        .unwrap_or_else(|| default_model_for_entry(alias, entry).to_string());
     let model = client.completion_model(model_name);
     let tool_defs: Vec<rig::completion::ToolDefinition> = loop_tools
         .iter()
@@ -2066,7 +2118,7 @@ fn build_critic_fn(
     let model_name = entry
         .model
         .clone()
-        .unwrap_or_else(|| default_model_for(alias).to_string());
+        .unwrap_or_else(|| default_model_for_entry(alias, entry).to_string());
     Ok(std::sync::Arc::new(move |prompt: String| {
         let client = client.clone();
         let model_name = model_name.clone();
@@ -2106,7 +2158,7 @@ pub fn build_approval_fn(
     let model_name = entry
         .model
         .clone()
-        .unwrap_or_else(|| default_model_for(alias).to_string());
+        .unwrap_or_else(|| default_model_for_entry(alias, entry).to_string());
     Ok(std::sync::Arc::new(move |req: ApprovalRequest| {
         let client = client.clone();
         let model_name = model_name.clone();
@@ -2143,7 +2195,7 @@ fn build_review_stream_fn(
     let model_name = entry
         .model
         .clone()
-        .unwrap_or_else(|| default_model_for(alias).to_string());
+        .unwrap_or_else(|| default_model_for_entry(alias, entry).to_string());
     let model = client.completion_model(model_name.clone());
     // Review path uses ONLY memory + skill — match what
     // `spawn_review_runner_with_cache` puts in `cfg.tools` so

@@ -548,24 +548,109 @@ fn custom_provider_http_allowed_with_allow_insecure() {
     );
 }
 
-/// Custom provider name colliding with built-in is rejected.
+/// dirge-j3jd: a custom alias backed by an `openai` provider_type must get
+/// OpenAI's default model, not the OpenRouter `vendor/model` fallback.
 #[test]
-fn custom_provider_builtin_name_collision_rejected() {
-    // Plugin tries to shadow "openai" with an explicit different
-    // backend type and base_url.
-    let custom = std::collections::HashMap::from([(
-        "openai".to_string(),
+fn default_model_for_entry_resolves_alias_provider_type() {
+    let entry = ProviderEntry {
+        provider_type: Some("openai".to_string()),
+        base_url: Some("https://proxy.internal/v1".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(default_model_for_entry("my-openai", &entry), "gpt-4o");
+
+    let anthropic = ProviderEntry {
+        provider_type: Some("anthropic".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        default_model_for_entry("work-claude", &anthropic),
+        "claude-sonnet-4-6"
+    );
+}
+
+/// dirge-j3jd: `default_model_for_alias` looks the entry up in the
+/// providers map; a custom alias resolves to its backend default, while an
+/// undeclared (built-in) name still resolves directly.
+#[test]
+fn default_model_for_alias_uses_map_then_builtin_fallback() {
+    let providers = HashMap::from([(
+        "my-openai".to_string(),
         ProviderEntry {
-            provider_type: Some("custom".to_string()),
-            base_url: Some("https://evil.example.com/v1".to_string()),
+            provider_type: Some("openai".to_string()),
             ..Default::default()
         },
     )]);
-    let result = resolve_provider_info("openai", &custom);
-    assert!(
-        result.is_none(),
-        "builtin name collision should be rejected"
+    // Custom alias → resolved via entry → OpenAI default.
+    assert_eq!(default_model_for_alias("my-openai", &providers), "gpt-4o");
+    // Undeclared name that IS a built-in → direct resolution.
+    assert_eq!(
+        default_model_for_alias("anthropic", &providers),
+        "claude-sonnet-4-6"
     );
+    // The bare alias WITHOUT the map would have wrongly fallen back here:
+    assert_eq!(default_model_for("my-openai"), "deepseek/deepseek-v4-flash");
+}
+
+/// dirge-8sku: an UNTRUSTED plugin shadowing a built-in name is still
+/// rejected (collision guard ENFORCED) — guards against credential
+/// interception. Tested directly via the validator since the plugin
+/// registry is a process-global OnceLock.
+#[test]
+fn plugin_provider_builtin_name_collision_rejected() {
+    let res = validate_custom_provider(
+        "openai",
+        "https://evil.example.com/v1",
+        false,
+        /* enforce_builtin_collision */ true,
+    );
+    assert!(
+        res.is_err(),
+        "plugin shadowing a built-in name must be rejected"
+    );
+    assert!(res.unwrap_err().contains("collides with built-in"));
+}
+
+/// dirge-8sku: a CONFIG-declared alias of a built-in name with a custom
+/// base_url is the documented, trusted use (e.g. `ollama` → openai
+/// backend + local proxy) and must be ACCEPTED — previously it was wrongly
+/// rejected as a collision, contradicting docs/config.md.
+#[test]
+fn config_alias_of_builtin_name_with_base_url_is_accepted() {
+    let providers = std::collections::HashMap::from([(
+        "ollama".to_string(),
+        ProviderEntry {
+            provider_type: Some("openai".to_string()),
+            base_url: Some("http://localhost:11434/v1".to_string()),
+            allow_insecure: true,
+            ..Default::default()
+        },
+    )]);
+    let result = resolve_provider_info("ollama", &providers);
+    assert!(
+        result.is_some(),
+        "config-declared alias of a built-in name should be accepted"
+    );
+    let info = result.unwrap();
+    assert_eq!(info.kind, ProviderKind::OpenAI);
+    assert_eq!(info.base_url.as_deref(), Some("http://localhost:11434/v1"));
+}
+
+/// dirge-8sku: the URL-scheme check still applies to config aliases —
+/// the collision guard is skipped, NOT all validation.
+#[test]
+fn config_alias_still_enforces_url_scheme() {
+    let res = validate_custom_provider(
+        "openai",
+        "http://evil.example.com/v1", // insecure, non-local
+        false,                        // allow_insecure = false
+        /* enforce_builtin_collision */ false,
+    );
+    assert!(
+        res.is_err(),
+        "config alias must still reject insecure http:// without allow_insecure"
+    );
+    assert!(res.unwrap_err().contains("insecure base_url"));
 }
 
 // ============================================================
