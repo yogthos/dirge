@@ -546,24 +546,25 @@ fn chamber_row_with_bg_right_border_aligns_with_tabs() {
 /// Chat window switching: next / prev index math wraps correctly.
 #[test]
 fn chat_index_next_prev_wraps() {
-    // Simulate 3 chats (0=main, 1, 2), active=0.
-    let count = 3;
-    // Ctrl+N: next
-    assert_eq!((0 + 1) % count, 1);
-    assert_eq!((1 + 1) % count, 2);
-    assert_eq!((2 + 1) % count, 0); // wrap
-    // Ctrl+P: prev
-    assert_eq!((0 + count - 1) % count, 2); // wrap
-    assert_eq!((2 + count - 1) % count, 1);
-    assert_eq!((1 + count - 1) % count, 0);
+    // Simulate 3 chats (0=main, 1, 2).
+    let count: usize = 3;
+    // Ctrl+N: next = (active + 1) % count
+    for (active, expected) in [(0usize, 1usize), (1, 2), (2, 0)] {
+        assert_eq!((active + 1) % count, expected, "next from {active}");
+    }
+    // Ctrl+P: prev = (active + count - 1) % count
+    for (active, expected) in [(0usize, 2usize), (2, 1), (1, 0)] {
+        assert_eq!((active + count - 1) % count, expected, "prev from {active}");
+    }
 }
 
 /// Chat window switching: single chat is a no-op.
 #[test]
 fn chat_index_next_prev_one_chat_is_noop() {
-    let count = 1;
-    assert_eq!((0 + 1) % count, 0);
-    assert_eq!((0 + count - 1) % count, 0);
+    let count: usize = 1;
+    let active: usize = 0;
+    assert_eq!((active + 1) % count, 0);
+    assert_eq!((active + count - 1) % count, 0);
 }
 
 // ============================================================
