@@ -1036,6 +1036,19 @@ pub async fn run_loop(
                         new_messages.push(LoopMessage::ToolResult(result.clone()));
                     }
                 }
+
+                // dirge-tc4r: guarantee a result for EVERY tool_call_id in
+                // the assistant message. Partial storm suppression and a
+                // cancelled/interrupted batch both append fewer results
+                // than there were calls, orphaning an id — which makes the
+                // NEXT provider request 400. Backfill a synthetic error
+                // result so history stays well-formed and the model sees
+                // the gap instead of the user seeing a raw 400.
+                for tr in super::tools::backfill_missing_tool_results(&tool_calls, &tool_results) {
+                    current_context.messages.push(tool_result_to_value(&tr));
+                    new_messages.push(LoopMessage::ToolResult(tr.clone()));
+                    tool_results.push(tr);
+                }
             }
 
             // Pi line 218: turn_end.

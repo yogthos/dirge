@@ -987,6 +987,42 @@ pub async fn execute_tool_calls_parallel(
 ///     line 381 `hasSequentialToolCall`)
 ///   - otherwise → parallel
 ///
+/// dirge-tc4r: synthesize an error tool-result for every `tool_call_id`
+/// in `calls` that has NO matching result in `results`.
+///
+/// An assistant message keeps ALL of its `tool_calls`, but the storm
+/// breaker can suppress SOME of them (a partial multi-call batch), and a
+/// cancelled / interrupted batch stops early — either way fewer results
+/// get appended than there were calls, leaving an orphaned
+/// `tool_call_id`. The next provider request then 400s ("an assistant
+/// message with 'tool_calls' must be followed by tool messages responding
+/// to each 'tool_call_id'"). Backfilling a synthetic error result keeps
+/// the transcript well-formed (no 400) AND shows the model the gap (an
+/// error it can react to) instead of throwing the raw provider error at
+/// the user. Pure — unit-tested.
+pub(crate) fn backfill_missing_tool_results(
+    calls: &[ToolCall],
+    results: &[ToolResultMessage],
+) -> Vec<ToolResultMessage> {
+    let answered: std::collections::HashSet<&str> =
+        results.iter().map(|r| r.tool_call_id.as_str()).collect();
+    calls
+        .iter()
+        .filter(|c| !answered.contains(c.id.as_str()))
+        .map(|c| ToolResultMessage {
+            tool_call_id: c.id.clone(),
+            tool_name: c.name.clone(),
+            content: vec![ContentBlock::Text {
+                text: "[tool call not executed: it was suppressed as a repeated/looping call, or \
+                       the run was interrupted. Do NOT repeat it — try a different approach.]"
+                    .to_string(),
+            }],
+            details: Value::Null,
+            is_error: true,
+        })
+        .collect()
+}
+
 /// Faithful port of pi `executeToolCalls` (agent-loop.ts:370-388).
 pub async fn execute_tool_calls(
     context: &Context,

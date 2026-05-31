@@ -1536,3 +1536,57 @@ fn content_value_to_block_passes_plain_text_through() {
         other => panic!("expected text block, got {other:?}"),
     }
 }
+
+// dirge-tc4r: tool-result backfill for orphaned tool_call_ids.
+
+fn tc(id: &str, name: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments: serde_json::Value::Null,
+    }
+}
+
+fn trm(id: &str, name: &str) -> ToolResultMessage {
+    ToolResultMessage {
+        tool_call_id: id.to_string(),
+        tool_name: name.to_string(),
+        content: vec![],
+        details: serde_json::Value::Null,
+        is_error: false,
+    }
+}
+
+/// Partial suppression: 3 calls, 2 answered → exactly the 1 missing id is
+/// backfilled with an error result. This is the exact shape that 400s the
+/// provider when left unbackfilled.
+#[test]
+fn backfill_fills_only_the_unanswered_id() {
+    let calls = [tc("a", "edit"), tc("b", "read"), tc("c", "bash")];
+    let results = [trm("a", "edit"), trm("c", "bash")];
+    let back = backfill_missing_tool_results(&calls, &results);
+    assert_eq!(back.len(), 1, "exactly one orphan");
+    assert_eq!(back[0].tool_call_id, "b");
+    assert_eq!(back[0].tool_name, "read");
+    assert!(back[0].is_error, "backfill must be an error result");
+}
+
+/// All answered → no backfill (the common, healthy path).
+#[test]
+fn backfill_empty_when_every_call_is_answered() {
+    let calls = [tc("a", "x"), tc("b", "y")];
+    let results = [trm("a", "x"), trm("b", "y")];
+    assert!(backfill_missing_tool_results(&calls, &results).is_empty());
+}
+
+/// None answered (whole batch suppressed/interrupted) → all ids backfilled.
+#[test]
+fn backfill_fills_all_when_none_answered() {
+    let calls = [tc("a", "x"), tc("b", "y")];
+    let back = backfill_missing_tool_results(&calls, &[]);
+    assert_eq!(back.len(), 2);
+    let ids: std::collections::HashSet<&str> =
+        back.iter().map(|r| r.tool_call_id.as_str()).collect();
+    assert!(ids.contains("a") && ids.contains("b"));
+    assert!(back.iter().all(|r| r.is_error));
+}
