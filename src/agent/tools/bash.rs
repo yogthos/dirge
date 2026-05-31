@@ -596,6 +596,66 @@ fn mark_bash_mutations(permission: Option<&PermCheck>, command: &str) {
     }
 }
 
+/// dirge-7l5i: lexically resolve `.`/`..`/`.` path components without
+/// touching the filesystem (so it works for not-yet-created targets).
+#[cfg(feature = "semantic-bash")]
+fn normalize_lexical(p: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for comp in p.components() {
+        use std::path::Component;
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// dirge-7l5i: fold the targets of leading `cd`/`pushd` segments onto
+/// `base` to get the effective cwd a later relative target is written
+/// against. Best-effort, quote-trimming; conservatively applies ALL `cd`s
+/// in the compound (so the effective dir is the last one).
+#[cfg(feature = "semantic-bash")]
+fn fold_cd_dirs(base: &str, segments: &[String]) -> String {
+    let mut dir = std::path::PathBuf::from(base);
+    for seg in segments {
+        let mut it = seg.split_whitespace();
+        let head = it.next().unwrap_or("");
+        if head == "cd" || head == "pushd" {
+            if let Some(target) = it.find(|a| !a.starts_with('-')) {
+                let t = target.trim_matches(['"', '\'']);
+                if t.is_empty() {
+                    continue;
+                }
+                let tp = std::path::Path::new(t);
+                if tp.is_absolute() {
+                    dir = tp.to_path_buf();
+                } else {
+                    dir = normalize_lexical(&dir.join(tp));
+                }
+            }
+        }
+    }
+    dir.to_string_lossy().into_owned()
+}
+
+/// dirge-7l5i: resolve a redirect/mutation target to an absolute path
+/// against the (cd-adjusted) effective dir; absolute targets pass through.
+#[cfg(feature = "semantic-bash")]
+fn resolve_target(effective_dir: &str, target: &str) -> String {
+    let p = std::path::Path::new(target);
+    if p.is_absolute() {
+        target.to_string()
+    } else {
+        normalize_lexical(&std::path::Path::new(effective_dir).join(p))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 async fn check_bash_segments(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
@@ -642,12 +702,6 @@ async fn check_bash_segments(
             let g = perm.lock().unwrap_or_else(|e| e.into_inner());
             g.working_dir().to_string()
         };
-        let path_claim = |p: &str| {
-            Claim::new(
-                Operation::Edit,
-                crate::permission::engine::classify_path(p, &working_dir),
-            )
-        };
         // /dev/null detection lives solely in `classify_path` (the Path
         // resource's `dev_null` field, consulted by BuiltinAllow) — so
         // we just split into plain segments here. The old
@@ -655,6 +709,23 @@ async fn check_bash_segments(
         // per-segment flag that was discarded (dirge-v0b6).
         let (segments, complex) = bash::parse_bash_segments_full(command)
             .unwrap_or_else(|_| (vec![command.to_string()], false));
+        // dirge-7l5i: a leading `cd`/`pushd` changes the cwd BEFORE a later
+        // RELATIVE redirect/mutation target is written. Resolve relative
+        // targets against that cd'd directory, then classify the resulting
+        // ABSOLUTE path against the project root. Without this,
+        // `cd /etc && echo x > passwd` classified `passwd` as
+        // `<project>/passwd` (in-tree → auto-allowed) while bash actually
+        // wrote `/etc/passwd` — an out-of-tree write with no prompt.
+        // Conservative: all cd targets fold to one effective dir, so a
+        // write-then-cd ordering may over-prompt (safe direction).
+        let effective_dir = fold_cd_dirs(&working_dir, &segments);
+        let path_claim = |target: &str| {
+            let resolved = resolve_target(&effective_dir, target);
+            Claim::new(
+                Operation::Edit,
+                crate::permission::engine::classify_path(&resolved, &working_dir),
+            )
+        };
         if complex {
             // Subshell / command substitution / etc.: tree-sitter
             // declined to split — check the whole command as one
@@ -1674,6 +1745,34 @@ mod tests {
             assert!(
                 gated("echo \"a && rm -rf /\"").await,
                 "quoted operator is literal — echo is allowed as one segment"
+            );
+        }
+
+        /// dirge-7l5i: a `cd` to an EXTERNAL dir followed by a RELATIVE
+        /// redirect target must be classified out-of-project and prompt —
+        /// not silently auto-allowed by resolving the target against the
+        /// static project root. (`echo` is allowed, so the ONLY gate here
+        /// is the redirect target's classification.)
+        #[tokio::test]
+        async fn cd_outside_project_gates_relative_redirect() {
+            assert!(
+                !gated("cd /etc && echo pwned > passwd").await,
+                "cd /etc + relative `> passwd` writes /etc/passwd — must prompt"
+            );
+            // In-project cd + relative write stays auto-allowed.
+            assert!(
+                gated("cd subdir && echo ok > out.txt").await,
+                "in-project cd + relative write is in-tree, stays allowed"
+            );
+            // No cd: a plain relative in-project write is allowed as before.
+            assert!(
+                gated("echo ok > local.txt").await,
+                "plain in-project relative write stays allowed"
+            );
+            // Absolute external redirect was already gated; still is.
+            assert!(
+                !gated("echo pwned > /etc/passwd").await,
+                "absolute external redirect must prompt"
             );
         }
 
