@@ -37,6 +37,8 @@ pub(super) mod notices;
 pub(super) mod streaming;
 pub(super) mod tool_call;
 pub(super) mod tool_result;
+#[cfg(feature = "plugin")]
+pub(super) mod turn;
 
 // dirge-5h5: isolated repro harness for the parallel-read chamber
 // race. Drives the chamber state machine directly without the

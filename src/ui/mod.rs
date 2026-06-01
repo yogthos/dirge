@@ -2019,82 +2019,24 @@ pub async fn run_interactive(
                     }
                     AgentEvent::TurnStart { index } => {
                         #[cfg(feature = "plugin")]
-                        {
-                            // New turn — reset per-turn streaming state.
-                            // Without the reset, current_turn_text would
-                            // accumulate across all turns and the index
-                            // tracked here would drift from the runner's.
-                            token_batcher.reset();
-                            current_turn_text.clear();
-                            current_turn_index = index;
-                            if let Some(pm) = plugin_manager {
-                                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
-                                let _ = mgr.dispatch(
-                                    "on-turn-start",
-                                    &format!("@{{:index {}}}", index),
-                                );
-                                // Clear tool-hook slots after the turn
-                                // hook runs so a `(harness/block ...)`
-                                // call inside on-turn-start can't bleed
-                                // into the *first* tool of the next
-                                // turn. `dispatch_tool_hook` clears
-                                // slots before tool hooks, but turn
-                                // hooks bypass that path.
-                                let _ = mgr.eval(
-                                    "(do (set harness-block nil) \
-                                         (set harness-mutate-input nil) \
-                                         (set harness-replace-result nil))",
-                                );
-                            }
-                        }
+                        run_handlers::turn::handle_turn_start(
+                            plugin_manager,
+                            &mut token_batcher,
+                            &mut current_turn_text,
+                            &mut current_turn_index,
+                            index,
+                        );
                         #[cfg(not(feature = "plugin"))]
                         let _ = index;
                     }
                     AgentEvent::TurnEnd { index } => {
                         #[cfg(feature = "plugin")]
-                        {
-                            if let Some(pm) = plugin_manager {
-                                // Flush any tokens that didn't reach the
-                                // batcher threshold so the final partial
-                                // update gets delivered.
-                                if let Some(tail) = token_batcher.flush_remaining() {
-                                    // tail is the *new* tokens since the
-                                    // last update; current_turn_text now
-                                    // covers them since we pushed at the
-                                    // same time as the batcher.
-                                    let _ = tail;
-                                    let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
-                                    let _ = mgr.dispatch(
-                                        "on-message-update",
-                                        &format!(
-                                            "@{{:index {} :partial \"{}\"}}",
-                                            index,
-                                            crate::plugin::escape_janet_string(
-                                                &current_turn_text
-                                            ),
-                                        ),
-                                    );
-                                }
-                                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
-                                let _ = mgr.dispatch(
-                                    "on-turn-end",
-                                    &format!(
-                                        "@{{:index {} :message \"{}\"}}",
-                                        index,
-                                        crate::plugin::escape_janet_string(&current_turn_text),
-                                    ),
-                                );
-                                // Same defense as on-turn-start: clear
-                                // tool-hook slots so turn-end can't
-                                // leak block/mutate/replace into the
-                                // next tool call.
-                                let _ = mgr.eval(
-                                    "(do (set harness-block nil) \
-                                         (set harness-mutate-input nil) \
-                                         (set harness-replace-result nil))",
-                                );
-                            }
-                        }
+                        run_handlers::turn::handle_turn_end(
+                            plugin_manager,
+                            &mut token_batcher,
+                            &current_turn_text,
+                            index,
+                        );
                         #[cfg(not(feature = "plugin"))]
                         let _ = index;
                     }
