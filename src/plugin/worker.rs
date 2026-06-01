@@ -687,6 +687,10 @@ const HARNESS_LSP_INIT: &str = r#"
 /// can never quit/crash the tool. Runs after the harness preludes and
 /// before any plugin file is loaded, so plugins compile against the
 /// shadowed bindings. dirge itself never calls `os/exit` from Janet.
+// Janet source — consumed only by the `cfg(feature = "plugin")` worker loop
+// below; gated to match so a no-plugin build (e.g. Windows `windows-default`)
+// doesn't trip `-D warnings` on the unused const.
+#[cfg(feature = "plugin")]
 const HARNESS_SANDBOX: &str = r#"
 (defn- dirge-disabled-fn [sym-name]
   (fn [&] (error (string sym-name

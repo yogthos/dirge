@@ -360,6 +360,10 @@ impl Config {
 
     /// Whether the plugin named `name` should be loaded. Default true —
     /// only an explicit `"enabled": false` skips it.
+    // Consumed only by the plugin loader (main.rs, `cfg(feature = "plugin")`)
+    // and the config tests; dead in a no-plugin build (e.g. the Windows
+    // `windows-default` set), where `-D warnings` would otherwise fail.
+    #[allow(dead_code)]
     pub fn plugin_enabled(&self, name: &str) -> bool {
         self.plugins
             .as_ref()
@@ -369,6 +373,7 @@ impl Config {
     }
 
     /// Whether the plugin named `name` requested auto-start. Default false.
+    #[allow(dead_code)] // plugin-only consumer; see `plugin_enabled`.
     pub fn plugin_auto_start(&self, name: &str) -> bool {
         self.plugins
             .as_ref()

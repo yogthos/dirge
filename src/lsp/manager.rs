@@ -533,6 +533,10 @@ impl LspManager {
     /// canonical-path lookup). Avoids cloning the whole project diagnostic
     /// map the way [`all_diagnostics`](Self::all_diagnostics) does — O(one
     /// file) instead of O(all files).
+    // Consumed by the LSP plugin harness (`lsp::harness::run_query`, reached
+    // only under `cfg(feature = "plugin")`); dead in a no-plugin build like
+    // the Windows `windows-default` set, where `-D warnings` would fail.
+    #[allow(dead_code)]
     pub fn diagnostics_for(&self, file: &Path) -> Option<Vec<Diagnostic>> {
         let entries: Vec<_> = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
