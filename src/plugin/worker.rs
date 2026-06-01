@@ -205,24 +205,37 @@ const HARNESS_INIT: &str = r#"
 # Stored as tab-separated `customType\tcontent\tdisplay\n`
 # (harness/-escape'd so embedded tabs/newlines round-trip).
 # Drained per turn boundary alongside steering messages.
+# dirge-df1v: same per-turn cap as harness/notify above — a plugin
+# can't grow this buffer without bound before the host's per-turn drain.
+(def harness-custom-msg-cap 131072)
+(var harness-custom-flooded false)
 (var harness-custom-messages "")
 (defn harness/add-custom-message [a &opt b c]
-  (cond
-    # Single-string form — bare content, no type.
-    (and (string? a) (nil? b))
+  (when (= harness-custom-messages "") (set harness-custom-flooded false))
+  (if (>= (length harness-custom-messages) harness-custom-msg-cap)
+    (unless harness-custom-flooded
+      (set harness-custom-flooded true)
       (set harness-custom-messages
            (string harness-custom-messages
                    (harness/-escape "") "\t"
-                   (harness/-escape a) "\t"
-                   "1\n"))
-    # Typed form.
-    (and (string? a) (string? b))
-      (let [d (if (nil? c) "1" (if c "1" "0"))]
+                   (harness/-escape "[plugin] too many custom messages this turn — further ones dropped") "\t"
+                   "1\n")))
+    (cond
+      # Single-string form — bare content, no type.
+      (and (string? a) (nil? b))
         (set harness-custom-messages
              (string harness-custom-messages
+                     (harness/-escape "") "\t"
                      (harness/-escape a) "\t"
-                     (harness/-escape b) "\t"
-                     d "\n")))))
+                     "1\n"))
+      # Typed form.
+      (and (string? a) (string? b))
+        (let [d (if (nil? c) "1" (if c "1" "0"))]
+          (set harness-custom-messages
+               (string harness-custom-messages
+                       (harness/-escape a) "\t"
+                       (harness/-escape b) "\t"
+                       d "\n"))))))
 
 # Slash-command registry (9b — wire format aligned with the other
 # tab-separated harness blobs). Plugins register at load time; the
@@ -295,16 +308,31 @@ const HARNESS_INIT: &str = r#"
 # to push a line into the host's chat display. Stored as a
 # `level\tmsg\n` blob; the host's drain_notifications
 # splits and clears in one round-trip.
+# dirge-df1v: cap per-turn accumulation. A plugin that calls
+# harness/notify in a hot hook (on-message-update fires every ~16
+# tokens) would otherwise grow this buffer without bound before the
+# host drains it at the turn boundary. Once over the cap we append ONE
+# "dropped" marker and stop; the host clears the list to "" on drain,
+# and the reset-on-empty check below re-arms the marker for next turn.
+(def harness-notif-cap 65536)
+(var harness-notif-flooded false)
 (var harness-notif-list "")
 (defn harness/notify [msg &opt level]
   (when (string? msg)
-    (let [lvl (cond
-                (or (= level :info) (= level "info")) "info"
-                (or (= level :warn) (= level "warn")) "warn"
-                (or (= level :error) (= level "error")) "error"
-                "info")]
-      (set harness-notif-list
-           (string harness-notif-list lvl "\t" msg "\n")))))
+    (when (= harness-notif-list "") (set harness-notif-flooded false))
+    (if (>= (length harness-notif-list) harness-notif-cap)
+      (unless harness-notif-flooded
+        (set harness-notif-flooded true)
+        (set harness-notif-list
+             (string harness-notif-list
+                     "warn\t[plugin] too many notifications this turn — further ones dropped\n")))
+      (let [lvl (cond
+                  (or (= level :info) (= level "info")) "info"
+                  (or (= level :warn) (= level "warn")) "warn"
+                  (or (= level :error) (= level "error")) "error"
+                  "info")]
+        (set harness-notif-list
+             (string harness-notif-list lvl "\t" msg "\n"))))))
 
 # Hook-error dedup slots. `harness-last-hook-err-msg` is the most
 # recently pushed sanitized hook-error message; `harness-last-hook-err-count`
@@ -1490,6 +1518,79 @@ mod tests {
         // The other host-control escape hatches are neutered too.
         assert!(worker.eval("(os/proc-kill nil)").is_err());
         assert!(worker.eval("(os/sigaction :term (fn [&] nil))").is_err());
+    }
+
+    /// dirge-df1v: a plugin flooding `harness/notify` in a hot loop must not
+    /// grow the notification buffer without bound. It's capped, gets a single
+    /// "dropped" marker, and resets once the host drains it.
+    #[test]
+    fn notification_buffer_is_capped_and_resets_on_drain() {
+        let (mut worker, _d, _l) = Worker::try_spawn().unwrap();
+
+        // Flood far past the cap.
+        worker
+            .eval("(loop [i :range [0 50000]] (harness/notify (string \"notification number \" i) :info))")
+            .unwrap();
+
+        let len: usize = worker
+            .eval("(length harness-notif-list)")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            len <= harness_notif_cap_for_test() + 256,
+            "notif buffer should be capped, got {len}"
+        );
+        // The single flood marker is present.
+        assert_ne!(
+            worker
+                .eval("(if (string/find \"further ones dropped\" harness-notif-list) 1 0)")
+                .unwrap(),
+            "0",
+            "expected the flood marker",
+        );
+
+        // Simulate the host's per-turn drain (it clears the list to "").
+        worker.eval("(set harness-notif-list \"\")").unwrap();
+        // A normal notification after drain works again (marker re-armed).
+        worker
+            .eval("(harness/notify \"after drain\" :info)")
+            .unwrap();
+        let after = worker.eval("harness-notif-list").unwrap();
+        assert!(after.contains("after drain"), "got {after}");
+        assert!(
+            !after.contains("dropped"),
+            "flood marker should have reset; got {after}"
+        );
+    }
+
+    /// Mirror cap for custom messages.
+    #[test]
+    fn custom_message_buffer_is_capped() {
+        let (mut worker, _d, _l) = Worker::try_spawn().unwrap();
+        worker
+            .eval("(loop [i :range [0 50000]] (harness/add-custom-message (string \"custom message number \" i)))")
+            .unwrap();
+        let len: usize = worker
+            .eval("(length harness-custom-messages)")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            len <= 131072 + 256,
+            "custom-message buffer should be capped, got {len}"
+        );
+        assert_ne!(
+            worker
+                .eval("(if (string/find \"further ones dropped\" harness-custom-messages) 1 0)")
+                .unwrap(),
+            "0",
+            "expected the custom-message flood marker",
+        );
+    }
+
+    fn harness_notif_cap_for_test() -> usize {
+        65536
     }
 
     /// The catchable error means the existing per-hook `(try ...)` wrapping
