@@ -1340,7 +1340,12 @@ pub async fn run_loop(
             critic_done = true;
             if let Some(critic) = &config.critic_fn {
                 let transcript = build_critic_transcript(&new_messages);
-                follow_up = super::critic::run_critic(critic, &transcript).await;
+                // dirge-bedj: pass the agent's own system prompt as the
+                // constraint set so the critic judges within the same rules
+                // the agent had (and never demands a forbidden action).
+                follow_up =
+                    super::critic::run_critic(critic, &current_context.system_prompt, &transcript)
+                        .await;
             }
         }
         if !follow_up.is_empty() {

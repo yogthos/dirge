@@ -9,7 +9,9 @@ use crossterm::style::Color;
 use crate::agent::agent_loop::message::EscalationReason;
 use crate::agent::agent_loop::tool_input_repair::RepairStatsSnapshot;
 use crate::ui::renderer::Renderer;
-use crate::ui::text_output::{strip_leading_system_reminder, write_system_lines, write_user_lines};
+use crate::ui::text_output::{
+    strip_leading_system_reminder, write_critic_lines, write_system_lines, write_user_lines,
+};
 use crate::ui::theme;
 
 /// `AgentEvent::UserMessage` — the literal prompt sent to the LLM. Strips
@@ -19,6 +21,13 @@ use crate::ui::theme;
 /// to the session at submit time.
 pub(crate) fn handle_user_message(renderer: &mut Renderer, content: &str) -> std::io::Result<()> {
     let visible = strip_leading_system_reminder(content);
+    // dirge-vg9e: the in-loop critic re-enters as a user-role message so the
+    // model acts on it; surface it under a distinct `<critic>` handle/color
+    // rather than the user's `<you>`. The tag is stripped from the display.
+    if let Some(body) = visible.strip_prefix(crate::agent::agent_loop::critic::CRITIC_TAG) {
+        write_critic_lines(renderer, body.trim_start())?;
+        return renderer.write_line("", Color::White);
+    }
     write_user_lines(renderer, visible)?;
     renderer.write_line("", Color::White)
 }

@@ -187,10 +187,33 @@ pub fn render_session(
         // to 8 columns so multi-role chats stay visually aligned.
         // Continuation lines are indented to that same width so the
         // handle isn't repeated on every wrap.
-        let (handle, line_color) = match msg.role {
-            MessageRole::User => ("<you> ", theme::user()),
-            MessageRole::Assistant => ("<dirge> ", theme::agent()),
-            MessageRole::System => ("<sys> ", theme::system()),
+        // dirge-vg9e: a persisted critic follow-up is a User-role message
+        // tagged with `[critic]`; render it under its own handle/color in
+        // scrollback too, matching the live view.
+        let is_critic = msg.role == MessageRole::User
+            && msg
+                .content
+                .trim_start()
+                .starts_with(crate::agent::agent_loop::critic::CRITIC_TAG);
+        let (handle, line_color) = if is_critic {
+            ("<critic> ", theme::critic())
+        } else {
+            match msg.role {
+                MessageRole::User => ("<you> ", theme::user()),
+                MessageRole::Assistant => ("<dirge> ", theme::agent()),
+                MessageRole::System => ("<sys> ", theme::system()),
+            }
+        };
+        // Strip the `[critic]` tag from the displayed body (the handle
+        // already conveys the role).
+        let body: &str = if is_critic {
+            msg.content
+                .trim_start()
+                .strip_prefix(crate::agent::agent_loop::critic::CRITIC_TAG)
+                .map(str::trim_start)
+                .unwrap_or(&msg.content)
+        } else {
+            &msg.content
         };
         let cont_indent = " ".repeat(handle.chars().count());
 
@@ -214,7 +237,7 @@ pub fn render_session(
                 renderer.write_line(&entry.text, entry.color)?;
             }
         } else {
-            for (i, line) in msg.content.lines().enumerate() {
+            for (i, line) in body.lines().enumerate() {
                 let prefix = if i == 0 {
                     handle.to_string()
                 } else {

@@ -117,6 +117,13 @@ pub(crate) fn write_user_lines(renderer: &mut Renderer, text: &str) -> std::io::
     write_prefixed_lines(renderer, "<you> ", theme::user(), text)
 }
 
+/// Print the in-loop critic's review under a distinct `<critic> ` prefix in
+/// the critic color, so it reads as a separate reviewing voice rather than
+/// the user's own message (dirge-vg9e). See `write_prefixed_lines`.
+pub(crate) fn write_critic_lines(renderer: &mut Renderer, text: &str) -> std::io::Result<()> {
+    write_prefixed_lines(renderer, "<critic> ", theme::critic(), text)
+}
+
 /// Print a dirge-originated log/notice (e.g. the max-agent-turns cap) to
 /// the chat log with a `<system> ` prefix in the *warning* color so it
 /// reads as a transient runtime notice that stands out from the user's

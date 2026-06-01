@@ -56,6 +56,9 @@ pub struct Theme {
     pub perm: Color,
     /// Secondary result text (slash command output, tool stdout dim).
     pub result: Color,
+    /// In-loop critic's review voice. Distinct from `user` so critic
+    /// follow-ups aren't mistaken for the user's own messages.
+    pub critic: Color,
     /// Hard errors. Always red-family; theme can choose the exact red
     /// but must keep it semantically distinct from everything else.
     pub error: Color,
@@ -98,6 +101,10 @@ impl Theme {
             tool: Color::Green,
             perm: Color::Yellow,
             result: Color::DarkGreen,
+            // Magenta reads distinct from the green/cyan axis — the critic
+            // is a separate reviewing voice. (Freed up now that thinking no
+            // longer monopolizes the magenta register.)
+            critic: Color::Magenta,
             error: Color::Red,
             warn: Color::Yellow,
             accent: Color::Green,
@@ -120,6 +127,8 @@ impl Theme {
             tool: Color::Yellow,
             perm: Color::Magenta,
             result: Color::DarkGrey,
+            // Blue — distinct from plain's Magenta(perm)/Green(user)/Cyan(accent).
+            critic: Color::Blue,
             error: Color::Red,
             warn: Color::Yellow,
             accent: Color::Cyan,
@@ -146,6 +155,7 @@ struct ThemeJson {
     tool: Option<ColorValue>,
     perm: Option<ColorValue>,
     result: Option<ColorValue>,
+    critic: Option<ColorValue>,
     error: Option<ColorValue>,
     warn: Option<ColorValue>,
     accent: Option<ColorValue>,
@@ -251,6 +261,7 @@ impl ThemeJson {
             tool: pick(self.tool, base.tool),
             perm: pick(self.perm, base.perm),
             result: pick(self.result, base.result),
+            critic: pick(self.critic, base.critic),
             error: pick(self.error, base.error),
             warn: pick(self.warn, base.warn),
             accent: pick(self.accent, base.accent),
@@ -346,6 +357,9 @@ pub fn perm() -> Color {
 }
 pub fn result() -> Color {
     current().result
+}
+pub fn critic() -> Color {
+    current().critic
 }
 pub fn error() -> Color {
     current().error
