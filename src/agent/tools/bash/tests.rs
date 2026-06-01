@@ -1,8 +1,11 @@
 //! Unit + integration tests for the bash tool. Split out of
 //! `agent/tools/bash.rs` (dirge-4y4l stage 9a). `use super::*` pulls in
-//! `BashTool`, the parsing/permission helpers, and the re-exported
-//! `run_with_timeout` from `bash::exec`.
+//! `BashTool` + `run_with_timeout` (re-imported from `bash::exec`), and
+//! `use super::check::*` pulls in the parsing/permission helpers
+//! (`check_bash_segments`, `quote_aware_split`, `coarse_*`,
+//! `bash_mutation_targets`) extracted to `bash::check` in stage 9b.
 
+use super::check::*;
 use super::*;
 use tokio::process::Command;
 use tokio::time::Duration;
