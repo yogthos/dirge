@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rig::completion::ToolDefinition;
 use rig::tool::{ToolDyn, ToolError};
@@ -15,6 +15,7 @@ use crate::extras::mcp::client::{SharedConnection, raw_connect};
 use crate::extras::mcp::config::McpServerConfig;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
+use crate::timeout::Deadline;
 
 #[derive(Debug)]
 pub struct McpToolError(pub String);
@@ -242,9 +243,10 @@ impl ToolDyn for McpTool {
             // The cap is a TOTAL budget for the whole try-reconnect-
             // retry cycle (M-R3 review fix), not per-attempt. Worst
             // case the user waits 120s for everything; previously the
-            // budget was 240s = 2 × 120s.
-            const MCP_CALL_BUDGET: Duration = Duration::from_secs(120);
-            let started = Instant::now();
+            // budget was 240s = 2 × 120s. dirge-onlr: the budget value
+            // and the elapsed-aware accounting are now the shared
+            // `Deadline` / `Timeouts` types.
+            let deadline = Deadline::start(crate::timeout::Timeouts::DEFAULT.mcp_call);
 
             let result = match try_call_with_reconnect(
                 &server_name,
@@ -252,8 +254,7 @@ impl ToolDyn for McpTool {
                 config.as_deref(),
                 &reconnect_lock,
                 params,
-                started,
-                MCP_CALL_BUDGET,
+                deadline,
             )
             .await
             {
@@ -338,7 +339,7 @@ impl ToolDyn for McpTool {
 /// non-transport ServiceErrors surface verbatim — reconnecting
 /// wouldn't help.
 ///
-/// `started` + `total_budget` define the deadline for the WHOLE
+/// `deadline` is the elapsed-aware budget for the WHOLE
 /// try-reconnect-retry cycle (M-R3 fix). Each `call_once` invocation
 /// receives whatever budget remains, so the worst-case latency
 /// matches the prior single-attempt timeout.
@@ -354,14 +355,13 @@ async fn try_call_with_reconnect(
     config: Option<&McpServerConfig>,
     reconnect_lock: &Arc<Mutex<u64>>,
     params: CallToolRequestParams,
-    started: Instant,
-    total_budget: Duration,
+    deadline: Deadline,
 ) -> Result<rmcp::model::CallToolResult, String> {
     // Snapshot the generation BEFORE the first call so we can detect
     // after-the-fact reconnects below.
     let gen_before = *reconnect_lock.lock().await;
 
-    let remaining = remaining_budget(started, total_budget);
+    let remaining = deadline.remaining();
     let first = call_once(server_name, connection, params.clone(), remaining).await;
     let err = match first {
         Ok(r) => return Ok(r),
@@ -396,7 +396,7 @@ async fn try_call_with_reconnect(
             // Bound the reconnect at the remaining budget so a wedged
             // server doesn't burn the whole thing without leaving any
             // for the retry call.
-            let reconnect_budget = remaining_budget(started, total_budget);
+            let reconnect_budget = deadline.remaining();
             let reconnect_result =
                 tokio::time::timeout(reconnect_budget, raw_connect(server_name, cfg)).await;
             match reconnect_result {
@@ -420,7 +420,7 @@ async fn try_call_with_reconnect(
                         "{}\n(auto-reconnect to '{}' timed out within the {}s budget)",
                         err.message,
                         server_name,
-                        total_budget.as_secs(),
+                        deadline.budget().as_secs(),
                     ));
                 }
             }
@@ -430,15 +430,15 @@ async fn try_call_with_reconnect(
     }
 
     // Second attempt with the fresh peer.
-    let remaining = remaining_budget(started, total_budget);
-    if remaining.is_zero() {
+    if deadline.is_expired() {
         return Err(format!(
             "MCP tool {}::{} budget ({}s) exhausted before retry",
             server_name,
             params.name,
-            total_budget.as_secs(),
+            deadline.budget().as_secs(),
         ));
     }
+    let remaining = deadline.remaining();
     match call_once(server_name, connection, params, remaining).await {
         Ok(r) => Ok(r),
         Err(e) => Err(format!(
@@ -446,13 +446,6 @@ async fn try_call_with_reconnect(
             e.message,
         )),
     }
-}
-
-/// Time left in the budget. Returns `Duration::ZERO` (NOT a negative)
-/// when the deadline has passed; `tokio::time::timeout(ZERO, _)` then
-/// fires immediately and surfaces the budget-exhausted state.
-fn remaining_budget(started: Instant, total: Duration) -> Duration {
-    total.saturating_sub(started.elapsed())
 }
 
 /// Tagged error for `try_call_with_reconnect` — distinguishes
@@ -619,6 +612,7 @@ fn extract_arg_paths(args: &JsonObject) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// Classification matrix for `is_transport_failure`. M-R5 review
     /// tightening: ONLY the two unambiguous transport-failure
@@ -648,19 +642,20 @@ mod tests {
         }));
     }
 
-    /// `remaining_budget` decays as time passes and saturates at
-    /// zero past the deadline (no negative durations / underflow).
+    /// The shared `Deadline` (which replaced the inline
+    /// `remaining_budget`) decays as time passes and saturates at zero
+    /// past the deadline (no negative durations / underflow) against the
+    /// real clock. Clock-controlled coverage lives in `crate::timeout`.
     #[test]
-    fn remaining_budget_decays_and_saturates() {
+    fn mcp_deadline_decays_and_saturates() {
         let now = Instant::now();
         let total = Duration::from_millis(100);
+        let deadline = Deadline::from_start(now, total);
         // Fresh start — full budget available.
-        let r1 = remaining_budget(now, total);
-        assert!(r1 > Duration::from_millis(90));
+        assert!(deadline.remaining() > Duration::from_millis(90));
         // Past the deadline — saturates to ZERO, not negative.
         std::thread::sleep(Duration::from_millis(110));
-        let r2 = remaining_budget(now, total);
-        assert_eq!(r2, Duration::ZERO);
+        assert_eq!(deadline.remaining(), Duration::ZERO);
     }
 
     // ── dirge-mgub: per-server external-path guard ────────────────

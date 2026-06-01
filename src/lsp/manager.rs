@@ -47,7 +47,8 @@ use crate::lsp::uri::path_to_file_uri_string;
 /// Time we'll let any non-initialize LSP request take. Generous — LSP servers
 /// can be slow on first-touch indexing — but bounded so a stuck server
 /// doesn't hold up the agent's turn forever.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// dirge-onlr: single source — see crate::timeout::Timeouts.
+const REQUEST_TIMEOUT: Duration = crate::timeout::Timeouts::DEFAULT.lsp_request;
 
 /// How a [`LspManager::touch_file`] call should handle diagnostics:
 /// - `None`: just send didOpen / didChange and return.

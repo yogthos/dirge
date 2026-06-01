@@ -94,7 +94,8 @@ impl SharedConnection {
 /// startup indefinitely. 10s is generous for legitimate inits — npm
 /// install-on-first-run servers take a few seconds; locally-running
 /// binaries respond in <100ms. Past the cap we abort and log.
-const MCP_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// dirge-onlr: single source — see crate::timeout::Timeouts.
+const MCP_INIT_TIMEOUT: std::time::Duration = crate::timeout::Timeouts::DEFAULT.mcp_init;
 
 /// Connect to one MCP server and wrap the connection in a
 /// shared, swappable container. Returns the `Arc<SharedConnection>`

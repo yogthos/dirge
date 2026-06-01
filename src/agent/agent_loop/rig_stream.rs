@@ -124,8 +124,9 @@ where
         // that interleave reasoning between tool-call deltas.
         let mut open_tool_calls: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // dirge-onlr: single source — see crate::timeout::Timeouts.
         const TOOL_CALL_GAP_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(30);
+            crate::timeout::Timeouts::DEFAULT.tool_call_gap;
         // Wall-clock instant when the last forward-progress chunk
         // arrived. Used to compute the remaining gap budget while
         // a tool call is mid-assembly. Initialized to "now" so

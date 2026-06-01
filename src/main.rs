@@ -17,6 +17,7 @@ mod session;
 mod shell;
 mod skill;
 mod text;
+mod timeout;
 mod ui;
 
 #[cfg(test)]

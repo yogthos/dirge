@@ -26,7 +26,8 @@ use crate::lsp::uri::path_to_file_uri;
 /// Time we'll wait for the server to answer `initialize`. Matches opencode's
 /// 45s ceiling — rust-analyzer in particular can take a moment when first
 /// indexing a large workspace.
-pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
+// dirge-onlr: single source — see crate::timeout::Timeouts.
+pub const INITIALIZE_TIMEOUT: Duration = crate::timeout::Timeouts::DEFAULT.lsp_initialize;
 
 /// Run the LSP initialize handshake against a connected [`RpcClient`].
 ///

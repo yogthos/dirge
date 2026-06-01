@@ -504,7 +504,10 @@ impl Tool for BashTool {
 
         // Background requested but no store wired (headless): fall back to
         // a bounded synchronous run.
-        let secs = args.timeout.unwrap_or(120);
+        // dirge-onlr: single source — see crate::timeout::Timeouts.
+        let secs = args
+            .timeout
+            .unwrap_or(crate::timeout::Timeouts::DEFAULT.bash.as_secs());
         if secs == 0 {
             return Err(ToolError::Msg("timeout must be > 0".to_string()));
         }

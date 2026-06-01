@@ -488,7 +488,7 @@ impl Config {
     /// Precedence:
     ///   1. `providers[name].stream_chunk_timeout_secs`
     ///   2. top-level `stream_chunk_timeout_secs`
-    ///   3. `DEFAULT_STREAM_CHUNK_TIMEOUT_SECS` (300s)
+    ///   3. `[timeouts].stream_chunk_secs` → `Timeouts::DEFAULT` (300s)
     ///
     /// Passing an unknown / empty provider name falls through past
     /// (1) to the top-level / default.
@@ -503,10 +503,24 @@ impl Config {
             .as_ref()
             .and_then(|m| m.get(provider).or_else(|| m.get(&lower)))
             .and_then(|p| p.stream_chunk_timeout_secs);
-        let secs = from_provider
-            .or(self.stream_chunk_timeout_secs)
-            .unwrap_or(crate::agent::runner::DEFAULT_STREAM_CHUNK_TIMEOUT_SECS);
-        std::time::Duration::from_secs(secs)
+        // Provider override and the top-level key still win; otherwise
+        // fall through to the centralized default.
+        match from_provider.or(self.stream_chunk_timeout_secs) {
+            Some(secs) => std::time::Duration::from_secs(secs),
+            None => self.resolve_timeouts().stream_chunk,
+        }
+    }
+
+    /// Resolve the named per-operation timeouts (dirge-onlr). Today this
+    /// returns the centralized defaults ([`crate::timeout::Timeouts`]) —
+    /// the single source of truth replacing the magic-number consts that
+    /// used to live in config, the stream loop, the MCP client, and the
+    /// LSP manager. A `[timeouts]` config override block + threading the
+    /// resolved values into LSP/MCP/bash construction is follow-up; this
+    /// accessor is the seam those overrides will merge into.
+    #[allow(clippy::unused_self)] // &self is the seam for future config merge
+    pub fn resolve_timeouts(&self) -> crate::timeout::Timeouts {
+        crate::timeout::Timeouts::DEFAULT
     }
 
     pub fn resolve_show_edit_diff(&self) -> bool {
