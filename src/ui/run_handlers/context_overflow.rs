@@ -25,8 +25,8 @@ use crate::provider::{AnyAgent, AnyClient};
 use crate::sandbox::Sandbox;
 #[cfg(feature = "semantic")]
 use crate::semantic::SemanticManager;
-use crate::ui::agent_io::persist_turn_to_db;
-use crate::ui::colors::c_error;
+use crate::ui::agent_io::{persist_turn_to_db, render_agent_stream};
+use crate::ui::colors::{c_agent, c_error};
 use crate::ui::events::sanitize_output;
 use crate::ui::renderer::Renderer;
 use crate::ui::run_handlers::RunCtx;
@@ -67,6 +67,18 @@ pub(crate) async fn handle_context_overflow(
     // user stranded at the error.
     *was_reasoning = false;
     close_tool_chamber_if_open(ctx.renderer, ctx.last_tool_name, ctx.tool_chamber_open)?;
+    // dirge-ufe0: flush any trailing token the render coalescer skipped
+    // (the ContextOverflow event queued behind the final tokens leaves
+    // them caught-up-but-unpainted) before the overflow line is written,
+    // so the streamed text stays on-screen above it (also DB-persisted).
+    if !ctx.response_buf.is_empty() {
+        render_agent_stream(
+            ctx.response_buf,
+            ctx.response_start_line,
+            c_agent(),
+            ctx.renderer,
+        )?;
+    }
     let safe = sanitize_output(&error);
     ctx.renderer
         .write_line(&format!("context overflow: {}", safe), c_error())?;

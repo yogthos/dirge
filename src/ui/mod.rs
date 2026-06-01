@@ -2200,6 +2200,21 @@ pub async fn run_interactive(
                         #[cfg(feature = "experimental-ui-terminal-tab")]
                         renderer.set_last_tool_name("");
                         close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
+                        // dirge-ufe0: flush any trailing token the render
+                        // coalescer skipped (the Error event queued behind
+                        // the final tokens leaves them caught-up-but-
+                        // unpainted) before the error line is written, so
+                        // the streamed text stays on-screen above the error
+                        // (it is also persisted to the DB below).
+                        if !response_buf.is_empty() {
+                            render_agent_stream(
+                                &response_buf,
+                                &mut response_start_line,
+                                c_agent(),
+                                &mut renderer,
+                            )?;
+                            last_token_render = None;
+                        }
                         let safe = sanitize_output(&e);
                         renderer.write_line(&format!("error: {}", safe), c_error())?;
 
