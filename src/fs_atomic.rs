@@ -113,8 +113,11 @@ fn atomic_write_inner(target: &Path, content: &[u8], private: bool) -> io::Resul
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
         }
+        // On non-unix, file modes don't apply: `prev_mode` and the
+        // `private` (0600) request are both unused. Consume them so
+        // `-D warnings` doesn't fail the Windows build.
         #[cfg(not(unix))]
-        let _ = prev_mode;
+        let _ = (prev_mode, private);
         std::fs::rename(&tmp, target)?;
         Ok(())
     })();

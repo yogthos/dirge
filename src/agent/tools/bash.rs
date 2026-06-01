@@ -90,6 +90,10 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, 
         .spawn()
         .map_err(|e| ToolError::Msg(format!("failed to spawn: {}", e)))?;
     let pid = child.id();
+    // pid drives only the Unix process-group kill paths below; on
+    // non-unix it's unused — consume it so `-D warnings` passes.
+    #[cfg(not(unix))]
+    let _ = pid;
 
     // Drop guard: on Unix, `kill_on_drop(true)` SIGKILLs the immediate
     // bash child when the future is dropped (e.g. user Ctrl+C aborts
@@ -275,6 +279,9 @@ fn spawn_streaming_shell(
             }
         };
         let pid = child.id();
+        // Unix-only process-group kill paths use pid; consume on non-unix.
+        #[cfg(not(unix))]
+        let _ = pid;
         #[cfg(unix)]
         let mut pgguard = pid.map(PgKillGuard::new);
 
