@@ -5,6 +5,11 @@
 //! clusters are extracted into sibling modules.
 
 use super::*;
+// `pub(super)` internals exercised directly by these tests (not part of
+// the re-exported public surface).
+use super::error_fmt::{build_concrete_hint, navigate_schema};
+use super::semantic::unwrap_md_link;
+use super::validate::parse_json_pointer;
 
 // ============================================================
 // parse_json_pointer
