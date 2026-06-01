@@ -1068,6 +1068,48 @@ fn phase9_example_plugins_load_end_to_end() {
     );
 }
 
+/// The bundled `backpressured` plugin loads end-to-end, registers its
+/// three commands, stays off without the keyword, and engages on it —
+/// injecting the loop discipline into the system prompt.
+#[cfg(feature = "plugin")]
+#[test]
+fn backpressured_plugin_loads_and_engages() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/backpressured");
+
+    // Off without the keyword: no system-prompt injection. Load via the
+    // directory loader (shares the env AND aliases the bare hooks so
+    // dispatch finds them) — the same path dirge uses at startup.
+    {
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &dir).unwrap();
+        assert_eq!(mgr.list_commands().len(), 3, "registers three commands");
+        mgr.dispatch("on-prompt", "@{:prompt \"just a normal request\"}")
+            .unwrap();
+        mgr.dispatch("before-agent-start", "@{}").unwrap();
+        assert!(
+            mgr.take_system_prompt_append().is_none(),
+            "stays off without the backpressure keyword",
+        );
+    }
+
+    // Engaged by the keyword: discipline injected.
+    {
+        let mut mgr = PluginManager::try_new().unwrap();
+        super::load_plugin(&mut mgr, &dir).unwrap();
+        mgr.dispatch("on-prompt", "@{:prompt \"do this backpressured\"}")
+            .unwrap();
+        mgr.dispatch("before-agent-start", "@{}").unwrap();
+        let sp = mgr
+            .take_system_prompt_append()
+            .expect("engaged → injects a system prompt");
+        assert!(sp.contains("backpressured loop"), "discipline present");
+        assert!(
+            sp.contains("Independent reviewer"),
+            "reviewer section present"
+        );
+    }
+}
+
 // --- 9b: register-command + register-provider wire alignment -------
 
 /// Duplicate command name resolves last-wins (matches H4 semantics
