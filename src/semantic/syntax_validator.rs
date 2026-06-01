@@ -207,7 +207,29 @@ fn snippet_for(node: tree_sitter::Node, source: &str) -> String {
 /// (the safest default for `write` / `edit` / `apply_patch`).
 pub fn check_syntax(path: &Path, content: &str) -> Result<(), Vec<SyntaxError>> {
     let Some(lang) = language_for_path(path) else {
-        return Ok(()); // unknown extension or feature not built
+        // No tree-sitter grammar for this extension. For languages we have
+        // delimiter-lexing rules for (lisps without a grammar — .janet,
+        // .fnl, .lisp, .scm, .rkt, .el, .cljd, .jdn), fall back to the
+        // delimiter-balance scanner so the model still gets the actionable
+        // "add N matching `)`" feedback instead of silence. Silence is what
+        // pushes the model into counting delimiters by hand (dirge-gwpi).
+        // For everything else (no grammar AND no lex rules) this is a no-op.
+        return match lex_rules_for_path(path) {
+            Some(rules) if delimiter_summary(content, rules).is_some() => {
+                // Sentinel error: the actionable message is produced by
+                // `format_errors` (which appends the delimiter summary). It
+                // carries no line/col of its own — `format_errors` does not
+                // render sentinels for the no-grammar path.
+                Err(vec![SyntaxError {
+                    line: 0,
+                    column: 0,
+                    snippet: String::new(),
+                    is_missing: true,
+                    expected: None,
+                }])
+            }
+            _ => Ok(()),
+        };
     };
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&lang).is_err() {
@@ -254,6 +276,13 @@ struct LexRules {
     char_squote: bool,
     /// `\x` char literals (Lisp): the char after a backslash is escaped.
     char_backslash: bool,
+    /// `?x` / `?\x` char literals (Emacs Lisp): `?(` is the character `(`,
+    /// not an opening delimiter.
+    char_question: bool,
+    /// Backtick long-strings (Janet): `` `...` ``, `` ``...`` `` — delimited
+    /// by a run of N backticks, closed by the next run of N backticks. Raw
+    /// (no escapes inside).
+    long_string_backtick: bool,
 }
 
 const RULES_C: LexRules = LexRules {
@@ -263,6 +292,8 @@ const RULES_C: LexRules = LexRules {
     strings: &[("\"", "\"", true)],
     char_squote: true,
     char_backslash: false,
+    char_question: false,
+    long_string_backtick: false,
 };
 const RULES_RUST: LexRules = LexRules {
     line_comments: &["//"],
@@ -276,6 +307,8 @@ const RULES_RUST: LexRules = LexRules {
     ],
     char_squote: true,
     char_backslash: false,
+    char_question: false,
+    long_string_backtick: false,
 };
 const RULES_GO: LexRules = LexRules {
     line_comments: &["//"],
@@ -284,6 +317,8 @@ const RULES_GO: LexRules = LexRules {
     strings: &[("`", "`", false), ("\"", "\"", true)],
     char_squote: true,
     char_backslash: false,
+    char_question: false,
+    long_string_backtick: false,
 };
 const RULES_JAVA: LexRules = LexRules {
     line_comments: &["//"],
@@ -292,6 +327,8 @@ const RULES_JAVA: LexRules = LexRules {
     strings: &[("\"\"\"", "\"\"\"", true), ("\"", "\"", true)],
     char_squote: true,
     char_backslash: false,
+    char_question: false,
+    long_string_backtick: false,
 };
 const RULES_PYTHON: LexRules = LexRules {
     line_comments: &["#"],
@@ -305,7 +342,11 @@ const RULES_PYTHON: LexRules = LexRules {
     ],
     char_squote: false,
     char_backslash: false,
+    char_question: false,
+    long_string_backtick: false,
 };
+// Clojure family + Fennel: `;` line comments, `"` strings, `\x` char
+// literals (`\(`, `\space`). No block comments, no `?`/backtick forms.
 const RULES_LISP: LexRules = LexRules {
     line_comments: &[";"],
     block_comments: &[],
@@ -313,6 +354,44 @@ const RULES_LISP: LexRules = LexRules {
     strings: &[("\"", "\"", true)],
     char_squote: false,
     char_backslash: true,
+    char_question: false,
+    long_string_backtick: false,
+};
+// Janet / JDN: `#` line comments (NOT `;`), `"` strings with `\` escapes,
+// and backtick long-strings (`` `...` ``).
+const RULES_JANET: LexRules = LexRules {
+    line_comments: &["#"],
+    block_comments: &[],
+    nested_block_comments: false,
+    strings: &[("\"", "\"", true)],
+    char_squote: false,
+    char_backslash: false,
+    char_question: false,
+    long_string_backtick: true,
+};
+// Scheme / Racket / Common Lisp: `;` line comments, nestable `#| ... |#`
+// block comments, `"` strings, `\x` char escapes (`#\(`).
+const RULES_SCHEME: LexRules = LexRules {
+    line_comments: &[";"],
+    block_comments: &[("#|", "|#")],
+    nested_block_comments: true,
+    strings: &[("\"", "\"", true)],
+    char_squote: false,
+    char_backslash: true,
+    char_question: false,
+    long_string_backtick: false,
+};
+// Emacs Lisp: `;` line comments, `"` strings, and `?x` / `?\x` char
+// literals (`?(` is the character `(`, not an opener).
+const RULES_ELISP: LexRules = LexRules {
+    line_comments: &[";"],
+    block_comments: &[],
+    nested_block_comments: false,
+    strings: &[("\"", "\"", true)],
+    char_squote: false,
+    char_backslash: true,
+    char_question: true,
+    long_string_backtick: false,
 };
 
 /// Lexing rules for a path's extension, or `None` when the delimiter
@@ -325,8 +404,14 @@ fn lex_rules_for_path(path: &Path) -> Option<&'static LexRules> {
         "go" => &RULES_GO,
         "java" => &RULES_JAVA,
         "py" | "pyi" => &RULES_PYTHON,
-        "clj" | "cljs" | "cljc" | "cljd" | "edn" | "bb" | "janet" | "jdn" | "fnl" | "lisp"
-        | "el" | "scm" | "rkt" => &RULES_LISP,
+        // Clojure family + Fennel.
+        "clj" | "cljs" | "cljc" | "cljd" | "edn" | "bb" | "fnl" => &RULES_LISP,
+        // Janet + Janet Data Notation (`#` comments, backtick long-strings).
+        "janet" | "jdn" => &RULES_JANET,
+        // Scheme / Racket / Common Lisp (`#| |#` block comments).
+        "scm" | "ss" | "rkt" | "lisp" | "lsp" | "cl" => &RULES_SCHEME,
+        // Emacs Lisp (`?x` char literals).
+        "el" => &RULES_ELISP,
         _ => return None,
     })
 }
@@ -436,6 +521,43 @@ fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
                 continue 'outer;
             }
         }
+        if rules.char_question && b[i] == b'?' {
+            // Emacs Lisp char literal: `?X` or `?\X` (e.g. `?(`, `?\(`).
+            // The character — including a delimiter — is data, not an opener.
+            if b.get(i + 1) == Some(&b'\\') {
+                adv(b, &mut i, &mut line, &mut col, 3); // ?\X
+            } else if i + 1 < n {
+                adv(b, &mut i, &mut line, &mut col, 2); // ?X
+            } else {
+                adv(b, &mut i, &mut line, &mut col, 1);
+            }
+            continue 'outer;
+        }
+        if rules.long_string_backtick && b[i] == b'`' {
+            // Janet long-string: a run of k backticks opens it; the next run
+            // of ≥ k backticks closes it. Raw — no escapes inside.
+            let mut k = 0usize;
+            while i + k < n && b[i + k] == b'`' {
+                k += 1;
+            }
+            adv(b, &mut i, &mut line, &mut col, k);
+            while i < n {
+                if b[i] == b'`' {
+                    let mut j = 0usize;
+                    while i + j < n && b[i + j] == b'`' {
+                        j += 1;
+                    }
+                    if j >= k {
+                        adv(b, &mut i, &mut line, &mut col, k);
+                        break;
+                    }
+                    adv(b, &mut i, &mut line, &mut col, j);
+                } else {
+                    adv(b, &mut i, &mut line, &mut col, 1);
+                }
+            }
+            continue 'outer;
+        }
         match b[i] {
             b'(' | b'[' | b'{' => stack.push((b[i], line, col)),
             b')' | b']' | b'}' => {
@@ -484,21 +606,37 @@ fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
 /// appended so the model gets an actionable "the `{` at line N is never
 /// closed" instead of a bare line:col.
 pub fn format_errors(path: &Path, content: &str, errors: &[SyntaxError]) -> String {
-    let mut out = format!(
-        "Syntax check failed for {}: {} error(s) detected by tree-sitter. \
-         Fix and re-submit. (This is a pre-write guard — the file was NOT modified.)\n",
-        path.display(),
-        errors.len(),
-    );
-    for err in errors {
-        out.push_str(&err.render());
-        out.push('\n');
-    }
-    if errors.len() == MAX_ERRORS {
-        out.push_str(&format!(
-            "  …(truncated at {} errors; fix the listed issues and re-check)\n",
-            MAX_ERRORS,
-        ));
+    // When a tree-sitter grammar exists, the errors come from it (and the
+    // delimiter summary localizes them). For grammarless languages the
+    // errors are sentinels from the delimiter-balance fallback — the summary
+    // below IS the message, so don't claim tree-sitter and don't render the
+    // empty sentinels. (dirge-gwpi)
+    let has_grammar = language_for_path(path).is_some();
+    let mut out = if has_grammar {
+        format!(
+            "Syntax check failed for {}: {} error(s) detected by tree-sitter. \
+             Fix and re-submit. (This is a pre-write guard — the file was NOT modified.)\n",
+            path.display(),
+            errors.len(),
+        )
+    } else {
+        format!(
+            "Syntax check failed for {}: delimiters are unbalanced. \
+             Fix and re-submit. (This is a pre-write guard — the file was NOT modified.)\n",
+            path.display(),
+        )
+    };
+    if has_grammar {
+        for err in errors {
+            out.push_str(&err.render());
+            out.push('\n');
+        }
+        if errors.len() == MAX_ERRORS {
+            out.push_str(&format!(
+                "  …(truncated at {} errors; fix the listed issues and re-check)\n",
+                MAX_ERRORS,
+            ));
+        }
     }
     if let Some(rules) = lex_rules_for_path(path)
         && let Some(summary) = delimiter_summary(content, rules)
@@ -697,5 +835,118 @@ int main(void) {
             rendered.contains("Delimiter imbalance"),
             "Clojure error should carry the paren-balance hint: {rendered}"
         );
+    }
+
+    // ---- Grammarless-lisp fallback (dirge-gwpi) ----
+    // These languages have NO tree-sitter grammar, so check_syntax must
+    // fall back to the delimiter scanner and still produce the actionable
+    // "do not count by hand" message — otherwise the model writes a broken
+    // file with zero feedback and resorts to counting parens itself.
+
+    #[test]
+    fn janet_unbalanced_flags_and_advises_not_to_count() {
+        let path = PathBuf::from("/tmp/x.janet");
+        let content = "(defn- f [x]\n  (+ x 1)\n"; // one unclosed `(`
+        let errors = check_syntax(&path, content).expect_err("janet imbalance must be flagged");
+        let msg = format_errors(&path, content, &errors);
+        assert!(msg.contains("do not count by hand"), "{msg}");
+        // No-grammar path must not falsely claim tree-sitter detected it.
+        assert!(
+            !msg.contains("tree-sitter"),
+            "no-grammar path must not claim tree-sitter: {msg}"
+        );
+    }
+
+    #[test]
+    fn janet_balanced_passes() {
+        let path = PathBuf::from("/tmp/x.janet");
+        assert!(check_syntax(&path, "(defn- f [x] (+ x 1))\n").is_ok());
+    }
+
+    #[test]
+    fn janet_hash_comment_parens_no_false_positive() {
+        // Janet line comments are `#`, NOT `;`. Parens inside a `#` comment
+        // must not be counted (RULES_LISP's `;` would miscount here).
+        let path = PathBuf::from("/tmp/x.janet");
+        let content = "# a comment with ( unbalanced paren\n(def x 1)\n";
+        assert!(
+            check_syntax(&path, content).is_ok(),
+            "`#` comment parens must be ignored for Janet"
+        );
+    }
+
+    #[test]
+    fn janet_backtick_long_string_parens_no_false_positive() {
+        let path = PathBuf::from("/tmp/x.janet");
+        let content = "(def s `a long string with ( unbalanced paren`)\n";
+        assert!(
+            check_syntax(&path, content).is_ok(),
+            "backtick long-string parens must be ignored for Janet"
+        );
+    }
+
+    #[test]
+    fn jdn_uses_janet_lexing() {
+        let path = PathBuf::from("/tmp/x.jdn");
+        assert!(check_syntax(&path, "# c (\n{:a 1}\n").is_ok());
+    }
+
+    #[test]
+    fn fennel_unbalanced_flags() {
+        let path = PathBuf::from("/tmp/x.fnl");
+        let errors = check_syntax(&path, "(fn f [x]\n  (+ x 1)\n").expect_err("fennel imbalance");
+        assert!(format_errors(&path, "(fn f [x]\n  (+ x 1)\n", &errors).contains("do not count"));
+    }
+
+    #[test]
+    fn fennel_semicolon_comment_no_false_positive() {
+        let path = PathBuf::from("/tmp/x.fnl");
+        assert!(check_syntax(&path, "; comment with (\n(local x 1)\n").is_ok());
+    }
+
+    #[test]
+    fn cljd_unbalanced_flags() {
+        let path = PathBuf::from("/tmp/x.cljd");
+        assert!(check_syntax(&path, "(defn f [x] (+ x 1)\n").is_err());
+    }
+
+    #[test]
+    fn scheme_block_comment_parens_no_false_positive() {
+        // Scheme/Racket use `#| ... |#` (nestable) block comments.
+        let path = PathBuf::from("/tmp/x.scm");
+        let content = "#| a block ( comment #| nested ) |# still |#\n(define x 1)\n";
+        assert!(
+            check_syntax(&path, content).is_ok(),
+            "`#| |#` block-comment parens must be ignored"
+        );
+    }
+
+    #[test]
+    fn scheme_unbalanced_flags() {
+        let path = PathBuf::from("/tmp/x.rkt");
+        assert!(check_syntax(&path, "(define (f x)\n  (+ x 1)\n").is_err());
+    }
+
+    #[test]
+    fn commonlisp_block_comment_no_false_positive() {
+        let path = PathBuf::from("/tmp/x.lisp");
+        assert!(check_syntax(&path, "#| ( |#\n(defun f () 1)\n").is_ok());
+    }
+
+    #[test]
+    fn elisp_question_char_paren_no_false_positive() {
+        // Elisp char literals: `?(` is the character `(`, not an opener.
+        let path = PathBuf::from("/tmp/x.el");
+        let content = "(setq c ?\\()\n"; // elisp `?\(` is the char `(`
+        assert!(
+            check_syntax(&path, content).is_ok(),
+            "`?(`/`?\\(` char literals must not count as openers"
+        );
+    }
+
+    #[test]
+    fn elisp_unbalanced_flags() {
+        let path = PathBuf::from("/tmp/x.el");
+        assert!(check_syntax(&path, "(defun f ()\n  (+ 1 2)\n").is_err());
     }
 }
