@@ -106,6 +106,16 @@ const HARNESS_INIT: &str = r#"
 (defn harness/has-symbol? [name]
   (truthy? (get (curenv) (symbol name))))
 
+# dirge-99ic: the loading plugin's config.json settings
+# (`plugins.<name>`). The host sets this to the plugin's settings right
+# BEFORE each plugin's files load, then clears it. A plugin must capture
+# its own config in LOAD-TIME code (e.g. `(def my-cfg (harness/plugin-config))`)
+# — reading it later from a shared hook is unreliable because the slot
+# reflects the LAST plugin loaded. Shape: @{:enabled bool :auto-start bool}
+# or nil when no `plugins` config applies.
+(var harness-plugin-config nil)
+(defn harness/plugin-config [] harness-plugin-config)
+
 # Tool-hook slots. Plugins call these from inside
 # on-tool-start / on-tool-end. The host reads them via
 # dispatch_tool_hook on the Rust side.

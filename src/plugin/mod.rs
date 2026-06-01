@@ -262,6 +262,22 @@ impl PluginManager {
         self.worker.eval(code)
     }
 
+    /// dirge-99ic: stash the loading plugin's `config.json` settings in
+    /// `harness-plugin-config` so its load-time code can read them via
+    /// `harness/plugin-config`. Call right before `load_plugin`, then
+    /// [`clear_loading_plugin_config`](Self::clear_loading_plugin_config)
+    /// after, so one plugin's config never leaks into the next.
+    pub fn set_loading_plugin_config(&mut self, enabled: bool, auto_start: bool) {
+        let _ = self.worker.eval(&format!(
+            "(set harness-plugin-config @{{:enabled {enabled} :auto-start {auto_start}}})"
+        ));
+    }
+
+    /// Reset the plugin-config slot to nil after a plugin finishes loading.
+    pub fn clear_loading_plugin_config(&mut self) {
+        let _ = self.worker.eval("(set harness-plugin-config nil)");
+    }
+
     pub fn dispatch(&mut self, hook: &str, context_janet: &str) -> Result<Vec<String>, String> {
         let names = match self.hooks.get(hook) {
             Some(names) => names.clone(),

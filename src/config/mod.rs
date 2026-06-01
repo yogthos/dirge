@@ -180,6 +180,22 @@ impl crate::lsp::server::AsExtensionOverride for LspServerConfig {
     }
 }
 
+/// Per-plugin settings under the config `plugins` object, keyed by plugin
+/// name (the directory name or the `.janet` file stem under a plugin search
+/// dir). Both fields default to "unset"; the host treats that as
+/// enabled + not auto-started, so existing setups load every plugin as
+/// before.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PluginSettings {
+    /// Load this plugin? Default true. `false` skips loading it entirely.
+    pub enabled: Option<bool>,
+    /// Passed to the plugin (via `harness/plugin-config`) so it can
+    /// self-engage at startup instead of waiting for a trigger. Plugin-
+    /// specific: e.g. `backpressured` engages its loop when this is true.
+    pub auto_start: Option<bool>,
+}
+
 /// `lsp = true`  → enable built-in servers with default commands.
 /// `lsp = false` → disable LSP entirely.
 /// `lsp = { server-id = { … } }` → enable defaults, overriding the named
@@ -235,6 +251,10 @@ pub struct Config {
     /// Each entry's `provider_type` defaults to the alias key
     /// when omitted.
     pub providers: Option<HashMap<String, ProviderEntry>>,
+    /// Per-plugin settings, keyed by plugin name (the directory name or
+    /// the `.janet` file stem under a plugin search dir). Absent entry =
+    /// enabled, not auto-started (backward compatible).
+    pub plugins: Option<HashMap<String, PluginSettings>>,
     pub permission: Option<serde_json::Value>,
     pub restrictive: Option<bool>,
     pub accept_all: Option<bool>,
@@ -336,6 +356,25 @@ impl Config {
     /// Snapshot of the unified providers map. Empty when not set.
     pub fn providers_map(&self) -> HashMap<String, ProviderEntry> {
         self.providers.clone().unwrap_or_default()
+    }
+
+    /// Whether the plugin named `name` should be loaded. Default true —
+    /// only an explicit `"enabled": false` skips it.
+    pub fn plugin_enabled(&self, name: &str) -> bool {
+        self.plugins
+            .as_ref()
+            .and_then(|m| m.get(name))
+            .and_then(|s| s.enabled)
+            .unwrap_or(true)
+    }
+
+    /// Whether the plugin named `name` requested auto-start. Default false.
+    pub fn plugin_auto_start(&self, name: &str) -> bool {
+        self.plugins
+            .as_ref()
+            .and_then(|m| m.get(name))
+            .and_then(|s| s.auto_start)
+            .unwrap_or(false)
     }
 
     /// Phase 4 part 2: resolve the context-depth reminder
@@ -707,6 +746,41 @@ mod tests {
 
         let cfg: Config = serde_json::from_str(r#"{"lsp": false}"#).unwrap();
         assert!(!cfg.lsp.unwrap().is_enabled());
+    }
+
+    /// dirge-99ic: `plugins.<name>.{enabled, auto_start}` toggles, with
+    /// enabled defaulting to true (plugins load unless explicitly off).
+    #[test]
+    fn plugin_toggles_parse_with_enabled_default_true() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "plugins": {
+                    "backpressured": {"enabled": true, "auto_start": true},
+                    "nrepl": {"enabled": false},
+                    "noisy": {"auto_start": true}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.plugin_enabled("backpressured"));
+        assert!(cfg.plugin_auto_start("backpressured"));
+
+        assert!(!cfg.plugin_enabled("nrepl"));
+        assert!(!cfg.plugin_auto_start("nrepl"));
+
+        // enabled omitted → defaults to true; auto_start honored.
+        assert!(cfg.plugin_enabled("noisy"));
+        assert!(cfg.plugin_auto_start("noisy"));
+
+        // Absent entry → enabled, not auto-started.
+        assert!(cfg.plugin_enabled("unlisted"));
+        assert!(!cfg.plugin_auto_start("unlisted"));
+
+        // No `plugins` block at all → everything loads (backward compat).
+        let empty: Config = serde_json::from_str("{}").unwrap();
+        assert!(empty.plugin_enabled("anything"));
+        assert!(!empty.plugin_auto_start("anything"));
     }
 
     #[test]

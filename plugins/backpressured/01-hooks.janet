@@ -98,3 +98,10 @@ Act on the real findings; push back on wrong ones. Apply this to the plan
   (when bp-active
     (harness/append-system-prompt (bp-discipline)))
   nil)
+
+# Honor `plugins.backpressured.auto_start` from config.json: engage the
+# loop from the first prompt without needing the keyword. Captured at
+# LOAD time, while harness-plugin-config holds THIS plugin's settings.
+(let [cfg (harness/plugin-config)]
+  (when (and cfg (get cfg :auto-start))
+    (set bp-active true)))

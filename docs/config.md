@@ -319,6 +319,36 @@ plugin pre-hook). If you load third-party plugins, treat them with the same
 care you'd give to executing third-party code in your shell — the plugin's
 trust level effectively equals the user's. There is no sandboxing.
 
+### Per-plugin settings (`plugins`)
+
+Plugins are discovered from `~/.config/dirge/plugins/` and
+`./.dirge/plugins/` and load automatically. The optional `plugins` object
+toggles them by name — the **directory name** (multi-file plugins) or the
+**`.janet` file stem** (single-file plugins):
+
+```json
+{
+  "plugins": {
+    "backpressured": { "enabled": true, "auto_start": true },
+    "nrepl":         { "enabled": false }
+  }
+}
+```
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `enabled` | `true` | Whether to load the plugin. `false` skips it entirely. |
+| `auto_start` | `false` | Passed to the plugin via `harness/plugin-config`; a plugin that supports it self-engages at startup (e.g. `backpressured` runs its loop without the keyword). |
+
+A plugin with no entry — or no `plugins` block at all — is **enabled and not
+auto-started**, so existing setups load every plugin exactly as before.
+
+Plugin authors: read your own settings in **load-time** code with
+`(harness/plugin-config)`, which returns `@{:enabled bool :auto-start bool}`
+(or `nil`). The host sets it just before your files load and clears it
+after, so capture it at the top level — not from a shared hook, where it
+would reflect the last plugin loaded.
+
 ## Streaming timeouts
 
 dirge applies a per-chunk read deadline to streaming LLM responses so a

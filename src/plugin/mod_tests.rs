@@ -1108,6 +1108,22 @@ fn backpressured_plugin_loads_and_engages() {
             "reviewer section present"
         );
     }
+
+    // dirge-99ic: `auto_start` engages the loop at load time — no keyword.
+    {
+        let mut mgr = PluginManager::try_new().unwrap();
+        // Host injects this plugin's config.json settings before loading.
+        mgr.set_loading_plugin_config(/* enabled */ true, /* auto_start */ true);
+        super::load_plugin(&mut mgr, &dir).unwrap();
+        mgr.clear_loading_plugin_config();
+
+        // No on-prompt keyword — engaged purely by auto_start.
+        mgr.dispatch("before-agent-start", "@{}").unwrap();
+        let sp = mgr
+            .take_system_prompt_append()
+            .expect("auto_start → discipline injected without the keyword");
+        assert!(sp.contains("backpressured loop"), "discipline present");
+    }
 }
 
 // --- 9b: register-command + register-provider wire alignment -------

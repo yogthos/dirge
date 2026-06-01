@@ -635,10 +635,29 @@ async fn main() -> anyhow::Result<()> {
                 if !is_janet_file && !is_plugin_dir {
                     continue;
                 }
+                // dirge-99ic: a plugin's config-key is its directory name
+                // (dir plugin) or `.janet` file stem (single-file). Honor
+                // `plugins.<name>.enabled` (default true) and pass
+                // `auto_start` to the plugin via harness-plugin-config.
+                let plugin_name = if is_plugin_dir {
+                    path.file_name()
+                } else {
+                    path.file_stem()
+                }
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+                if !cfg.plugin_enabled(&plugin_name) {
+                    if cli.verbose {
+                        eprintln!("skipping disabled plugin: {plugin_name}");
+                    }
+                    continue;
+                }
                 if cli.verbose {
                     eprintln!("loading plugin: {}", path.display());
                 }
                 let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.set_loading_plugin_config(true, cfg.plugin_auto_start(&plugin_name));
                 match plugin::load_plugin(&mut mgr, &path) {
                     Ok(loaded) => {
                         if cli.verbose && loaded.files.len() > 1 {
@@ -661,6 +680,8 @@ async fn main() -> anyhow::Result<()> {
                         eprintln!("warning: failed to load plugin {}: {}", path.display(), e);
                     }
                 }
+                // Don't let this plugin's config leak into the next one.
+                mgr.clear_loading_plugin_config();
             }
         }
 

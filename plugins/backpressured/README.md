@@ -44,6 +44,27 @@ loaded with `dirge --verbose` (prints `loading plugin: …/backpressured`) or
 by running `/backpressured-status`. The plugin stays dormant until you
 engage it (see Usage).
 
+### Config toggles
+
+In `~/.config/dirge/config.json` you can disable the plugin or have it
+engage automatically:
+
+```json
+{
+  "plugins": {
+    "backpressured": { "enabled": true, "auto_start": true }
+  }
+}
+```
+
+- **`enabled`** (default `true`) — set `false` to skip loading it entirely.
+- **`auto_start`** (default `false`) — engage the loop from the **first
+  prompt without the keyword**. Use this when you want every session in a
+  project to run backpressured by default.
+
+The key (`backpressured`) is the plugin's directory name under the plugin
+search dir.
+
 ## Usage
 
 Engage it by mentioning **backpressure** in your prompt:
