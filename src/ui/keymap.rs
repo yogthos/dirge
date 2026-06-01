@@ -23,6 +23,9 @@ use crate::config::KeybindingConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
     ToggleReasoning,
+    /// Expand on demand: the buffered thinking (while the agent is
+    /// thinking), else reprint the last collapsed tool result in full.
+    Expand,
     ScrollPageUp,
     ScrollPageDown,
     ScrollToTop,
@@ -42,6 +45,11 @@ impl KeyAction {
             KeyAction::ToggleReasoning,
             "toggle_reasoning",
             &[(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+        ),
+        (
+            KeyAction::Expand,
+            "expand",
+            &[(KeyCode::Char('o'), KeyModifiers::CONTROL)],
         ),
         (
             KeyAction::ScrollPageUp,

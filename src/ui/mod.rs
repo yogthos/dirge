@@ -310,7 +310,11 @@ pub async fn run_interactive(
     // row `MoveTo(0, i)`, so the issue can't manifest.
     let mut reasoning_buf = String::new();
     let mut reasoning_start_line: Option<usize> = None;
-    let mut show_reasoning = true;
+    // dirge-fjqk: thinking is suppressed by default — it's noisy and low
+    // value. The animated "thinking" avatar is the live spinner; the
+    // reasoning text is buffered and revealed on demand with Ctrl+O (or
+    // streamed inline if the user flips this on with Ctrl+R).
+    let mut show_reasoning = false;
     let mut was_reasoning = false;
     let mut todo_tools_enabled = false;
     let mut last_tool_name: Option<String> = None;
@@ -404,7 +408,7 @@ pub async fn run_interactive(
     // it as a fresh chamber with the full body. Only the most
     // recent collapse is retained — past collapses scroll away into
     // chat history and are not addressable.
-    let mut _last_collapsed: Option<CollapsedToolResult> = None;
+    let mut last_collapsed: Option<CollapsedToolResult> = None;
     #[allow(unused_mut)]
     let mut loop_label: Option<String> = None;
     #[cfg(feature = "loop")]
@@ -492,7 +496,7 @@ pub async fn run_interactive(
                 chamber_top_end: &mut chamber_top_end,
                 tool_calls_buf: &mut tool_calls_buf,
                 tool_calls_this_run: &mut tool_calls_this_run,
-                last_collapsed: &mut _last_collapsed,
+                last_collapsed: &mut last_collapsed,
                 last_user_prompt: &mut last_user_prompt,
                 cli,
                 cfg,
@@ -1020,6 +1024,39 @@ pub async fn run_interactive(
                             continue;
                         }
 
+                        // dirge-fjqk: Ctrl+O expands on demand. While the agent
+                        // is thinking (buffered reasoning present), reveal it in
+                        // a plain, color-reset block (no markdown stream → no
+                        // bleed). Otherwise reprint the last collapsed tool
+                        // result in full (restores that affordance).
+                        if action == Some(KeyAction::Expand) {
+                            if !reasoning_buf.is_empty() {
+                                renderer.write_line("  ╭─ thinking ─", theme::dim())?;
+                                for line in reasoning_buf.lines() {
+                                    renderer.write_line(
+                                        &format!("  │ {}", sanitize_output(line)),
+                                        theme::dim(),
+                                    )?;
+                                }
+                                renderer.write_line("  ╰─", theme::dim())?;
+                                renderer.write_line("", Color::White)?;
+                            } else if let Some(collapsed) = &last_collapsed {
+                                const EXPAND_CAP_BYTES: usize = 64 * 1024;
+                                crate::ui::tool_display::render_collapsed_in_full(
+                                    &mut renderer,
+                                    collapsed,
+                                    EXPAND_CAP_BYTES,
+                                )?;
+                            }
+                            renderer.render_viewport()?;
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
+                                is_running,
+                            )?;
+                            continue;
+                        }
+
                         let ctrl_p = action == Some(KeyAction::PrevChat);
                         let ctrl_x = action == Some(KeyAction::CloseChat);
                         if matches!(
@@ -1245,7 +1282,7 @@ pub async fn run_interactive(
                             // from a previous, unrelated turn. New
                             // truncations during the turn populate
                             // it again.
-                            _last_collapsed = None;
+                            last_collapsed = None;
                             #[cfg(feature = "loop")]
                             if loop_state.as_ref().is_some_and(|ls| ls.active) && !text.starts_with('/') {
                                 // Queue the message instead of dropping it.
@@ -1741,15 +1778,30 @@ pub async fn run_interactive(
                 match event {
                     AgentEvent::Reasoning(text) => {
                         renderer.set_avatar_state(avatar::AvatarState::Thinking);
-                        if !show_reasoning {
-                            continue;
+                        if show_reasoning {
+                            let mut ctx = make_run_ctx!();
+                            run_handlers::streaming::handle_reasoning(
+                                &mut ctx,
+                                &text,
+                                &mut was_reasoning,
+                            )?;
+                        } else {
+                            // dirge-fjqk: suppressed. Buffer the thinking so
+                            // Ctrl+O can reveal it, and print ONE compact
+                            // placeholder per burst (the animated avatar is the
+                            // live spinner). `was_reasoning` doubles as the
+                            // "burst started" flag — it's reset on the next
+                            // token / turn boundary, so the next think shows the
+                            // hint again. No DarkMagenta stream → no bleed.
+                            if !was_reasoning {
+                                renderer.write_line(
+                                    "  ◇ thinking… (Ctrl+O to view)",
+                                    theme::dim(),
+                                )?;
+                                was_reasoning = true;
+                            }
+                            reasoning_buf.push_str(&sanitize_output(&text));
                         }
-                        let mut ctx = make_run_ctx!();
-                        run_handlers::streaming::handle_reasoning(
-                            &mut ctx,
-                            &text,
-                            &mut was_reasoning,
-                        )?;
                     }
                     AgentEvent::Token(text) => {
                         // Caught-up check for the render coalescer, computed

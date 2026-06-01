@@ -623,9 +623,11 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                     }
                 }
                 TagEnd::Link if !in_table && !in_code_block => {
-                    // reset both underline + color back to current
-                    // paragraph color (set by flush_acc).
-                    acc.push_str("\x1b[24m\x1b[39m");
+                    // Underline off, then restore the stream's BASE color —
+                    // not `\x1b[39m` (terminal default), which would leave the
+                    // rest of the line mis-colored (dirge-08zx).
+                    acc.push_str("\x1b[24m");
+                    acc.push_str(&ansi_fg(base_color));
                 }
                 _ => {}
             },
@@ -655,7 +657,12 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                     acc.push('`');
                     acc.push_str(&t);
                     acc.push('`');
-                    acc.push_str("\x1b[39m");
+                    // Restore the stream's BASE color, not terminal default
+                    // (`\x1b[39m`) — otherwise the rest of the paragraph after
+                    // an inline code span renders in the wrong color
+                    // (dirge-08zx). The trailing `\x1b[0m` at line flush still
+                    // guarantees no cross-line bleed.
+                    acc.push_str(&ansi_fg(base_color));
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -846,9 +853,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(blob.contains("`fn_name`"));
+        // dirge-08zx: after an inline code span, the foreground returns to the
+        // stream's BASE color (here: agent), not terminal default (`\x1b[39m`),
+        // so the rest of the paragraph stays correctly colored.
         assert!(
-            blob.contains("\x1b[39m"),
-            "should reset fg after inline code"
+            blob.contains(&format!("`{}", ansi_fg(crate::ui::theme::agent()))),
+            "inline code should restore the base color after the closing backtick: {blob:?}"
+        );
+        assert!(
+            !blob.contains("\x1b[39m"),
+            "must not reset to terminal default fg (that mis-colors the rest of the line)"
         );
     }
 

@@ -310,7 +310,6 @@ pub(crate) fn render_tool_output(
 }
 
 /// Re-render a previously-collapsed result with NO line cap.
-#[allow(dead_code)]
 pub(crate) fn render_collapsed_in_full(
     renderer: &mut Renderer,
     collapsed: &CollapsedToolResult,
