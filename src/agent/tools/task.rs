@@ -78,7 +78,15 @@ pub enum SubagentChatEvent {
     Aborted { id: String },
 }
 
-pub type SubagentChatSender = mpsc::UnboundedSender<SubagentChatEvent>;
+/// dirge-02tn: subagent chat events are DISPLAY-ONLY — the subagent's
+/// real result returns through the normal tool-result path, not this
+/// channel. So the channel is BOUNDED and producers use `try_send`:
+/// under a sustained UI stall the live chat view degrades (a few dropped
+/// tokens/updates) but memory stays bounded and correctness is
+/// unaffected. 1024 is generous — normal streaming never fills it.
+pub const SUBAGENT_CHAT_CAP: usize = 1024;
+
+pub type SubagentChatSender = mpsc::Sender<SubagentChatEvent>;
 
 /// Receiver side of the subagent chat-event channel — exposed for
 /// the UI loop's `tokio::select!` arm. Only consumed in main.rs +
@@ -86,7 +94,7 @@ pub type SubagentChatSender = mpsc::UnboundedSender<SubagentChatEvent>;
 /// (TaskTool) lives in this module and `cargo check` sees only the
 /// definition site, not the cross-module consumer.
 #[allow(dead_code)]
-pub type SubagentChatReceiver = mpsc::UnboundedReceiver<SubagentChatEvent>;
+pub type SubagentChatReceiver = mpsc::Receiver<SubagentChatEvent>;
 
 /// dirge-ov2 Phase D: process-global sender for subagent chat
 /// events. Set once at interactive-session startup; every TaskTool
@@ -261,11 +269,11 @@ impl TaskTool {
     /// tool call on UI plumbing trouble.
     fn emit_chat(&self, event: SubagentChatEvent) {
         if let Some(sink) = &self.chat_sink {
-            let _ = sink.send(event);
+            let _ = sink.try_send(event);
             return;
         }
         if let Some(sink) = subagent_chat_sink() {
-            let _ = sink.send(event);
+            let _ = sink.try_send(event);
         }
     }
 }
@@ -435,9 +443,9 @@ impl Tool for TaskTool {
                 let final_event = match &chat_event {
                     SubagentChatEvent::Token { id, text } => {
                         if let Some(sink) = &chat_sink {
-                            let _ = sink.send(chat_event.clone());
+                            let _ = sink.try_send(chat_event.clone());
                         } else if let Some(sink) = subagent_chat_sink() {
-                            let _ = sink.send(chat_event.clone());
+                            let _ = sink.try_send(chat_event.clone());
                         }
                         SubagentChatEvent::Complete {
                             id: id.clone(),
@@ -447,9 +455,9 @@ impl Tool for TaskTool {
                     _ => chat_event.clone(),
                 };
                 if let Some(sink) = chat_sink {
-                    let _ = sink.send(final_event);
+                    let _ = sink.try_send(final_event);
                 } else if let Some(sink) = subagent_chat_sink() {
-                    let _ = sink.send(final_event);
+                    let _ = sink.try_send(final_event);
                 }
                 unregister_subagent_abort(&tid_for_task);
                 store_for_task.notify(&tid_for_task, state);
@@ -878,21 +886,47 @@ mod tests {
     /// Aborted events round-trip through the chat sink — the UI
     /// receiver sees them with the same id payload the producer
     /// sent. Guards the variant additions against accidental
+    /// dirge-02tn: the chat channel is BOUNDED — once full, `try_send`
+    /// drops (returns Err) rather than growing memory without bound.
+    /// Events are display-only, so a dropped event under a UI stall only
+    /// degrades the live view, never the subagent's result.
+    #[test]
+    fn subagent_chat_channel_is_bounded_and_drops_on_overflow() {
+        let (tx, _rx) = mpsc::channel::<SubagentChatEvent>(SUBAGENT_CHAT_CAP);
+        // Fill to capacity without draining (_rx kept alive so the channel
+        // stays open — otherwise try_send would fail Closed, not Full).
+        for i in 0..SUBAGENT_CHAT_CAP {
+            tx.try_send(SubagentChatEvent::Token {
+                id: "x".into(),
+                text: format!("{i}"),
+            })
+            .expect("sends within capacity succeed");
+        }
+        let overflow = tx.try_send(SubagentChatEvent::Token {
+            id: "x".into(),
+            text: "overflow".into(),
+        });
+        assert!(
+            overflow.is_err(),
+            "channel must be bounded — an over-capacity try_send drops"
+        );
+    }
+
     /// silent drops when the dispatch is refactored.
     #[test]
     fn subagent_token_event_routes_to_chat_slot() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentChatEvent>();
-        tx.send(SubagentChatEvent::Token {
+        let (tx, mut rx) = mpsc::channel::<SubagentChatEvent>(SUBAGENT_CHAT_CAP);
+        tx.try_send(SubagentChatEvent::Token {
             id: "a1".into(),
             text: "hello world".into(),
         })
         .unwrap();
-        tx.send(SubagentChatEvent::Reasoning {
+        tx.try_send(SubagentChatEvent::Reasoning {
             id: "a1".into(),
             text: "thinking".into(),
         })
         .unwrap();
-        tx.send(SubagentChatEvent::Aborted { id: "a1".into() })
+        tx.try_send(SubagentChatEvent::Aborted { id: "a1".into() })
             .unwrap();
 
         match rx.try_recv().unwrap() {
@@ -917,14 +951,14 @@ mod tests {
 
     #[test]
     fn subagent_tool_call_event_routes_to_chat_slot() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<SubagentChatEvent>();
-        tx.send(SubagentChatEvent::ToolCall {
+        let (tx, mut rx) = mpsc::channel::<SubagentChatEvent>(SUBAGENT_CHAT_CAP);
+        tx.try_send(SubagentChatEvent::ToolCall {
             id: "a1".into(),
             tool_name: "read".into(),
             args_summary: "path=/tmp/x".into(),
         })
         .unwrap();
-        tx.send(SubagentChatEvent::ToolResult {
+        tx.try_send(SubagentChatEvent::ToolResult {
             id: "a1".into(),
             tool_name: "read".into(),
             output_summary: "12 lines".into(),

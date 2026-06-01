@@ -1099,8 +1099,13 @@ async fn main() -> anyhow::Result<()> {
         // and creates / writes to chat windows. Process-global
         // sink so the TaskTool doesn't need plumbing through the
         // 13-site builder pipeline.
+        // dirge-02tn: bounded — display-only events, producers use
+        // try_send (drop on overflow) so a runaway subagent can't grow
+        // this channel without bound if the UI stalls.
         let (subagent_chat_tx, subagent_chat_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::agent::tools::task::SubagentChatEvent>();
+            tokio::sync::mpsc::channel::<crate::agent::tools::task::SubagentChatEvent>(
+                crate::agent::tools::task::SUBAGENT_CHAT_CAP,
+            );
         crate::agent::tools::task::set_subagent_chat_sink(subagent_chat_tx);
 
         // ui-redesign: spawn the system-load poller. The handle is

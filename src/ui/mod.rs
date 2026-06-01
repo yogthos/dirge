@@ -180,9 +180,7 @@ pub async fn run_interactive(
     // Spawn / Complete / Failed events here; the UI loop creates /
     // updates a dedicated chat window per subagent so the user can
     // switch to it via Ctrl-N/P/X.
-    mut subagent_chat_rx: tokio::sync::mpsc::UnboundedReceiver<
-        crate::agent::tools::task::SubagentChatEvent,
-    >,
+    mut subagent_chat_rx: tokio::sync::mpsc::Receiver<crate::agent::tools::task::SubagentChatEvent>,
     // ui-redesign: shared system-load snapshot. Polled in the
     // background; read at panel paint time. Cheap clone (Arc bump).
     sysload: crate::ui::sysload::SharedSysLoad,
