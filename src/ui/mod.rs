@@ -67,7 +67,8 @@ use crate::shell;
 #[cfg(feature = "plugin")]
 use crate::ui::agent_io::render_plugin_entry;
 use crate::ui::agent_io::{
-    apply_subagent_panel_event, capture_partial_on_abort, persist_turn_to_db, render_agent_stream,
+    RENDER_FRAME, apply_subagent_panel_event, capture_partial_on_abort, persist_turn_to_db,
+    render_agent_stream, should_render_token,
 };
 use crate::ui::chat_state::{ChatUiState, load_chat_ui_state, save_chat_ui_state};
 use crate::ui::colors::{c_agent, c_error, c_perm, c_tool, resolve_color};
@@ -294,6 +295,10 @@ pub async fn run_interactive(
     #[cfg(feature = "plugin")]
     let mut current_turn_index: u32 = 0;
     let mut response_start_line: Option<usize> = None;
+    // dirge-ufe0: timestamp of the last agent-token repaint, used to
+    // coalesce a burst of buffered tokens into ~60fps frames instead of
+    // one paint per token. `None` until the first paint of a stream.
+    let mut last_token_render: Option<std::time::Instant> = None;
     // dirge-ypg: reasoning text buffer + buffer-position anchor.
     // Mirrors the Token handler's `response_buf`/`response_start_line`
     // pair so reasoning streams render via the same buffered
@@ -1887,12 +1892,27 @@ pub async fn run_interactive(
                         // highlights (headings, code, accent) ride on
                         // their own theme accessors so they remain
                         // visible against any chosen base.
-                        render_agent_stream(
-                            &response_buf,
-                            &mut response_start_line,
-                            c_agent(),
-                            &mut renderer,
-                        )?;
+                        //
+                        // dirge-ufe0: coalesce repaints. A burst of
+                        // buffered tokens (the agent->UI channel holds up
+                        // to 256) would otherwise repaint once per token.
+                        // Paint only when caught up to the last queued
+                        // event (so the final token of a burst always
+                        // lands) or a frame interval elapsed (so a long
+                        // burst still streams visibly). The ToolCall/Done
+                        // arms flush response_buf, so a coalesced trailing
+                        // token still renders before the buffer clears.
+                        let pending = agent_rx.as_ref().map_or(0, |rx| rx.len());
+                        let since = last_token_render.map_or(RENDER_FRAME, |t| t.elapsed());
+                        if should_render_token(pending, since, RENDER_FRAME) {
+                            render_agent_stream(
+                                &response_buf,
+                                &mut response_start_line,
+                                c_agent(),
+                                &mut renderer,
+                            )?;
+                            last_token_render = Some(std::time::Instant::now());
+                        }
                         agent_line_started = true;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
@@ -1966,6 +1986,20 @@ pub async fn run_interactive(
                         )?;
                         last_tool_name = Some(name.to_string());
                         last_tool_call_id = Some(id.to_string());
+                        // dirge-ufe0: flush any trailing token the render
+                        // coalescer skipped (a ToolCall queued behind the
+                        // final tokens leaves them caught-up-but-unpainted)
+                        // before response_buf is cleared, so the streamed
+                        // text is on-screen above the tool chamber.
+                        if !response_buf.is_empty() {
+                            render_agent_stream(
+                                &response_buf,
+                                &mut response_start_line,
+                                c_agent(),
+                                &mut renderer,
+                            )?;
+                        }
+                        last_token_render = None;
                         if agent_line_started {
                             renderer.write_line("", Color::White)?;
                             agent_line_started = false;

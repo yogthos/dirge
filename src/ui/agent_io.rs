@@ -98,6 +98,28 @@ pub(crate) fn render_agent_stream(
     Ok(())
 }
 
+/// Frame interval for coalescing the agent token stream. At ~60 fps a
+/// burst of buffered tokens repaints at most once per frame instead of
+/// once per token (dirge-ufe0).
+pub(crate) const RENDER_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Decide whether the `AgentEvent::Token` arm should repaint now.
+///
+/// Renders when caught up to the last queued event (`pending == 0`) so
+/// the final token of a burst always lands, OR when at least one frame
+/// interval has elapsed since the last paint so a long burst still
+/// shows incremental progress. Otherwise the paint is skipped and the
+/// token only accumulates into `response_buf` — a later caught-up token
+/// (or the ToolCall/Done flush) renders it. Pure so the coalescing
+/// rule is unit-testable without driving the event loop.
+pub(crate) fn should_render_token(
+    pending: usize,
+    since_last_render: std::time::Duration,
+    frame: std::time::Duration,
+) -> bool {
+    pending == 0 || since_last_render >= frame
+}
+
 /// Capture whatever assistant text had streamed in before an abort,
 /// store it on the session as the assistant's reply (with a
 /// `[interrupted by user]` trailer so the LLM sees on next turn
@@ -298,4 +320,50 @@ pub(crate) fn render_plugin_entry(
         renderer.write_line(&format!("  {}", sanitize_output(&entry.data)), theme::dim())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn renders_when_caught_up_even_within_frame() {
+        // No more queued events → always paint so the last token of a
+        // burst lands, regardless of how recently we painted.
+        assert!(should_render_token(0, Duration::ZERO, RENDER_FRAME));
+        assert!(should_render_token(
+            0,
+            Duration::from_millis(1),
+            RENDER_FRAME
+        ));
+    }
+
+    #[test]
+    fn coalesces_mid_burst_within_frame() {
+        // More events still queued AND under one frame → skip (the
+        // skipped token rides along in response_buf for the next paint).
+        assert!(!should_render_token(
+            5,
+            Duration::from_millis(4),
+            RENDER_FRAME
+        ));
+        assert!(!should_render_token(1, Duration::ZERO, RENDER_FRAME));
+    }
+
+    #[test]
+    fn renders_mid_burst_after_frame_elapses() {
+        // Still queued but a frame elapsed → paint for incremental
+        // progress on a long burst.
+        assert!(should_render_token(
+            5,
+            Duration::from_millis(20),
+            RENDER_FRAME
+        ));
+    }
+
+    #[test]
+    fn renders_at_exact_frame_boundary() {
+        assert!(should_render_token(3, RENDER_FRAME, RENDER_FRAME));
+    }
 }
