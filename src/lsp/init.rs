@@ -10,7 +10,6 @@
 //! the JSON themselves.
 
 use std::path::Path;
-use std::time::Duration;
 
 use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DidChangeWatchedFilesClientCapabilities,
@@ -22,12 +21,6 @@ use lsp_types::{
 
 use crate::lsp::rpc::{RpcClient, RpcError};
 use crate::lsp::uri::path_to_file_uri;
-
-/// Time we'll wait for the server to answer `initialize`. Matches opencode's
-/// 45s ceiling — rust-analyzer in particular can take a moment when first
-/// indexing a large workspace.
-// dirge-onlr: single source — see crate::timeout::Timeouts.
-pub const INITIALIZE_TIMEOUT: Duration = crate::timeout::Timeouts::DEFAULT.lsp_initialize;
 
 /// Run the LSP initialize handshake against a connected [`RpcClient`].
 ///
@@ -63,9 +56,10 @@ pub async fn initialize(
         ..Default::default()
     };
 
-    let result: InitializeResult = client
-        .request("initialize", params, INITIALIZE_TIMEOUT)
-        .await?;
+    // dirge-onlr/4xgd: resolved [timeouts].lsp_initialize_secs. rust-analyzer
+    // can take a moment on first-touch indexing of a large workspace.
+    let init_timeout = crate::timeout::Timeouts::get().lsp_initialize;
+    let result: InitializeResult = client.request("initialize", params, init_timeout).await?;
 
     client.notify("initialized", serde_json::json!({})).await?;
 

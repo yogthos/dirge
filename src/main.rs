@@ -388,6 +388,11 @@ async fn main() -> anyhow::Result<()> {
     // theme is global state; setting it once at boot keeps every
     // render site from having to thread it explicitly.
     ui::theme::init(cfg.theme.as_deref().unwrap_or("phosphor"));
+    // dirge-4xgd: install the resolved per-operation timeouts process-wide
+    // (same set-once-at-boot rationale as the theme). Every consumer reads
+    // them via `timeout::Timeouts::get()` so a `[timeouts]` config override
+    // applies across LSP / MCP / bash / the stream loop from one place.
+    timeout::Timeouts::init(cfg.resolve_timeouts());
     let mut context = context::load(cli.resolve_no_context_files(&cfg));
 
     let default_prompt = cli

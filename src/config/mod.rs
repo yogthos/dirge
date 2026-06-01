@@ -143,6 +143,23 @@ pub struct ToolsConfig {
     pub task_output_inline_max_bytes: Option<usize>,
 }
 
+/// Override block for the named per-operation timeouts, under the
+/// config `timeouts` object. Every field is in seconds; unset fields
+/// fall back to [`crate::timeout::Timeouts::DEFAULT`]. Mirrors the field
+/// set of [`crate::timeout::Timeouts`] (dirge-onlr / dirge-4xgd) so the
+/// previously scattered magic-number timeouts have one configurable home.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct TimeoutsConfig {
+    pub stream_chunk_secs: Option<u64>,
+    pub tool_call_gap_secs: Option<u64>,
+    pub mcp_call_secs: Option<u64>,
+    pub mcp_init_secs: Option<u64>,
+    pub lsp_request_secs: Option<u64>,
+    pub lsp_initialize_secs: Option<u64>,
+    pub bash_secs: Option<u64>,
+}
+
 /// Per-server LSP configuration. All fields optional — unspecified fields
 /// fall back to the built-in defaults for the given `server_id`.
 ///
@@ -339,6 +356,10 @@ pub struct Config {
     /// re-focusing; higher to silence the reminder for routine
     /// multi-step refactors.
     pub context_depth_reminder_threshold: Option<usize>,
+    /// dirge-onlr / dirge-4xgd: per-operation timeout overrides. Unset
+    /// fields fall back to `crate::timeout::Timeouts::DEFAULT`. Merged in
+    /// `resolve_timeouts()` and installed process-wide at startup.
+    pub timeouts: Option<TimeoutsConfig>,
     #[cfg(feature = "lsp")]
     pub lsp: Option<LspConfig>,
     #[cfg(feature = "mcp")]
@@ -511,16 +532,28 @@ impl Config {
         }
     }
 
-    /// Resolve the named per-operation timeouts (dirge-onlr). Today this
-    /// returns the centralized defaults ([`crate::timeout::Timeouts`]) —
-    /// the single source of truth replacing the magic-number consts that
-    /// used to live in config, the stream loop, the MCP client, and the
-    /// LSP manager. A `[timeouts]` config override block + threading the
-    /// resolved values into LSP/MCP/bash construction is follow-up; this
-    /// accessor is the seam those overrides will merge into.
-    #[allow(clippy::unused_self)] // &self is the seam for future config merge
+    /// Resolve the named per-operation timeouts (dirge-onlr / dirge-4xgd):
+    /// each field is its `[timeouts]` override when set, else the built-in
+    /// default ([`crate::timeout::Timeouts::DEFAULT`]). Installed
+    /// process-wide at startup via `Timeouts::init`, so all consumers read
+    /// the same resolved values through `Timeouts::get()` — the single
+    /// source of truth replacing the magic-number consts that used to live
+    /// in config, the stream loop, the MCP client, and the LSP manager.
     pub fn resolve_timeouts(&self) -> crate::timeout::Timeouts {
-        crate::timeout::Timeouts::DEFAULT
+        let d = crate::timeout::Timeouts::DEFAULT;
+        let c = self.timeouts.clone().unwrap_or_default();
+        let or_default = |o: Option<u64>, default: std::time::Duration| {
+            o.map(std::time::Duration::from_secs).unwrap_or(default)
+        };
+        crate::timeout::Timeouts {
+            stream_chunk: or_default(c.stream_chunk_secs, d.stream_chunk),
+            tool_call_gap: or_default(c.tool_call_gap_secs, d.tool_call_gap),
+            mcp_call: or_default(c.mcp_call_secs, d.mcp_call),
+            mcp_init: or_default(c.mcp_init_secs, d.mcp_init),
+            lsp_request: or_default(c.lsp_request_secs, d.lsp_request),
+            lsp_initialize: or_default(c.lsp_initialize_secs, d.lsp_initialize),
+            bash: or_default(c.bash_secs, d.bash),
+        }
     }
 
     pub fn resolve_show_edit_diff(&self) -> bool {
@@ -752,6 +785,30 @@ pub fn load() -> Config {
 #[cfg(all(test, feature = "lsp"))]
 mod tests {
     use super::*;
+
+    /// dirge-4xgd: `[timeouts]` overrides merge onto Timeouts::DEFAULT;
+    /// unset fields keep their defaults.
+    #[test]
+    fn timeouts_override_merges_onto_defaults() {
+        let d = crate::timeout::Timeouts::DEFAULT;
+
+        // No block → all defaults.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        let t = cfg.resolve_timeouts();
+        assert_eq!(t.mcp_call, d.mcp_call);
+        assert_eq!(t.lsp_request, d.lsp_request);
+
+        // Partial block → named fields override, rest default.
+        let cfg: Config =
+            serde_json::from_str(r#"{ "timeouts": { "mcp_call_secs": 45, "bash_secs": 300 } }"#)
+                .unwrap();
+        let t = cfg.resolve_timeouts();
+        assert_eq!(t.mcp_call, std::time::Duration::from_secs(45));
+        assert_eq!(t.bash, std::time::Duration::from_secs(300));
+        // Untouched fields keep defaults.
+        assert_eq!(t.lsp_request, d.lsp_request);
+        assert_eq!(t.mcp_init, d.mcp_init);
+    }
 
     #[test]
     fn lsp_config_parses_as_bool() {

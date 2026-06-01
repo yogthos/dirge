@@ -93,10 +93,9 @@ impl SharedConnection {
 /// (e.g. waiting for stdin that never comes) would otherwise pin
 /// startup indefinitely. 10s is generous for legitimate inits — npm
 /// install-on-first-run servers take a few seconds; locally-running
-/// binaries respond in <100ms. Past the cap we abort and log.
-// dirge-onlr: single source — see crate::timeout::Timeouts.
-const MCP_INIT_TIMEOUT: std::time::Duration = crate::timeout::Timeouts::DEFAULT.mcp_init;
-
+/// binaries respond in <100ms. Past the cap we abort and log. The value
+/// is the resolved `[timeouts].mcp_init_secs` (dirge-onlr/4xgd).
+///
 /// Connect to one MCP server and wrap the connection in a
 /// shared, swappable container. Returns the `Arc<SharedConnection>`
 /// the manager + every McpTool clone holds.
@@ -104,12 +103,13 @@ pub async fn connect(
     server_name: String,
     config: &McpServerConfig,
 ) -> anyhow::Result<Arc<SharedConnection>> {
+    let init_timeout = crate::timeout::Timeouts::get().mcp_init;
     let inner = connect_inner(server_name.clone(), config);
-    match tokio::time::timeout(MCP_INIT_TIMEOUT, inner).await {
+    match tokio::time::timeout(init_timeout, inner).await {
         Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!(
             "MCP server {server_name:?} did not initialize within {}s — skipping",
-            MCP_INIT_TIMEOUT.as_secs(),
+            init_timeout.as_secs(),
         )),
     }
 }

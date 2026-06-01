@@ -246,7 +246,7 @@ impl ToolDyn for McpTool {
             // budget was 240s = 2 × 120s. dirge-onlr: the budget value
             // and the elapsed-aware accounting are now the shared
             // `Deadline` / `Timeouts` types.
-            let deadline = Deadline::start(crate::timeout::Timeouts::DEFAULT.mcp_call);
+            let deadline = Deadline::start(crate::timeout::Timeouts::get().mcp_call);
 
             let result = match try_call_with_reconnect(
                 &server_name,

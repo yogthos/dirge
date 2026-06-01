@@ -124,9 +124,9 @@ where
         // that interleave reasoning between tool-call deltas.
         let mut open_tool_calls: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        // dirge-onlr: single source — see crate::timeout::Timeouts.
-        const TOOL_CALL_GAP_TIMEOUT: std::time::Duration =
-            crate::timeout::Timeouts::DEFAULT.tool_call_gap;
+        // dirge-onlr/4xgd: resolved [timeouts].tool_call_gap_secs.
+        let tool_call_gap_timeout: std::time::Duration =
+            crate::timeout::Timeouts::get().tool_call_gap;
         // Wall-clock instant when the last forward-progress chunk
         // arrived. Used to compute the remaining gap budget while
         // a tool call is mid-assembly. Initialized to "now" so
@@ -160,7 +160,7 @@ where
             // chunk of any kind). Otherwise the configured
             // `chunk_timeout` is used as-is.
             let effective_timeout = if !open_tool_calls.is_empty() {
-                let remaining = TOOL_CALL_GAP_TIMEOUT.saturating_sub(last_chunk_at.elapsed());
+                let remaining = tool_call_gap_timeout.saturating_sub(last_chunk_at.elapsed());
                 let gap_budget = if remaining.is_zero() {
                     // The forward-progress window already
                     // expired between iterations. Fire the
@@ -189,7 +189,7 @@ where
                             format!(
                                 "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls)",
                                 t.as_secs(),
-                                TOOL_CALL_GAP_TIMEOUT.as_secs(),
+                                tool_call_gap_timeout.as_secs(),
                             )
                         } else {
                             format!(

@@ -15,6 +15,7 @@
 //!   MCP client, and the LSP manager. Config overrides merge onto
 //!   [`Timeouts::DEFAULT`] via `Config::resolve_timeouts`.
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Elapsed-aware budget for an operation and all of its retries.
@@ -121,7 +122,30 @@ impl Timeouts {
         lsp_initialize: Duration::from_secs(Self::DEFAULT_LSP_INITIALIZE_SECS),
         bash: Duration::from_secs(Self::DEFAULT_BASH_SECS),
     };
+
+    /// Install the process-wide resolved timeouts. Call once at startup
+    /// after config load (`Config::resolve_timeouts`). Subsequent calls
+    /// are ignored — same OnceLock-set-once convention as `ui::theme::init`
+    /// (dirge-4xgd). Threading the resolved struct through every subsystem
+    /// constructor would mean signature churn across LSP/MCP/bash/stream;
+    /// a startup-installed global is the lighter, idiomatic fit for
+    /// process-wide config that's read but never mutated after load.
+    pub fn init(resolved: Timeouts) {
+        let _ = RESOLVED.set(resolved);
+    }
+
+    /// The process-wide resolved timeouts, or [`Timeouts::DEFAULT`] when
+    /// `init` hasn't run (unit tests, early startup). Every consumer reads
+    /// its timeout through this so a `[timeouts]` config override applies
+    /// everywhere from one place.
+    pub fn get() -> Timeouts {
+        RESOLVED.get().copied().unwrap_or(Self::DEFAULT)
+    }
 }
+
+/// Process-wide resolved timeouts, installed once at startup by
+/// [`Timeouts::init`]. Read via [`Timeouts::get`].
+static RESOLVED: OnceLock<Timeouts> = OnceLock::new();
 
 impl Default for Timeouts {
     fn default() -> Self {

@@ -46,9 +46,11 @@ use crate::lsp::uri::path_to_file_uri_string;
 
 /// Time we'll let any non-initialize LSP request take. Generous — LSP servers
 /// can be slow on first-touch indexing — but bounded so a stuck server
-/// doesn't hold up the agent's turn forever.
-// dirge-onlr: single source — see crate::timeout::Timeouts.
-const REQUEST_TIMEOUT: Duration = crate::timeout::Timeouts::DEFAULT.lsp_request;
+/// doesn't hold up the agent's turn forever. Reads the resolved
+/// `[timeouts].lsp_request_secs` (dirge-onlr/4xgd).
+fn request_timeout() -> Duration {
+    crate::timeout::Timeouts::get().lsp_request
+}
 
 /// How a [`LspManager::touch_file`] call should handle diagnostics:
 /// - `None`: just send didOpen / didChange and return.
@@ -681,7 +683,7 @@ impl LspManager {
                 .request(
                     "textDocument/prepareCallHierarchy",
                     position_params(file, line, character),
-                    REQUEST_TIMEOUT,
+                    request_timeout(),
                 )
                 .await
             {
@@ -694,7 +696,7 @@ impl LspManager {
             match entry
                 .client
                 .rpc()
-                .request(method, json!({ "item": first }), REQUEST_TIMEOUT)
+                .request(method, json!({ "item": first }), request_timeout())
                 .await
             {
                 Ok(v) => out.push(v),
@@ -719,7 +721,7 @@ impl LspManager {
             match entry
                 .client
                 .rpc()
-                .request(method, params.clone(), REQUEST_TIMEOUT)
+                .request(method, params.clone(), request_timeout())
                 .await
             {
                 Ok(v) => out.push(v),

@@ -383,6 +383,34 @@ Provider name matching is case-insensitive (`anthropic` matches
 }
 ```
 
+## Operation timeouts
+
+Every other per-operation timeout is named in one place — the `timeouts`
+block — and installed process-wide at startup. Each field is in seconds;
+omitted fields keep their built-in default. (The streaming chunk timeout
+above is the one exception with richer per-provider precedence;
+`timeouts.stream_chunk_secs` acts as its global fallback.)
+
+| Field | Default | What it bounds |
+|---|---|---|
+| `stream_chunk_secs` | 300 | Per-chunk read deadline for a streaming LLM response (fallback for the per-provider key above) |
+| `tool_call_gap_secs` | 30 | Stall window while a tool call is mid-assembly in the stream |
+| `mcp_call_secs` | 120 | Total budget for one MCP tool call, including reconnect + retry |
+| `mcp_init_secs` | 10 | MCP server `initialize` handshake |
+| `lsp_request_secs` | 30 | Any non-`initialize` LSP request |
+| `lsp_initialize_secs` | 45 | LSP `initialize` handshake |
+| `bash_secs` | 120 | Default `bash` tool timeout when the call omits one |
+
+```json
+{
+  "timeouts": {
+    "mcp_call_secs": 60,
+    "lsp_initialize_secs": 90,
+    "bash_secs": 300
+  }
+}
+```
+
 ## Key bindings
 
 VSCode-style overrides for the global "command" keys. `keybindings` is an
