@@ -5,6 +5,14 @@
 
 use super::append_mode_reminder;
 use super::*;
+// Crate types/helpers the tests construct directly. Previously reached via
+// the parent module's `use` imports; now imported here since those moved
+// into the `agent_inner` / `loop_tools` children (dirge-4y4l stage 11c).
+use crate::agent::model_family::resolve_family;
+use crate::agent::tools::ToolCache;
+use crate::cli::Cli;
+use crate::config::Config;
+use crate::sandbox::Sandbox;
 use clap::Parser;
 
 #[test]

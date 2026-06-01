@@ -27,6 +27,13 @@ use crate::skill::{self, Skill};
 
 use super::build_session_search_tool;
 
+/// dirge-x949: wrap a batch of freshly-collected MCP tools into the
+/// `LoopTool` adapters the agent loop dispatches against, applying the
+/// same built-in-name collision filter `build_loop_tools` uses. Pulled
+/// out so background MCP loading (see main.rs) can inject server tools
+/// into an already-running agent *after* the UI is drawn, instead of
+/// blocking startup on `connect_all` + `collect_tools`.
+#[cfg(feature = "mcp")]
 pub async fn wrap_mcp_tools(
     mcp_tools: Vec<crate::extras::mcp::tool::McpTool>,
 ) -> Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> {
