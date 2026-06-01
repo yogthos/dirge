@@ -35,6 +35,7 @@ pub(super) mod error;
 pub(super) mod interjected;
 pub(super) mod notices;
 pub(super) mod streaming;
+pub(super) mod tool_call;
 pub(super) mod tool_result;
 
 // dirge-5h5: isolated repro harness for the parallel-read chamber
@@ -49,6 +50,7 @@ pub(super) use context_overflow::handle_context_overflow;
 pub(super) use done::handle_done;
 pub(super) use error::handle_error;
 pub(super) use interjected::handle_interjected;
+pub(super) use tool_call::handle_tool_call;
 pub(super) use tool_result::handle_tool_result;
 
 /// Bundle of frequently-mutated UI state borrowed by every extracted

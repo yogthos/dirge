@@ -66,9 +66,7 @@ use crate::session::{MessageRole, PermissionAllowEntry, Session};
 use crate::shell;
 #[cfg(feature = "plugin")]
 use crate::ui::agent_io::render_plugin_entry;
-use crate::ui::agent_io::{
-    apply_subagent_panel_event, capture_partial_on_abort, render_agent_stream,
-};
+use crate::ui::agent_io::{apply_subagent_panel_event, capture_partial_on_abort};
 use crate::ui::chat_state::{ChatUiState, load_chat_ui_state, save_chat_ui_state};
 use crate::ui::colors::{c_agent, c_error, c_perm, c_tool, resolve_color};
 use crate::ui::events::{render_session, sanitize_output};
@@ -1873,143 +1871,17 @@ pub async fn run_interactive(
                         )?;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
-                        // Feed the left-panel [ACTIVITY] ticker (newest last,
-                        // bounded ring).
-                        tool_activity
-                            .push_back(crate::ui::panel_data::tool_call_label(&name, &args));
-                        while tool_activity.len() > TOOL_ACTIVITY_CAP {
-                            tool_activity.pop_front();
-                        }
-                        // dirge-5h5: log entry state so the parallel-
-                        // read race can be reconstructed offline.
-                        tracing::trace!(
-                            target: "dirge::ui::chamber",
-                            event = "tool_call_in",
-                            id = %id,
-                            name = %name,
-                            last_tool_call_id_before = ?last_tool_call_id,
-                            tool_chamber_open_before = tool_chamber_open,
-                            chamber_top_start_before = ?chamber_top_start,
-                            chamber_top_end_before = ?chamber_top_end,
-                            buffer_len = renderer.buffer_len(),
-                            "ToolCall handler entry"
-                        );
-                        was_reasoning = false;
-                        // Phase 3: persist as structured entry. Start
-                        // in Interrupted state so that if the user
-                        // aborts before the result arrives, the saved
-                        // session captures the right state. The
-                        // matching `ToolResult` flips it to Completed.
-                        tool_calls_buf.push(crate::session::ToolCallEntry {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                            args: args.clone(),
-                            state: crate::session::ToolCallState::Interrupted,
-                        });
-                        // Track for the abort-trailer warning: when
-                        // the user later hits Ctrl+C / Esc, the
-                        // saved partial reply notes how many tool
-                        // calls ran (and didn't have their results
-                        // preserved in the message text).
-                        tool_calls_this_run = tool_calls_this_run.saturating_add(1);
-                        renderer.set_avatar_state(avatar::AvatarState::from_tool_name(&name));
-                        #[cfg(feature = "experimental-ui-terminal-tab")]
-                        renderer.set_last_tool_name(&name);
-                        // If a previous tool's chamber never closed
-                        // (errored without a ToolResult, etc.), close
-                        // it before opening the new one. Without this
-                        // the new `╭─ NAME ─ args` lands inside the
-                        // stale chamber.
-                        //
-                        // Use PASSIVE close, not abort. A new ToolCall
-                        // arriving over a stale chamber is chamber
-                        // turnover, not a denial event — the prior
-                        // tool may have finished cleanly and just
-                        // not flipped the flags yet (race, or a code
-                        // path that emitted ToolCall before the
-                        // previous ToolResult landed). Painting
-                        // "⚠ tool denied · aborted · no result" on it
-                        // would falsely brand a healthy tool call as
-                        // refused. The other three abort callers
-                        // (Error / Interjected / ContextOverflow) are
-                        // genuine denial-shaped events and stay on
-                        // `close_tool_chamber_if_open`.
-                        close_tool_chamber_passive(
-                            &mut renderer,
-                            &mut last_tool_name,
-                            &mut tool_chamber_open,
-                            &mut chamber_top_start,
-                            &mut chamber_top_end,
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::handle_tool_call(
+                            &mut ctx,
+                            &id,
+                            &name,
+                            &args,
+                            &mut was_reasoning,
+                            &mut last_token_render,
+                            &mut tool_activity,
+                            TOOL_ACTIVITY_CAP,
                         )?;
-                        last_tool_name = Some(name.to_string());
-                        last_tool_call_id = Some(id.to_string());
-                        // dirge-ufe0: flush any trailing token the render
-                        // coalescer skipped (a ToolCall queued behind the
-                        // final tokens leaves them caught-up-but-unpainted)
-                        // before response_buf is cleared, so the streamed
-                        // text is on-screen above the tool chamber.
-                        if !response_buf.is_empty() {
-                            render_agent_stream(
-                                &response_buf,
-                                &mut response_start_line,
-                                c_agent(),
-                                &mut renderer,
-                            )?;
-                        }
-                        last_token_render = None;
-                        if agent_line_started {
-                            renderer.write_line("", Color::White)?;
-                            agent_line_started = false;
-                        }
-                        response_buf.clear();
-                        response_start_line = None;
-                        reasoning_buf.clear();
-                        reasoning_start_line = None;
-                        // Tool-call line: rounded chamber TOP border
-                        // with the tool name on it. Output lines below
-                        // get `│ ` chamber rows; the chamber is closed
-                        // by `╰────╯` after the ToolResult. Header
-                        // border pads with dashes out to the frame
-                        // width so it visually mates with the closing
-                        // bottom border (matching btop's framed cards).
-                        let upper = name.to_ascii_uppercase();
-                        // Record the buffer position BEFORE the
-                        // spacer + header — used by passive close
-                        // to drop the chamber entirely if no body
-                        // content follows (parallel tool calls).
-                        chamber_top_start = Some(renderer.buffer_len());
-                        // Blank line BEFORE the chamber top so the eye
-                        // has an anchor between dense prior output (a
-                        // permission alert + "allowed ..." lines) and
-                        // the new tool chamber. Without it, the
-                        // chamber's ╭─ tended to sit pressed against
-                        // the previous line and on small terminals
-                        // the ╭ row could scroll off-screen while the
-                        // chamber's content rows stayed visible —
-                        // looking like a "cut off at top" chamber.
-                        renderer.write_line("", Color::White)?;
-                        let raw_value = format_tool_banner_value(&name, &args);
-                        let raw_value = sanitize_output(&raw_value).into_string();
-                        let (frame_w, _) = chamber_widths(&renderer);
-                        let header = fit_banner_header(&upper, &raw_value, frame_w);
-                        renderer.write_line(&header, c_tool())?;
-                        chamber_top_end = Some(renderer.buffer_len());
-                        tool_chamber_open = true;
-                        tracing::trace!(
-                            target: "dirge::ui::chamber",
-                            event = "tool_call_painted",
-                            id = %id,
-                            name = %name,
-                            chamber_top_start_after = ?chamber_top_start,
-                            chamber_top_end_after = ?chamber_top_end,
-                            buffer_len = renderer.buffer_len(),
-                            "ToolCall TOP painted"
-                        );
-
-                        // Note: on-tool-start fires from HookedToolDyn now,
-                        // around the actual tool invocation. The UI no
-                        // longer dispatches it here — that would double-
-                        // fire the hook per tool call.
                     }
                     AgentEvent::ToolStarted { .. } => {
                         // No UI work yet — the chamber TOP is
