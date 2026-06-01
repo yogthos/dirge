@@ -72,6 +72,31 @@ default = [
     'semantic-cpp',
     'semantic-elixir',
 ]
+# Default feature set minus `plugin` (dirge-4xgd / Windows release).
+# The Janet bindings don't build on Windows MSVC: `evil_janet` references
+# `_setjmp` (absent on MSVC) and `janetrs` 0.8 passes an i64 to the Windows
+# `fseek`, whose `offset` is `c_long` (i32). The release workflow builds the
+# Windows target with this set; Windows users can `cargo install
+# --no-default-features --features windows-default` for the same result
+# (everything except Janet-backed plugins).
+windows-default = [
+    'loop',
+    'git-worktree',
+    'mcp',
+    'lsp',
+    'acp',
+    'semantic-ts',
+    'semantic-python',
+    'semantic-bash',
+    'semantic-clojure',
+    'semantic-go',
+    'semantic-ruby',
+    'semantic-rust',
+    'semantic-java',
+    'semantic-c',
+    'semantic-cpp',
+    'semantic-elixir',
+]
 loop = []
 git-worktree = []
 mcp = [

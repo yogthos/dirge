@@ -25,8 +25,12 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
+          # Windows MSVC can't build the Janet `plugin` feature
+          # (evil_janet needs _setjmp; janetrs 0.8 passes i64 to the
+          # Windows fseek). Build the default set minus plugin.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            cargo_flags: "--no-default-features --features windows-default"
 
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +46,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_flags }}
 
       # Package the `dirge` binary (named via [[bin]] regardless of the
       # `dirge-agent` crate name). Windows → .zip, Unix → .tar.gz; emit a

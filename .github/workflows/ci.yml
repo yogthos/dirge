@@ -86,3 +86,26 @@ jobs:
         # all-features (worst-case interaction).
         if: matrix.name == 'default' || matrix.name == 'plugin' || matrix.name == 'all-features'
         run: cargo test --bin dirge ${{ matrix.features }}
+
+  # Windows is only built at release time (release.yml, tag-triggered),
+  # so platform-specific breakage used to slip through until a release.
+  # The Janet `plugin` feature can't build on MSVC (evil_janet/_setjmp,
+  # janetrs fseek i64), so Windows ships the `windows-default` set
+  # (default minus plugin). Build + test it on every PR to catch
+  # regressions in that configuration before they reach a release.
+  windows:
+    name: build (windows-default)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build --bin dirge --no-default-features --features windows-default
+
+      - name: Test
+        run: cargo test --bin dirge --no-default-features --features windows-default
