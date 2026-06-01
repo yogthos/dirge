@@ -67,8 +67,7 @@ use crate::shell;
 #[cfg(feature = "plugin")]
 use crate::ui::agent_io::render_plugin_entry;
 use crate::ui::agent_io::{
-    RENDER_FRAME, apply_subagent_panel_event, capture_partial_on_abort, render_agent_stream,
-    should_render_token,
+    apply_subagent_panel_event, capture_partial_on_abort, render_agent_stream,
 };
 use crate::ui::chat_state::{ChatUiState, load_chat_ui_state, save_chat_ui_state};
 use crate::ui::colors::{c_agent, c_error, c_perm, c_tool, resolve_color};
@@ -1845,97 +1844,33 @@ pub async fn run_interactive(
                         if !show_reasoning {
                             continue;
                         }
-                        let safe = sanitize_output(&text);
-                        reasoning_buf.push_str(&safe);
-                        // Shared pipeline with Token. DarkMagenta as
-                        // the base color signals "thinking" voice;
-                        // markdown highlights (bold / italic / inline
-                        // code / headings / blockquotes) still render
-                        // via theme accessors so the visual
-                        // hierarchy reads consistently across both
-                        // streams.
-                        render_agent_stream(
-                            &reasoning_buf,
-                            &mut reasoning_start_line,
-                            Color::DarkMagenta,
-                            &mut renderer,
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::streaming::handle_reasoning(
+                            &mut ctx,
+                            &text,
+                            &mut was_reasoning,
                         )?;
-                        agent_line_started = true;
-                        was_reasoning = true;
                     }
                     AgentEvent::Token(text) => {
-                        renderer.set_avatar_state(avatar::AvatarState::Speaking);
-                        if was_reasoning {
-                            renderer.write_line("", Color::White)?;
-                            was_reasoning = false;
-                            response_buf.clear();
-                            response_start_line = None;
-                            // End-of-reasoning marker. Keep the
-                            // reasoning rendered in the scroll
-                            // (committed via the Reasoning handler's
-                            // render_viewport); just stop tracking it
-                            // so the next reasoning burst (if any)
-                            // anchors at a fresh buffer position
-                            // below the content about to stream.
-                            // `agent_line_started` is reset to true
-                            // by `render_agent_stream` below.
-                            reasoning_buf.clear();
-                            reasoning_start_line = None;
-                        }
-                        let safe = sanitize_output(&text);
-                        response_buf.push_str(&safe);
-
-                        // Stream this token into the per-turn batcher
-                        // and accumulator. When the batcher crosses its
-                        // threshold, dispatch `on-message-update` with
-                        // the cumulative text so far. The batcher's
-                        // batch covers only the *new* tokens since the
-                        // last update; current_turn_text is the *full*
-                        // turn text for the closing on-turn-end event.
-                        #[cfg(feature = "plugin")]
-                        if let Some(pm) = plugin_manager {
-                            current_turn_text.push_str(&text);
-                            if token_batcher.push(&text).is_some() {
-                                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
-                                let _ = mgr.dispatch(
-                                    "on-message-update",
-                                    &format!(
-                                        "@{{:index {} :partial \"{}\"}}",
-                                        current_turn_index,
-                                        crate::plugin::escape_janet_string(&current_turn_text),
-                                    ),
-                                );
-                            }
-                        }
-
-                        // Shared pipeline with Reasoning. theme::agent()
-                        // as the base color — switching themes shifts
-                        // the agent's voice in one place; markdown
-                        // highlights (headings, code, accent) ride on
-                        // their own theme accessors so they remain
-                        // visible against any chosen base.
-                        //
-                        // dirge-ufe0: coalesce repaints. A burst of
-                        // buffered tokens (the agent->UI channel holds up
-                        // to 256) would otherwise repaint once per token.
-                        // Paint only when caught up to the last queued
-                        // event (so the final token of a burst always
-                        // lands) or a frame interval elapsed (so a long
-                        // burst still streams visibly). The ToolCall/Done
-                        // arms flush response_buf, so a coalesced trailing
-                        // token still renders before the buffer clears.
+                        // Caught-up check for the render coalescer, computed
+                        // before ctx borrows the render state (dirge-ufe0).
                         let pending = agent_rx.as_ref().map_or(0, |rx| rx.len());
-                        let since = last_token_render.map_or(RENDER_FRAME, |t| t.elapsed());
-                        if should_render_token(pending, since, RENDER_FRAME) {
-                            render_agent_stream(
-                                &response_buf,
-                                &mut response_start_line,
-                                c_agent(),
-                                &mut renderer,
-                            )?;
-                            last_token_render = Some(std::time::Instant::now());
-                        }
-                        agent_line_started = true;
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::streaming::handle_token(
+                            &mut ctx,
+                            &text,
+                            &mut was_reasoning,
+                            &mut last_token_render,
+                            pending,
+                            #[cfg(feature = "plugin")]
+                            plugin_manager,
+                            #[cfg(feature = "plugin")]
+                            &mut token_batcher,
+                            #[cfg(feature = "plugin")]
+                            &mut current_turn_text,
+                            #[cfg(feature = "plugin")]
+                            current_turn_index,
+                        )?;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
                         // Feed the left-panel [ACTIVITY] ticker (newest last,

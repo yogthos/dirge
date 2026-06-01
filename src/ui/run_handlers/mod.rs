@@ -34,6 +34,7 @@ pub(super) mod done;
 pub(super) mod error;
 pub(super) mod interjected;
 pub(super) mod notices;
+pub(super) mod streaming;
 pub(super) mod tool_result;
 
 // dirge-5h5: isolated repro harness for the parallel-read chamber
