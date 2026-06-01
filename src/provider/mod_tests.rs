@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::ProviderEntry;
 use rig::client::CompletionClient;
 use std::collections::HashMap;
 
