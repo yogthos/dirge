@@ -1,4 +1,5 @@
 use super::*;
+use rig::client::CompletionClient;
 use std::collections::HashMap;
 
 /// Build an env-lookup closure backed by a HashMap. Avoids

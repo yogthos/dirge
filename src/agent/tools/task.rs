@@ -629,14 +629,14 @@ mod tests {
         // forces the session_id audit per the docstring above.
         let _tool: TaskTool = mock_tool();
 
-        // The btw_query path lives in provider/mod.rs. The build
+        // The btw_query path lives in provider/dispatch.rs. The build
         // inside it is `AgentBuilder::new(m).preamble(...).build()`
         // with no `.tool(...)` calls — verify by source inspection
         // that no tool-attaching call has crept in.
-        let provider_src = include_str!("../../provider/mod.rs");
+        let provider_src = include_str!("../../provider/dispatch.rs");
         let btw_idx = provider_src
             .find("pub async fn btw_query")
-            .expect("btw_query must exist in provider/mod.rs");
+            .expect("btw_query must exist in provider/dispatch.rs");
         let btw_end = provider_src[btw_idx..]
             .find("\n    }\n")
             .map(|i| btw_idx + i)
