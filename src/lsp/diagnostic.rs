@@ -1,9 +1,11 @@
 //! Diagnostic pretty-printing + report blocks for tool output.
 //!
-//! Mirrors opencode's `lsp/diagnostic.ts`: only ERROR severity surfaces in
-//! the report, max 20 per file (overflow becomes "... and N more"), wrapped
-//! in `<diagnostics file="...">` tags that the LLM recognizes as
-//! out-of-band tool context.
+//! Only ERROR severity surfaces in the report, capped at a few per file
+//! (overflow becomes "... and N more"), wrapped in `<diagnostics file="...">`
+//! tags that the LLM recognizes as out-of-band tool context. A file with an
+//! overwhelming error count (a flood — almost never caused by one edit;
+//! usually an unsupported language or broad pre-existing breakage) collapses
+//! to a one-line summary instead of a wall of noise (dirge-3fu0).
 //!
 //! The full agent-facing block (current file + capped other files) is
 //! built by [`build_report_block`]. That's what `write` / `edit` tools
@@ -15,9 +17,17 @@ use std::path::{Path, PathBuf};
 use lsp_types::{Diagnostic, DiagnosticSeverity};
 
 /// Max diagnostics rendered per file before truncating with a "... and N
-/// more" footer. Bounds blast radius for a generated file with hundreds of
-/// errors.
-const MAX_PER_FILE: usize = 20;
+/// more" footer. Kept small: a single edit rarely introduces many genuine
+/// errors, and a wall of them is noise, not signal (dirge-3fu0).
+const MAX_PER_FILE: usize = 8;
+
+/// Above this many errors in one file, stop enumerating and emit a one-line
+/// summary instead. An edit to one file practically never *causes* this
+/// many errors — it almost always means the language server doesn't fully
+/// understand the file (e.g. Janet → every symbol "Unresolved"), or the
+/// file has broad pre-existing breakage. Either way, dumping a wall of
+/// per-error lines the agent's edit didn't cause is the opposite of useful.
+const FLOOD_THRESHOLD: usize = 40;
 
 /// Max additional files surfaced in the project-wide section beyond the
 /// just-edited file. Stops a single edit from dumping the entire project's
@@ -53,6 +63,19 @@ pub fn report(file: &str, issues: &[Diagnostic]) -> Option<String> {
         return None;
     }
     let total = errors.len();
+    // Flood: too many to be from a single edit. Summarize instead of
+    // enumerating — a wall of likely-unrelated errors (unsupported language
+    // / pre-existing breakage) isn't actionable and drowns out real signal.
+    if total > FLOOD_THRESHOLD {
+        let preview: Vec<String> = errors.iter().take(3).map(|d| pretty(d)).collect();
+        return Some(format!(
+            "<diagnostics file=\"{file}\">\n\
+             {total} errors reported — too many to be from a single edit. The language server may \
+             not fully support this file, or it has broad pre-existing issues; not enumerating. \
+             Fix the root cause rather than chasing each line. First few:\n{}\n</diagnostics>",
+            preview.join("\n")
+        ));
+    }
     let limited = errors.iter().take(MAX_PER_FILE);
     let mut body: Vec<String> = limited.map(|d| pretty(d)).collect();
     if total > MAX_PER_FILE {
@@ -255,6 +278,37 @@ mod tests {
         assert!(block.contains("err 0"));
         assert!(block.contains(&format!("err {}", MAX_PER_FILE - 1)));
         assert!(!block.contains("err 25"));
+    }
+
+    // dirge-3fu0: a flood of errors (more than FLOOD_THRESHOLD) collapses to
+    // a concise summary — not a wall of per-error lines — because an edit to
+    // one file practically never causes that many genuine errors (it signals
+    // the LSP doesn't understand the file, or broad pre-existing breakage).
+    #[test]
+    fn report_floods_collapse_to_summary() {
+        let issues: Vec<Diagnostic> = (0..FLOOD_THRESHOLD + 200)
+            .map(|i| {
+                diag(
+                    DiagnosticSeverity::ERROR,
+                    i as u32,
+                    0,
+                    "Unresolved symbol: X",
+                )
+            })
+            .collect();
+        let block = report("core.janet", &issues).unwrap();
+        let total = FLOOD_THRESHOLD + 200;
+        // Reports the true count + the "not enumerating" framing.
+        assert!(block.contains(&format!("{total} errors reported")));
+        assert!(block.contains("not enumerating"));
+        assert!(block.contains("root cause"));
+        // Shows only a tiny preview, NOT MAX_PER_FILE lines.
+        assert!(
+            block.lines().count() < 8,
+            "flood must stay compact: {block}"
+        );
+        // No "... and N more" footer (that's the enumerate path).
+        assert!(!block.contains("... and"));
     }
 
     #[test]
