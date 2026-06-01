@@ -325,6 +325,10 @@ fn acquire_usage_lock(lock_path: &PathBuf) -> Result<UsageLock, String> {
                 {
                     let pid: Result<u32, _> = content.trim().parse();
                     if let Ok(pid) = pid {
+                        // pid feeds only the Unix liveness check; unused
+                        // on non-unix (no kill(2) probe there).
+                        #[cfg(not(unix))]
+                        let _ = pid;
                         // Check if process is still alive.
                         #[cfg(unix)]
                         {
