@@ -29,7 +29,7 @@ use crate::ui::agent_io::{persist_turn_to_db, render_agent_stream};
 use crate::ui::colors::{c_agent, c_error};
 use crate::ui::events::sanitize_output;
 use crate::ui::renderer::Renderer;
-use crate::ui::run_handlers::RunCtx;
+use crate::ui::run_handlers::{AgentBuildDeps, RunCtx};
 use crate::ui::slash::{CompressOutcome, handle_compress};
 use crate::ui::theme;
 use crate::ui::tool_display::close_tool_chamber_if_open;
@@ -42,23 +42,29 @@ pub(crate) async fn handle_context_overflow(
     was_reasoning: &mut bool,
     is_running: &mut bool,
     agent: &mut AnyAgent,
-    client: &AnyClient,
     context: &mut ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    question_tx: &Option<QuestionSender>,
-    plan_tx: &Option<PlanSwitchSender>,
-    bg_store: &Option<BackgroundStore>,
-    sandbox: &Sandbox,
+    // dirge-4y4l: the ~10 build_agent inputs bundled (see AgentBuildDeps).
+    deps: &AgentBuildDeps<'_>,
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
     agent_interject: &mut Option<mpsc::Sender<()>>,
     agent_cancel: &mut Option<mpsc::Sender<()>>,
     interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
-    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
-    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
 ) -> anyhow::Result<()> {
+    // Rebind the bundled deps to locals so the body below reads unchanged.
+    let client = deps.client;
+    let permission = deps.permission;
+    let ask_tx = deps.ask_tx;
+    let question_tx = deps.question_tx;
+    let plan_tx = deps.plan_tx;
+    let bg_store = deps.bg_store;
+    let sandbox = deps.sandbox;
+    #[cfg(feature = "mcp")]
+    let mcp_manager = deps.mcp_manager;
+    #[cfg(feature = "semantic")]
+    let semantic_manager = deps.semantic_manager;
+    #[cfg(feature = "lsp")]
+    let lsp_manager = deps.lsp_manager;
     // Audit H17: the streaming run hit a context-
     // length error. Auto-compact then re-spawn with
     // the same prompt against the now-compacted

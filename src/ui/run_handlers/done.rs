@@ -16,27 +16,17 @@ use compact_str::CompactString;
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
-use crate::agent::tools::background::BackgroundStore;
-use crate::agent::tools::plan::PlanSwitchSender;
-use crate::agent::tools::question::QuestionSender;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
-#[cfg(feature = "mcp")]
-use crate::extras::mcp::McpClientManager;
-use crate::permission::ask::AskSender;
-use crate::permission::checker::PermCheck;
 #[cfg(feature = "plugin")]
 use crate::plugin::PluginManager;
-use crate::provider::{AnyAgent, AnyClient};
-use crate::sandbox::Sandbox;
-#[cfg(feature = "semantic")]
-use crate::semantic::SemanticManager;
+use crate::provider::AnyAgent;
 use crate::session::MessageRole;
 use crate::ui::agent_io::persist_turn_to_db;
 use crate::ui::avatar;
 use crate::ui::colors::{c_agent, c_error};
 use crate::ui::events::render_session;
-use crate::ui::run_handlers::RunCtx;
+use crate::ui::run_handlers::{AgentBuildDeps, RunCtx};
 use crate::ui::slash::handle_compress;
 use crate::ui::theme;
 use crate::ui::tool_display::{chamber_bottom, chamber_widths};
@@ -77,28 +67,34 @@ pub(crate) async fn handle_done(
     was_reasoning: &mut bool,
     is_running: &mut bool,
     agent: &mut AnyAgent,
-    client: &AnyClient,
     context: &mut ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    question_tx: &Option<QuestionSender>,
-    plan_tx: &Option<PlanSwitchSender>,
-    bg_store: &Option<BackgroundStore>,
-    sandbox: &Sandbox,
+    // dirge-4y4l: the ~10 build_agent inputs bundled (see AgentBuildDeps).
+    deps: &AgentBuildDeps<'_>,
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
     agent_interject: &mut Option<mpsc::Sender<()>>,
     agent_cancel: &mut Option<mpsc::Sender<()>>,
     interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
-    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
-    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
     #[cfg(feature = "plugin")] plugin_manager: Option<
         &std::sync::Arc<std::sync::Mutex<PluginManager>>,
     >,
     #[cfg(feature = "loop")] loop_bits: LoopBits<'_>,
     #[cfg(feature = "git-worktree")] worktree_bits: WorktreeBits<'_>,
 ) -> anyhow::Result<()> {
+    // Rebind the bundled deps to locals so the body below reads unchanged.
+    let client = deps.client;
+    let permission = deps.permission;
+    let ask_tx = deps.ask_tx;
+    let question_tx = deps.question_tx;
+    let plan_tx = deps.plan_tx;
+    let bg_store = deps.bg_store;
+    let sandbox = deps.sandbox;
+    #[cfg(feature = "mcp")]
+    let mcp_manager = deps.mcp_manager;
+    #[cfg(feature = "semantic")]
+    let semantic_manager = deps.semantic_manager;
+    #[cfg(feature = "lsp")]
+    let lsp_manager = deps.lsp_manager;
     *was_reasoning = false;
     // A successful turn must not leave a chamber
     // half-painted. If anything slipped through

@@ -503,6 +503,29 @@ pub async fn run_interactive(
         };
     }
 
+    // dirge-4y4l: bundle the shared build_agent inputs so the agent-rebuild
+    // handlers (done / context_overflow / context_compacted) take one
+    // `&AgentBuildDeps` instead of ~10 individual params.
+    macro_rules! make_agent_build_deps {
+        () => {
+            run_handlers::AgentBuildDeps {
+                client: &client,
+                permission: &permission,
+                ask_tx: &ask_tx,
+                question_tx: &question_tx,
+                plan_tx: &plan_tx,
+                bg_store: &bg_store,
+                sandbox: &sandbox,
+                #[cfg(feature = "mcp")]
+                mcp_manager: mcp_manager.as_ref(),
+                #[cfg(feature = "semantic")]
+                semantic_manager,
+                #[cfg(feature = "lsp")]
+                lsp_manager: lsp_manager.as_ref(),
+            }
+        };
+    }
+
     render_session(&mut renderer, session, cli, cfg, context)?;
     renderer.draw_bottom(
         &input,
@@ -2087,25 +2110,13 @@ pub async fn run_interactive(
                             &mut was_reasoning,
                             &mut is_running,
                             &mut agent,
-                            &client,
                             context,
-                            &permission,
-                            &ask_tx,
-                            &question_tx,
-                            &plan_tx,
-                            &bg_store,
-                            &sandbox,
+                            &make_agent_build_deps!(),
                             &mut agent_rx,
                             &mut agent_abort,
                             &mut agent_interject,
                             &mut agent_cancel,
                             &interjection_queue,
-                            #[cfg(feature = "mcp")]
-                            mcp_manager.as_ref(),
-                            #[cfg(feature = "semantic")]
-                            semantic_manager,
-                            #[cfg(feature = "lsp")]
-                            lsp_manager.as_ref(),
                             #[cfg(feature = "plugin")]
                             plugin_manager,
                             #[cfg(feature = "loop")]
@@ -2172,25 +2183,13 @@ pub async fn run_interactive(
                             &mut was_reasoning,
                             &mut is_running,
                             &mut agent,
-                            &client,
                             context,
-                            &permission,
-                            &ask_tx,
-                            &question_tx,
-                            &plan_tx,
-                            &bg_store,
-                            &sandbox,
+                            &make_agent_build_deps!(),
                             &mut agent_rx,
                             &mut agent_abort,
                             &mut agent_interject,
                             &mut agent_cancel,
                             &interjection_queue,
-                            #[cfg(feature = "mcp")]
-                            mcp_manager.as_ref(),
-                            #[cfg(feature = "semantic")]
-                            semantic_manager,
-                            #[cfg(feature = "lsp")]
-                            lsp_manager.as_ref(),
                         ).await?;
                     }
                     AgentEvent::Error(e) => {

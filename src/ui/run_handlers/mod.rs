@@ -10,11 +10,23 @@
 //!
 //! Behavior is identical to the inline code; this is a pure refactor.
 
+use crate::agent::tools::background::BackgroundStore;
+use crate::agent::tools::plan::PlanSwitchSender;
+use crate::agent::tools::question::QuestionSender;
 use crate::cli::Cli;
 use crate::config::Config;
+use crate::permission::ask::AskSender;
+use crate::permission::checker::PermCheck;
+use crate::provider::AnyClient;
+use crate::sandbox::Sandbox;
 use crate::session::Session;
 use crate::ui::renderer::Renderer;
 use crate::ui::tool_display::CollapsedToolResult;
+
+#[cfg(feature = "mcp")]
+use crate::extras::mcp::McpClientManager;
+#[cfg(feature = "semantic")]
+use crate::semantic::SemanticManager;
 
 pub(super) mod context_overflow;
 pub(super) mod done;
@@ -64,4 +76,29 @@ pub(super) struct RunCtx<'a> {
     pub last_user_prompt: &'a mut String,
     pub cli: &'a Cli,
     pub cfg: &'a Config,
+}
+
+/// Shared immutable inputs to [`crate::provider::build_agent`], bundled so
+/// the agent-rebuild handlers (`done`, `context_overflow`,
+/// `context_compacted`) don't each thread ~10 individual parameters
+/// through their signatures (dirge-4y4l). Built once per dispatch via the
+/// `make_agent_build_deps!` macro in `run_interactive`; handlers destructure
+/// it back into locals at the top so their bodies read unchanged.
+///
+/// All fields are cheap references / `Option<&_>` (Copy), so destructuring
+/// a `&AgentBuildDeps` copies them out without moving.
+pub(crate) struct AgentBuildDeps<'a> {
+    pub client: &'a AnyClient,
+    pub permission: &'a Option<PermCheck>,
+    pub ask_tx: &'a Option<AskSender>,
+    pub question_tx: &'a Option<QuestionSender>,
+    pub plan_tx: &'a Option<PlanSwitchSender>,
+    pub bg_store: &'a Option<BackgroundStore>,
+    pub sandbox: &'a Sandbox,
+    #[cfg(feature = "mcp")]
+    pub mcp_manager: Option<&'a McpClientManager>,
+    #[cfg(feature = "semantic")]
+    pub semantic_manager: Option<&'a SemanticManager>,
+    #[cfg(feature = "lsp")]
+    pub lsp_manager: Option<&'a std::sync::Arc<crate::lsp::manager::LspManager>>,
 }
