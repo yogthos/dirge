@@ -6,11 +6,15 @@
 //!
 //! 1. [`PromptDenyPolicy`]   — frontmatter `deny_tools`; terminal Deny, beats Yolo.
 //! 2. [`YoloPolicy`]         — `mode == Yolo`; terminal Allow.
-//! 3. [`SessionAllowlistPolicy`] — user "allow always"; terminal Allow.
-//! 4. [`ConfiguredRulePolicy`]   — user rules, last-match-wins inside.
-//! 5. [`BuiltinAllowPolicy`]     — read-only ops, memory/skill, dev-null, in-cwd writes.
-//! 6. [`ExternalDirPolicy`]      — out-of-cwd paths → external_directory rule or Ask.
-//! 7. [`DefaultActionPolicy`]    — the configured default (always claims; terminal).
+//! 3. [`ConfiguredDenyPolicy`] — configured `deny` (last-match), terminal above
+//!    session-allow so a session grant can't override it (dirge-ct16). Below
+//!    Yolo: Yolo's documented "all rules off" is preserved.
+//! 4. [`SessionAllowlistPolicy`] — user "allow always"; terminal Allow.
+//! 5. [`ConfiguredRulePolicy`]   — user rules, last-match-wins inside (the
+//!    allow/ask cases; a last-match `deny` is pre-empted by `ConfiguredDeny`).
+//! 6. [`BuiltinAllowPolicy`]     — read-only ops, memory/skill, dev-null, in-cwd writes.
+//! 7. [`ExternalDirPolicy`]      — out-of-cwd paths → external_directory rule or Ask.
+//! 8. [`DefaultActionPolicy`]    — the configured default (always claims; terminal).
 //!
 //! Accept-mode loosening is NOT a decider — it's a post-Stage-A base
 //! coercion in `Engine::authorize` (it relaxes a base `Ask`→`Allow`,
@@ -74,6 +78,35 @@ impl Rule {
                 .iter()
                 .any(|k| self.pattern.matches(k))
     }
+}
+
+/// The last (top-to-bottom precedence) configured rule that matches this
+/// claim, or `None`. "Last-match-wins" is the configured-rule semantics,
+/// shared by [`ConfiguredRulePolicy`] and [`ConfiguredDenyPolicy`] so both
+/// agree on which single rule governs a claim.
+fn last_match<'r>(
+    rules: &'r [Rule],
+    req: &AccessRequest,
+    op: Operation,
+    resource: &Resource,
+) -> Option<&'r Rule> {
+    rules
+        .iter()
+        .filter(|r| r.matches(req, op, resource))
+        .next_back()
+}
+
+/// Whether a resource is a filesystem path OUTSIDE the working directory
+/// (and not `/dev/null`). Governs the external-directory deciders.
+fn is_external_path(resource: &Resource) -> bool {
+    matches!(
+        resource,
+        Resource::Path {
+            in_cwd: false,
+            dev_null: false,
+            ..
+        }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -188,11 +221,70 @@ impl Decider for ConfiguredRulePolicy {
         resource: &Resource,
         _: &PolicyCtx,
     ) -> Option<Verdict> {
-        self.rules
-            .iter()
-            .filter(|r| r.matches(req, op, resource))
-            .next_back() // last match wins
+        last_match(&self.rules, req, op, resource)
             .map(|r| Verdict::new(r.effect, format!("rule {:?} → {:?}", r.original, r.effect)))
+    }
+}
+
+/// dirge-ct16: configured `deny` rules made TERMINAL above session-allow
+/// (and the allow/ask deciders). Registered between [`YoloPolicy`] and
+/// [`SessionAllowlistPolicy`], so an explicit user deny can no longer be
+/// silently overridden by a (broad, one-keypress) session allow-always
+/// grant — while Yolo's documented "all rules off" behavior is preserved
+/// (this sits BELOW Yolo).
+///
+/// Honors last-match-wins: it only claims when the LAST matching rule is a
+/// `Deny`, so a later `allow` overriding an earlier `deny` is respected and
+/// NOT turned terminal. Covers both the main rule list and
+/// `external_directory` rules (for external paths) — both previously sat
+/// below session-allow and shared the bypass. Main rules outrank
+/// `external_directory` (mirroring the `ConfiguredRule` < `ExternalDir`
+/// decider order): when a main rule matches, it alone decides terminality.
+pub struct ConfiguredDenyPolicy {
+    pub rules: Vec<Rule>,
+    pub ext_rules: Vec<Rule>,
+}
+
+impl Decider for ConfiguredDenyPolicy {
+    fn id(&self) -> &'static str {
+        "configured-deny"
+    }
+    fn applies_to(&self, _: Operation, _: &Resource) -> bool {
+        true // claims only on a last-match Deny; cheap to evaluate in decide
+    }
+    fn decide(
+        &self,
+        req: &AccessRequest,
+        op: Operation,
+        resource: &Resource,
+        _: &PolicyCtx,
+    ) -> Option<Verdict> {
+        // Main rules govern any op/resource and outrank external_directory:
+        // if a main rule matches, it alone decides terminality (we do NOT
+        // fall through to ext rules — that would let an ext deny beat a
+        // main allow, reversing precedence).
+        if let Some(r) = last_match(&self.rules, req, op, resource) {
+            return (r.effect == Effect::Deny).then(|| {
+                Verdict::new(
+                    Effect::Deny,
+                    format!("rule {:?} → Deny (terminal)", r.original),
+                )
+            });
+        }
+        // No main rule matched: an external_directory deny on an external
+        // mutating path is likewise terminal above session-allow.
+        if matches!(op, Operation::Edit)
+            && is_external_path(resource)
+            && let Some(r) = last_match(&self.ext_rules, req, op, resource)
+        {
+            return (r.effect == Effect::Deny).then(|| {
+                Verdict::new(
+                    Effect::Deny,
+                    format!("external_directory {:?} → Deny (terminal)", r.original),
+                )
+            });
+        }
+        None
     }
 }
 
@@ -296,19 +388,6 @@ pub struct ExternalDirPolicy {
     pub rules: Vec<Rule>,
 }
 
-impl ExternalDirPolicy {
-    fn is_external_path(resource: &Resource) -> bool {
-        matches!(
-            resource,
-            Resource::Path {
-                in_cwd: false,
-                dev_null: false,
-                ..
-            }
-        )
-    }
-}
-
 impl Decider for ExternalDirPolicy {
     fn id(&self) -> &'static str {
         "external-dir"
@@ -316,7 +395,7 @@ impl Decider for ExternalDirPolicy {
     fn applies_to(&self, op: Operation, resource: &Resource) -> bool {
         // Only governs mutating access to external paths; external
         // reads are already allowed by BuiltinAllow (higher precedence).
-        matches!(op, Operation::Edit) && Self::is_external_path(resource)
+        matches!(op, Operation::Edit) && is_external_path(resource)
     }
     fn decide(
         &self,
@@ -325,14 +404,10 @@ impl Decider for ExternalDirPolicy {
         resource: &Resource,
         _: &PolicyCtx,
     ) -> Option<Verdict> {
-        if !Self::is_external_path(resource) {
+        if !is_external_path(resource) {
             return None;
         }
-        let matched = self
-            .rules
-            .iter()
-            .filter(|r| r.matches(req, op, resource))
-            .next_back();
+        let matched = last_match(&self.rules, req, op, resource);
         match matched {
             Some(r) => Some(Verdict::new(
                 r.effect,
@@ -435,6 +510,10 @@ mod tests {
             vec![
                 Box::new(PromptDenyPolicy),
                 Box::new(YoloPolicy),
+                Box::new(ConfiguredDenyPolicy {
+                    rules: vec![],
+                    ext_rules: vec![],
+                }),
                 Box::new(SessionAllowlistPolicy),
                 Box::new(ConfiguredRulePolicy { rules: vec![] }),
                 Box::new(BuiltinAllowPolicy),
@@ -643,6 +722,10 @@ mod tests {
             vec![
                 Box::new(PromptDenyPolicy),
                 Box::new(YoloPolicy),
+                Box::new(ConfiguredDenyPolicy {
+                    rules: rules.clone(),
+                    ext_rules: vec![],
+                }),
                 Box::new(SessionAllowlistPolicy),
                 Box::new(ConfiguredRulePolicy { rules }),
                 Box::new(BuiltinAllowPolicy),
@@ -685,7 +768,9 @@ mod tests {
             vec![path("/secret/k", false, false)],
         ));
         assert_eq!(d.effect, Effect::Deny);
-        assert_eq!(d.deciding.unwrap().policy, "configured-rule");
+        // The deny is now decided by the terminal configured-deny decider
+        // (dirge-ct16), which sits above session-allow.
+        assert_eq!(d.deciding.unwrap().policy, "configured-deny");
     }
 
     #[test]
@@ -795,5 +880,81 @@ mod tests {
             Effect::Deny,
             "hard-deny still trips on pure denials"
         );
+    }
+
+    // ---- dirge-ct16: configured `deny` is terminal above session-allow ----
+
+    #[test]
+    fn configured_deny_beats_session_allow() {
+        // A configured DENY must not be overridable by a (broad) session
+        // allow-always grant. Scenario: user denies edit of /etc/secret/**
+        // in config, then allow-always'd a sibling path → a broad /etc/**
+        // session grant. The narrow deny must still hold.
+        let mut e = engine_with_rules(vec![rule(
+            OpMatch::One(Operation::Edit),
+            Pattern::new("/etc/secret/**"),
+            Effect::Deny,
+        )]);
+        e.allow_always(Operation::Edit, "/etc/**");
+        let d = e.authorize(&req(
+            Operation::Edit,
+            SecurityMode::Standard,
+            vec![path("/etc/secret/k", false, false)],
+        ));
+        assert_eq!(
+            d.effect,
+            Effect::Deny,
+            "a session allow-always must not override a configured deny",
+        );
+        assert_eq!(d.deciding.unwrap().policy, "configured-deny");
+    }
+
+    #[test]
+    fn configured_deny_respects_last_match_allow() {
+        // Last-match-wins is preserved: a later `allow` overriding an
+        // earlier `deny` must NOT be turned terminal by the deny decider.
+        let e = engine_with_rules(vec![
+            rule(OpMatch::Any, Pattern::new("/proj/**"), Effect::Deny),
+            rule(
+                OpMatch::One(Operation::Edit),
+                Pattern::new("/proj/ok/**"),
+                Effect::Allow,
+            ),
+        ]);
+        let d = e.authorize(&req(
+            Operation::Edit,
+            SecurityMode::Standard,
+            vec![path("/proj/ok/a.rs", true, false)],
+        ));
+        assert_eq!(
+            d.effect,
+            Effect::Allow,
+            "later allow still wins by last-match"
+        );
+        let d = e.authorize(&req(
+            Operation::Edit,
+            SecurityMode::Standard,
+            vec![path("/proj/no/a.rs", true, false)],
+        ));
+        assert_eq!(d.effect, Effect::Deny);
+        assert_eq!(d.deciding.unwrap().policy, "configured-deny");
+    }
+
+    #[test]
+    fn yolo_still_overrides_configured_deny() {
+        // We deliberately kept config-deny BELOW yolo: yolo's documented
+        // "all rules off" contract (and its startup warning) is preserved.
+        let e = engine_with_rules(vec![rule(
+            OpMatch::One(Operation::Edit),
+            Pattern::new("/etc/**"),
+            Effect::Deny,
+        )]);
+        let d = e.authorize(&req(
+            Operation::Edit,
+            SecurityMode::Yolo,
+            vec![path("/etc/x", false, false)],
+        ));
+        assert_eq!(d.effect, Effect::Allow);
+        assert_eq!(d.deciding.unwrap().policy, "yolo");
     }
 }

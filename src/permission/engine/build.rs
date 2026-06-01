@@ -14,8 +14,9 @@
 use std::path::PathBuf;
 
 use super::policies::{
-    BuiltinAllowPolicy, ConfiguredRulePolicy, DefaultActionPolicy, ExternalDirPolicy,
-    LoopGuardPolicy, OpMatch, PromptDenyPolicy, Rule, SessionAllowlistPolicy, YoloPolicy,
+    BuiltinAllowPolicy, ConfiguredDenyPolicy, ConfiguredRulePolicy, DefaultActionPolicy,
+    ExternalDirPolicy, LoopGuardPolicy, OpMatch, PromptDenyPolicy, Rule, SessionAllowlistPolicy,
+    YoloPolicy,
 };
 use super::policy::{Decider, Modifier, PolicyCtx};
 use super::types::{Effect, Operation, Resource};
@@ -190,6 +191,14 @@ impl Engine {
         let deciders: Vec<Box<dyn Decider>> = vec![
             Box::new(PromptDenyPolicy),
             Box::new(YoloPolicy),
+            // dirge-ct16: configured `deny` is terminal above session-allow
+            // (so a broad allow-always grant can't override it) but below
+            // Yolo (preserving Yolo's documented "all rules off"). Covers
+            // both the main rule list and external_directory denies.
+            Box::new(ConfiguredDenyPolicy {
+                rules: rules.clone(),
+                ext_rules: ext_rules.clone(),
+            }),
             Box::new(SessionAllowlistPolicy),
             Box::new(ConfiguredRulePolicy { rules }),
             Box::new(BuiltinAllowPolicy),
@@ -450,5 +459,63 @@ mod tests {
             1,
             "duplicate claims in one request must not double-count the loop guard",
         );
+    }
+
+    #[test]
+    fn configured_deny_rule_beats_session_allow_via_from_config() {
+        use crate::permission::OpSpec;
+        // dirge-ct16: a main-list deny must survive a broad session grant.
+        let cfg = PermissionConfig {
+            rules: vec![rule(OpSpec::Edit, "/etc/secret/**", Action::Deny)],
+            ..Default::default()
+        };
+        let mut e = Engine::from_config(&cfg);
+        e.allow_always(Operation::Edit, "/etc/**"); // broad allow-always grant
+        let d = e.authorize(&req(
+            Operation::Edit,
+            "edit",
+            SecurityMode::Standard,
+            vec![classify_path("/etc/secret/k", "/proj")],
+        ));
+        assert_eq!(
+            d.effect,
+            Effect::Deny,
+            "configured deny must beat a session allow-always grant",
+        );
+        assert_eq!(d.deciding.unwrap().policy, "configured-deny");
+    }
+
+    #[test]
+    fn external_directory_deny_beats_session_allow_via_from_config() {
+        use crate::permission::OpSpec;
+        // dirge-ct16: external_directory deny also sat below session-allow;
+        // it must be terminal too.
+        let cfg = PermissionConfig {
+            external_directory: vec![rule(OpSpec::Any, "/shared/secret/**", Action::Deny)],
+            ..Default::default()
+        };
+        let mut e = Engine::from_config(&cfg);
+        e.allow_always(Operation::Edit, "/shared/**");
+        let d = e.authorize(&req(
+            Operation::Edit,
+            "write",
+            SecurityMode::Standard,
+            vec![classify_path("/shared/secret/k", "/proj")],
+        ));
+        assert_eq!(
+            d.effect,
+            Effect::Deny,
+            "external_directory deny must beat a session allow-always grant",
+        );
+        assert_eq!(d.deciding.unwrap().policy, "configured-deny");
+        // a sibling NOT covered by the deny still flows to the ext-dir Ask
+        let d = e.authorize(&req(
+            Operation::Edit,
+            "write",
+            SecurityMode::Standard,
+            vec![classify_path("/shared/ok/k", "/proj")],
+        ));
+        // session grant /shared/** allows this one (no deny matches)
+        assert_eq!(d.effect, Effect::Allow);
     }
 }
