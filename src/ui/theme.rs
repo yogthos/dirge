@@ -694,6 +694,8 @@ mod tests {
             "tool": "blue",
             "perm": "magenta",
             "result": "cyan",
+            "critic": "blue",
+            "thinking": "darkgrey",
             "error": "darkred",
             "warn": "darkyellow",
             "accent": "white",
@@ -709,6 +711,9 @@ mod tests {
         assert!(matches!(theme.agent, Color::Red));
         assert!(matches!(theme.error, Color::DarkRed));
         assert!(matches!(theme.banner_primary, Color::DarkBlue));
+        // The newer roles (critic, thinking) are config-themeable too.
+        assert!(matches!(theme.critic, Color::Blue));
+        assert!(matches!(theme.thinking, Color::DarkGrey));
         assert_eq!(theme.label, "MIDNIGHT");
     }
 

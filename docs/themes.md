@@ -46,6 +46,8 @@ A fully-custom palette:
   "tool":   "darkcyan",
   "perm":   "yellow",
   "result": "darkgray",
+  "critic":   "#c9a9ff",
+  "thinking": "#8a9c90",
   "error":  "red",
   "warn":   "yellow",
   "accent": "#ff66cc",
@@ -85,6 +87,8 @@ Each color field accepts three forms:
 | `tool` | Tool chamber headers (`╭─ BASH ─ …`) |
 | `perm` | Permission prompts (loud — yellow/red recommended) |
 | `result` | Secondary result text (slash output, dim tool stdout) |
+| `critic` | In-loop critic's review voice (`<critic>`) |
+| `thinking` | Agent reasoning / "thinking" register (placeholder, Ctrl+O expand, Ctrl+R stream) |
 | `error` | Hard errors (red recommended; keeps semantic urgency) |
 | `warn` | Warnings (yellow recommended) |
 | `accent` | Headers, focused picker rows, banner accent |
