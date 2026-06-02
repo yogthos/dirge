@@ -1031,14 +1031,14 @@ pub async fn run_interactive(
                         // result in full (restores that affordance).
                         if action == Some(KeyAction::Expand) {
                             if !reasoning_buf.is_empty() {
-                                renderer.write_line("  ╭─ thinking ─", theme::dim())?;
+                                renderer.write_line("  ╭─ thinking ─", theme::thinking())?;
                                 for line in reasoning_buf.lines() {
                                     renderer.write_line(
                                         &format!("  │ {}", sanitize_output(line)),
-                                        theme::dim(),
+                                        theme::thinking(),
                                     )?;
                                 }
-                                renderer.write_line("  ╰─", theme::dim())?;
+                                renderer.write_line("  ╰─", theme::thinking())?;
                                 renderer.write_line("", Color::White)?;
                             } else if let Some(collapsed) = &last_collapsed {
                                 const EXPAND_CAP_BYTES: usize = 64 * 1024;
@@ -1796,7 +1796,7 @@ pub async fn run_interactive(
                             if !was_reasoning {
                                 renderer.write_line(
                                     "  ◇ thinking… (Ctrl+O to view)",
-                                    theme::dim(),
+                                    theme::thinking(),
                                 )?;
                                 was_reasoning = true;
                             }

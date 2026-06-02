@@ -59,6 +59,11 @@ pub struct Theme {
     /// In-loop critic's review voice. Distinct from `user` so critic
     /// follow-ups aren't mistaken for the user's own messages.
     pub critic: Color,
+    /// The agent's "thinking" register — the suppressed-reasoning
+    /// placeholder, the (Ctrl+R) live reasoning stream, and the Ctrl+O
+    /// expansion. Deliberately soft/recessive: it's transient, low-priority
+    /// context that must never compete with the agent's actual prose.
+    pub thinking: Color,
     /// Hard errors. Always red-family; theme can choose the exact red
     /// but must keep it semantically distinct from everything else.
     pub error: Color,
@@ -88,7 +93,15 @@ impl Theme {
     /// monochrome monitor.
     pub const fn phosphor() -> Self {
         Theme {
-            agent: Color::Green,
+            // The AI's prose is the focal point — push it close to white
+            // (high brightness, low saturation) so the eye lands there
+            // first, while the green chrome (tool/header/accent) recedes
+            // around it. A faint green tint keeps the phosphor identity.
+            agent: Color::Rgb {
+                r: 222,
+                g: 248,
+                b: 226,
+            },
             // Cyan complements phosphor green without breaking the
             // CRT aesthetic — classic CRTs shipped with green OR
             // cyan/amber phosphors and the cyan tone reads
@@ -105,6 +118,14 @@ impl Theme {
             // is a separate reviewing voice. (Freed up now that thinking no
             // longer monopolizes the magenta register.)
             critic: Color::Magenta,
+            // Soft desaturated green-grey: clearly recessive next to the
+            // bright prose, so transient thinking output reads as quiet
+            // background, never competing with the answer.
+            thinking: Color::Rgb {
+                r: 128,
+                g: 150,
+                b: 140,
+            },
             error: Color::Red,
             warn: Color::Yellow,
             accent: Color::Green,
@@ -129,6 +150,12 @@ impl Theme {
             result: Color::DarkGrey,
             // Blue — distinct from plain's Magenta(perm)/Green(user)/Cyan(accent).
             critic: Color::Blue,
+            // Soft grey-blue: recessive, distinct from the dim-grey `dim`.
+            thinking: Color::Rgb {
+                r: 140,
+                g: 140,
+                b: 155,
+            },
             error: Color::Red,
             warn: Color::Yellow,
             accent: Color::Cyan,
@@ -156,6 +183,7 @@ struct ThemeJson {
     perm: Option<ColorValue>,
     result: Option<ColorValue>,
     critic: Option<ColorValue>,
+    thinking: Option<ColorValue>,
     error: Option<ColorValue>,
     warn: Option<ColorValue>,
     accent: Option<ColorValue>,
@@ -262,6 +290,7 @@ impl ThemeJson {
             perm: pick(self.perm, base.perm),
             result: pick(self.result, base.result),
             critic: pick(self.critic, base.critic),
+            thinking: pick(self.thinking, base.thinking),
             error: pick(self.error, base.error),
             warn: pick(self.warn, base.warn),
             accent: pick(self.accent, base.accent),
@@ -360,6 +389,9 @@ pub fn result() -> Color {
 }
 pub fn critic() -> Color {
     current().critic
+}
+pub fn thinking() -> Color {
+    current().thinking
 }
 pub fn error() -> Color {
     current().error

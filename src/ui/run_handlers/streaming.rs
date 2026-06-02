@@ -32,12 +32,14 @@ pub(crate) fn handle_reasoning(
 ) -> anyhow::Result<()> {
     let safe = sanitize_output(text);
     ctx.reasoning_buf.push_str(&safe);
-    // Shared pipeline with Token. DarkMagenta base color signals the
-    // "thinking" voice; markdown highlights still ride the theme accessors.
+    // Shared pipeline with Token. The soft, recessive `thinking` register
+    // signals the reasoning voice without competing with the agent's prose
+    // (replaces the hard DarkMagenta); markdown highlights still ride the
+    // theme accessors.
     render_agent_stream(
         ctx.reasoning_buf,
         ctx.reasoning_start_line,
-        Color::DarkMagenta,
+        crate::ui::theme::thinking(),
         ctx.renderer,
     )?;
     *ctx.agent_line_started = true;
