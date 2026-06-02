@@ -128,10 +128,13 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     if let BottomBody::Editor {
         cursor_row,
         cursor_col,
+        is_running,
         ..
     } = scene.body
     {
-        let prompt_w: u16 = 3; // both prompts are 3 cells
+        // Must match `paint_editor_box`'s prompt zone (2 cells idle,
+        // 3 while running) so the cursor sits on the painted text.
+        let prompt_w = super::bottom::input_prompt_width(is_running);
         let cursor_x = layout
             .input_box
             .x
