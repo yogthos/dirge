@@ -145,6 +145,14 @@ impl<'a> LeftPanel<'a> {
             style: Style::default().fg(RColor::Green),
         }
     }
+
+    /// Override the frame/border style so the left panel tracks the
+    /// main chat frame's color (the theme header tone). Default is
+    /// green to match the phosphor preset.
+    pub fn border_style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
 }
 
 impl<'a> Widget for LeftPanel<'a> {
@@ -215,7 +223,10 @@ fn paint_idle_card(buf: &mut Buffer, area: Rect, info: &LeftPanelInfo, style: St
     // Leave one trailing cell so a sub-panel's right border doesn't abut
     // the chat-frame divider (same caution as the subagent list).
     let box_w = area.width.saturating_sub(1);
-    let bs = Style::default().fg(RColor::Green);
+    // Sub-panel borders follow the caller's frame style (the main
+    // chat frame's color) so the left panel matches the theme rather
+    // than locking to green.
+    let bs = style;
 
     let mut dy = LEFT_PANEL_TOP_PAD;
 
@@ -427,6 +438,15 @@ impl<'a> RightPanel<'a> {
             style: Style::default().fg(RColor::Green),
             modified_offset: 0,
         }
+    }
+
+    /// Override the frame/border style so the right panel tracks the
+    /// main chat frame's color (the theme header tone). Default is
+    /// green to match the phosphor preset. Body text keeps its own
+    /// semantic colors (amber SYSTEM data, dim placeholders).
+    pub fn border_style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
     }
 
     /// dirge-b11: set the MODIFIED-list scroll offset. Clamped
@@ -685,6 +705,65 @@ mod tests {
         // Bottom border.
         let expected_bot = format!("╰{}╯", "─".repeat(18));
         assert_eq!(row(3), expected_bot);
+    }
+
+    /// The left + right panels' frame borders follow the border
+    /// style passed by the caller (the main chat frame's color),
+    /// not a hardcoded green. Guards the "panels match the main
+    /// panel's color scheme" contract.
+    #[test]
+    fn side_panels_borders_follow_caller_style() {
+        let magenta = RColor::Magenta;
+        let style = Style::default().fg(magenta);
+
+        // Find the first rounded corner / vertical border cell in a
+        // region and return its fg color.
+        let border_fg = |backend: &TestBackend, area: Rect| -> Option<RColor> {
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    let cell = backend.buffer().cell((x, y)).unwrap();
+                    if matches!(cell.symbol(), "╭" | "╮" | "╰" | "╯" | "│") {
+                        return Some(cell.fg);
+                    }
+                }
+            }
+            None
+        };
+
+        // Left panel.
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+        let mut backend = TestBackend::new(24, 20);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        let area = Rect::new(0, 0, 24, 20);
+        terminal
+            .draw(|f| {
+                f.render_widget(LeftPanel::new(&info, &subs).border_style(style), area);
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+        assert_eq!(
+            border_fg(&backend, area),
+            Some(magenta),
+            "left panel border should follow caller style"
+        );
+
+        // Right panel.
+        let pd = PanelData::default();
+        let mut backend = TestBackend::new(24, 24);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        let area = Rect::new(0, 0, 24, 24);
+        terminal
+            .draw(|f| {
+                f.render_widget(RightPanel::new(&pd).border_style(style), area);
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+        assert_eq!(
+            border_fg(&backend, area),
+            Some(magenta),
+            "right panel border should follow caller style"
+        );
     }
 
     /// Sub-panel content is LEFT-aligned per user feedback (not centered).

@@ -84,7 +84,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     // Left panel — idle card or subagent list. Skip on narrow terminals.
     if scene.show_left_panel && layout.left_panel.width >= 12 {
         f.render_widget(
-            LeftPanel::new(scene.left_info, scene.subagents),
+            LeftPanel::new(scene.left_info, scene.subagents).border_style(frame_style),
             layout.left_panel,
         );
     }
@@ -100,7 +100,9 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     // Right panel — stacked sub-panels. Skip on narrow terminals.
     if scene.show_right_panel && layout.right_panel.width >= 16 {
         f.render_widget(
-            RightPanel::new(scene.panel_data).modified_offset(scene.modified_offset),
+            RightPanel::new(scene.panel_data)
+                .border_style(frame_style)
+                .modified_offset(scene.modified_offset),
             layout.right_panel,
         );
     }
