@@ -154,9 +154,10 @@ impl Tool for ReadTool {
                         "dirge-hints": {"semantic": "absolute_path"}
                     },
                     "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to read" }
+                    "limit": { "type": "integer", "description": "Maximum number of lines to read" },
+                    "reason": { "type": "string", "description": "Why you're reading this file: what you expect to learn and how it serves the current task. Be specific and targeted — don't read files for general orientation." }
                 },
-                "required": ["path"],
+                "required": ["path", "reason"],
                 // Phase-2: when `limit` is given but `offset` is
                 // not (or vice versa), the harness auto-fills the
                 // missing one with `offset = 0` and prepends a

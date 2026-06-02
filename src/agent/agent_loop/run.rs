@@ -657,6 +657,12 @@ pub async fn run_loop(
     // F6 tier 3: the bounded LLM critic fires at most once per run.
     let mut critic_done = false;
 
+    // vix-port: don't let the model end a turn while it still has unfinished
+    // todos. Nudge it to finish or clear the list, bounded so a stuck list
+    // can't loop forever (vix caps at 3 nudges; session.go:1551).
+    const MAX_TODO_NUDGES: u8 = 3;
+    let mut todo_nudges: u8 = 0;
+
     'outer: loop {
         // Storm: fresh intent on each new user turn.
         // Port of Reasonix loop.ts:621 `this.repair.resetStorm()`.
@@ -1349,6 +1355,24 @@ pub async fn run_loop(
                 follow_up =
                     super::critic::run_critic(critic, &current_context.system_prompt, &transcript)
                         .await;
+            }
+        }
+        // vix-port: final gate — if nothing else is pending and the model is
+        // about to stop with unfinished todos, nudge it to finish or clear
+        // them. Bounded by MAX_TODO_NUDGES so a deliberately-abandoned list
+        // can't trap the loop.
+        if follow_up.is_empty() && todo_nudges < MAX_TODO_NUDGES {
+            let unfinished = crate::agent::tools::todo::unfinished_count();
+            if unfinished > 0 {
+                todo_nudges += 1;
+                follow_up = vec![LoopMessage::User(super::message::UserMessage {
+                    content: format!(
+                        "You still have {unfinished} unfinished todo{} (pending or in progress). \
+                         Finish the remaining work, or if it's genuinely done or no longer needed, \
+                         update the todo list (mark items completed/cancelled) before stopping.",
+                        if unfinished == 1 { "" } else { "s" }
+                    ),
+                })];
             }
         }
         if !follow_up.is_empty() {

@@ -18,6 +18,20 @@ pub struct TodoWriteArgs {
 
 pub static TODO_LIST: std::sync::Mutex<Vec<TodoItem>> = std::sync::Mutex::new(Vec::new());
 
+/// Number of todos still `pending` or `in_progress`. Used by the agent loop
+/// to nudge the model not to stop with unfinished planned work (ported from
+/// vix's end-of-turn TODO-completion nudge, session.go:1551).
+pub fn unfinished_count() -> usize {
+    TODO_LIST
+        .lock()
+        .map(|list| {
+            list.iter()
+                .filter(|t| t.status == "pending" || t.status == "in_progress")
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 pub struct WriteTodoList {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -112,5 +126,38 @@ impl Tool for WriteTodoList {
             list.iter().filter(|t| t.status == "cancelled").count()
         ));
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod nudge_tests {
+    use super::*;
+
+    /// `unfinished_count` counts pending + in_progress, ignores
+    /// completed/cancelled. (Sole mutator of the global TODO_LIST in tests.)
+    #[test]
+    fn unfinished_count_counts_pending_and_in_progress() {
+        let item = |status: &str| TodoItem {
+            content: "x".into(),
+            status: status.into(),
+            priority: "medium".into(),
+        };
+        {
+            let mut list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
+            *list = vec![
+                item("completed"),
+                item("pending"),
+                item("in_progress"),
+                item("cancelled"),
+            ];
+        }
+        assert_eq!(unfinished_count(), 2);
+        {
+            let mut list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
+            *list = vec![item("completed"), item("cancelled")];
+        }
+        assert_eq!(unfinished_count(), 0);
+        // Leave the global clean for any other consumer.
+        TODO_LIST.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }

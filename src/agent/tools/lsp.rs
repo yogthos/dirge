@@ -123,9 +123,10 @@ impl Tool for LspTool {
                     "query": {
                         "type": "string",
                         "description": "Search string for workspaceSymbol — REQUIRED when operation is 'workspaceSymbol' (pass empty string to list all symbols). Ignored for other operations."
-                    }
+                    },
+                    "reason": { "type": "string", "description": "Why you're querying: the specific code-structure question this answers and how it serves the current task. Be targeted." }
                 },
-                "required": ["operation", "file_path"]
+                "required": ["operation", "file_path", "reason"]
             }),
         }
     }

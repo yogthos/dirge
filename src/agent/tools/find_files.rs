@@ -67,9 +67,10 @@ impl Tool for FindFilesTool {
                     "include_hidden": {
                         "type": "boolean",
                         "description": "Include dotfiles (.env, .gitignore, etc.) in results. Default false to avoid surfacing secrets and config files."
-                    }
+                    },
+                    "reason": { "type": "string", "description": "Why you're searching for these files: the specific question this answers and how it serves the current task. Be targeted." }
                 },
-                "required": ["pattern"]
+                "required": ["pattern", "reason"]
             }),
         }
     }

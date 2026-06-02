@@ -20,8 +20,25 @@ Do NOT write any code, run any tests, or take any implementation action until th
 
 ### Phase 1: Discovery
 1. **Understand** — ask clarifying questions. Confirm acceptance criteria.
-2. **Explore** — use list_dir, glob, grep, read to understand the codebase structure, patterns, and testing framework.
+2. **Explore** — use list_dir, glob, grep, read, lsp to understand the codebase structure, patterns, and testing framework.
 3. **Scope check** — if the spec covers multiple independent subsystems, suggest breaking into separate plans.
+
+### Exploration discipline
+
+**Minimize tool calls.** Every `read`, `grep`, `glob`, `list_dir`, or `lsp` call should answer a specific, targeted question. The context and conversation you already have are your primary source of truth — only reach for source files when they leave a specific question unanswered.
+
+**Legitimate reasons to use a tool:**
+- Inspecting a function signature or implementation you intend to reference in the plan
+- Verifying that a utility or pattern you plan to rely on actually exists as described
+- Resolving an ambiguity about how two components interact
+- Confirming a file path exists before referencing it
+
+**Not legitimate reasons:**
+- General orientation ("ls everything", reading files just to "understand the project")
+- Re-reading anything already in context or covered earlier in the conversation
+- Exploring directories to rediscover structure you already know
+
+**Deduplicate.** Never call the same tool on the same file more than once. If you need multiple ranges from a file, read them in one call. Aimless exploration is the single biggest source of wasted tokens and lost focus — be surgical.
 
 ### Phase 2: Design
 4. **File structure mapping** — map which files will be created or modified and what each is responsible for.

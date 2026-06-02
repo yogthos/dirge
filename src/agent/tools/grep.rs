@@ -104,9 +104,10 @@ impl Tool for GrepTool {
                     "include_hidden": {
                         "type": "boolean",
                         "description": "Include dotfiles (.env, .gitignore, etc.) in the search. Default false to avoid surfacing secrets and config files."
-                    }
+                    },
+                    "reason": { "type": "string", "description": "Why you're searching: the specific question this answers and how it serves the current task. Be targeted." }
                 },
-                "required": ["pattern"]
+                "required": ["pattern", "reason"]
             }),
         }
     }
