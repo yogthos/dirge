@@ -15,8 +15,9 @@ use crate::ui::events::sanitize_output;
 use crate::ui::run_handlers::RunCtx;
 use crate::ui::theme;
 use crate::ui::tool_display::{
-    chamber_bottom, chamber_row, chamber_row_with_bg, chamber_widths, close_tool_chamber_passive,
-    fit_banner_header, format_tool_banner_value, render_tool_output,
+    CollapsedToolResult, chamber_bottom, chamber_row, chamber_row_with_bg, chamber_widths,
+    close_tool_chamber_passive, fit_banner_header, format_tool_banner_value, lsp_block_start,
+    render_tool_output, summarize_lsp_tail,
 };
 
 pub(crate) async fn handle_tool_result(
@@ -259,6 +260,20 @@ pub(crate) async fn handle_tool_result(
             let diff_start = lines.iter().position(|l| l.starts_with("--- a/"));
             if let Some(pre) = diff_start {
                 let (frame_w, inner) = chamber_widths(ctx.renderer);
+                // The edit tool appends an `LSP errors detected …`
+                // block after the diff. That block is the agent's
+                // to act on, but in the chat it's often a wall of
+                // language-server noise. Render the diff in full
+                // (meaningful) and collapse the diagnostics tail to
+                // one summary line; Ctrl+O still expands the full
+                // output via `last_collapsed`.
+                let diag_start = lsp_block_start(&lines);
+                let mut diff_end = diag_start.unwrap_or(lines.len());
+                // Trim blank lines the `\n\n` separator left between
+                // the diff and the diagnostics heading.
+                while diff_end > pre && lines[diff_end - 1].trim().is_empty() {
+                    diff_end -= 1;
+                }
                 // Pre-diff prose (the edit tool's
                 // header line, etc.) renders in
                 // the chamber's standard tone.
@@ -275,7 +290,7 @@ pub(crate) async fn handle_tool_result(
                 // get a dim-red bg (palette 52).
                 // Header (`--- ` / `+++ ` / `@@`) and
                 // context lines have no bg.
-                for l in &lines[pre..] {
+                for l in &lines[pre..diff_end] {
                     let txt = sanitize_output(l).into_string();
                     if l.starts_with("--- ") || l.starts_with("+++ ") {
                         // Filenames in the diff header get
@@ -302,6 +317,19 @@ pub(crate) async fn handle_tool_result(
                         ctx.renderer
                             .write_line(&chamber_row(&txt, inner), theme::dim())?;
                     }
+                }
+                // Compact LSP diagnostics summary (one line) in place
+                // of the appended wall; register the full output so
+                // Ctrl+O can expand it.
+                if let Some(ds) = diag_start {
+                    let summary = summarize_lsp_tail(&lines[ds..]);
+                    ctx.renderer
+                        .write_line(&chamber_row(&summary, inner), theme::warn())?;
+                    *ctx.last_collapsed = Some(CollapsedToolResult {
+                        tool_name: resolved_name.clone(),
+                        banner_value: sanitize_output(&banner_value).into_string(),
+                        full_output: output.to_string(),
+                    });
                 }
                 ctx.renderer
                     .write_line(&chamber_bottom(frame_w), theme::dim())?;

@@ -441,10 +441,172 @@ pub(crate) fn chamber_row_with_bg(content: &str, inner: usize, bg_idx: u8) -> St
     box_render::row_with_bg(box_render::BoxStyle::Rounded, content, inner + 4, bg_idx)
 }
 
+/// Index of the line where the `write`/`edit` tools' appended LSP
+/// diagnostics block begins (the `LSP errors detected …` heading), or
+/// `None` if the output has no such section. Used to keep the diff
+/// visible in full while collapsing the (often huge, often
+/// language-server-noise) diagnostics tail into one line.
+pub(crate) fn lsp_block_start(lines: &[&str]) -> Option<usize> {
+    lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("LSP errors detected"))
+}
+
+/// Parse a flood headline like `258 errors reported — too many …` into
+/// its leading count.
+fn parse_errors_reported(line: &str) -> Option<usize> {
+    let rest = line.trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let after = rest[digits.len()..].trim_start();
+    after
+        .starts_with("errors reported")
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Parse an overflow footer like `... and 15 more` into its count.
+fn parse_and_more(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix("... and ")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    rest[digits.len()..]
+        .trim_start()
+        .starts_with("more")
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Collapse an appended LSP diagnostics tail (the slice from
+/// [`lsp_block_start`] onward) into a single compact summary line.
+/// Counts `<diagnostics file=…>` blocks and best-effort totals their
+/// errors (flood headlines, enumerated `ERROR` lines, `… and N more`
+/// footers). Falls back gracefully when the count can't be derived.
+pub(crate) fn summarize_lsp_tail(tail: &[&str]) -> String {
+    let mut files = 0usize;
+    let mut errors = 0usize;
+    let mut i = 0;
+    while i < tail.len() {
+        if tail[i].trim_start().starts_with("<diagnostics file=") {
+            files += 1;
+            let mut j = i + 1;
+            let mut enumerated = 0usize;
+            let mut flood: Option<usize> = None;
+            while j < tail.len() && !tail[j].trim_start().starts_with("</diagnostics>") {
+                let bl = tail[j].trim_start();
+                if let Some(n) = parse_errors_reported(bl) {
+                    flood = Some(n);
+                } else if bl.starts_with("ERROR ") {
+                    enumerated += 1;
+                } else if let Some(n) = parse_and_more(bl) {
+                    enumerated += n;
+                }
+                j += 1;
+            }
+            errors += flood.unwrap_or(enumerated);
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    let suffix = "Ctrl+O to expand";
+    if files == 0 {
+        return format!("⚠ LSP errors reported — {suffix}");
+    }
+    let fpl = if files == 1 { "" } else { "s" };
+    if errors == 0 {
+        format!("⚠ LSP errors in {files} file{fpl} — {suffix}")
+    } else {
+        let epl = if errors == 1 { "" } else { "s" };
+        format!("⚠ LSP: {errors} error{epl} in {files} file{fpl} — {suffix}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn lsp_block_start_finds_heading() {
+        let lines = vec![
+            "--- a/x.rs",
+            "+++ b/x.rs",
+            "+added",
+            "",
+            "LSP errors detected in this file, please fix:",
+            "<diagnostics file=\"x.rs\">",
+        ];
+        assert_eq!(lsp_block_start(&lines), Some(4));
+    }
+
+    #[test]
+    fn lsp_block_start_none_without_diagnostics() {
+        let lines = vec!["--- a/x.rs", "+++ b/x.rs", "+added"];
+        assert_eq!(lsp_block_start(&lines), None);
+    }
+
+    #[test]
+    fn summarize_counts_enumerated_and_overflow() {
+        let lines = vec![
+            "LSP errors detected in this file, please fix:",
+            "<diagnostics file=\"x.rs\">",
+            "ERROR [1:1] a",
+            "ERROR [2:1] b",
+            "... and 4 more",
+            "</diagnostics>",
+        ];
+        // 2 enumerated + 4 overflow = 6 errors across 1 file.
+        assert_eq!(
+            summarize_lsp_tail(&lines),
+            "⚠ LSP: 6 errors in 1 file — Ctrl+O to expand"
+        );
+    }
+
+    #[test]
+    fn summarize_uses_flood_total_not_preview_lines() {
+        // A flood block reports its own total and previews 3 lines; the
+        // preview ERROR lines must NOT be double-counted on top of 258.
+        let lines = vec![
+            "LSP errors detected in this file, please fix:",
+            "<diagnostics file=\"core.janet\">",
+            "258 errors reported — too many to be from a single edit. …",
+            "ERROR [1:13] Unresolved symbol: Library",
+            "ERROR [2:27] Unresolved symbol: functions",
+            "ERROR [2:41] Unresolved symbol: the",
+            "</diagnostics>",
+            "",
+            "LSP errors detected in other files:",
+            "<diagnostics file=\"api.janet\">",
+            "ERROR [1:15] Unresolved symbol: API",
+            "... and 4 more",
+            "</diagnostics>",
+        ];
+        // 258 (flood) + (1 + 4) = 263 across 2 files.
+        assert_eq!(
+            summarize_lsp_tail(&lines),
+            "⚠ LSP: 263 errors in 2 files — Ctrl+O to expand"
+        );
+    }
+
+    #[test]
+    fn summarize_singular_file_and_error() {
+        let lines = vec![
+            "LSP errors detected in this file, please fix:",
+            "<diagnostics file=\"x.rs\">",
+            "ERROR [1:1] only one",
+            "</diagnostics>",
+        ];
+        assert_eq!(
+            summarize_lsp_tail(&lines),
+            "⚠ LSP: 1 error in 1 file — Ctrl+O to expand"
+        );
+    }
 
     #[test]
     fn banner_short_value_pads_with_dashes_to_full_width() {
