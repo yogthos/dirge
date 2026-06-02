@@ -87,55 +87,127 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// 80s-CRT phosphor green. Default. Errors red, warnings yellow.
-    /// No grey anywhere on the green axis — secondary tones use
-    /// DarkGreen so the whole display reads like a single-phosphor
-    /// monochrome monitor.
+    /// 80s-CRT phosphor green — a modern, cohesive take. Anchored on the
+    /// bright phosphor green of the agent's prose, with a low-saturation
+    /// surface around it. Two axes carry meaning so the log is readable at
+    /// a glance:
+    ///   - HUE = action type, so peripheral vision recognizes a message's
+    ///     kind without reading it: green = the agent, cyan = you, teal =
+    ///     tools, lavender = the critic, amber = needs-you (perms/warnings),
+    ///     red = errors.
+    ///   - BRIGHTNESS = importance, so the eye is pulled to what matters:
+    ///     the loud warm signals (error/perm) and the agent's answer are
+    ///     brightest; supporting detail (tool output, system/thinking
+    ///     notes) is muted; chrome (dim/divider) barely registers.
+    /// Saturation stays low everywhere EXCEPT the warm urgency signals,
+    /// which keep their vividness so they pop off the green/cyan field.
     pub const fn phosphor() -> Self {
         Theme {
-            // The AI's prose is the focal point: a bright phosphor green —
-            // a modern take on the 80s CRT look. Light and green-forward so
-            // the eye lands here first and it reads unmistakably as the
-            // green-terminal voice, while the more-saturated/darker green
-            // chrome (tool/header/accent) recedes around it. Not near-white
-            // (loses the CRT character) and not neon (#00ff00 is harsh).
+            // GREEN — the agent's prose. Focal point; brightest content color.
             agent: Color::Rgb {
                 r: 138,
                 g: 232,
                 b: 156,
             },
-            // Cyan complements phosphor green without breaking the
-            // CRT aesthetic — classic CRTs shipped with green OR
-            // cyan/amber phosphors and the cyan tone reads
-            // distinct-but-related. Before this both `user` and
-            // `agent` were `Color::Green` so user messages were
-            // visually indistinguishable from the agent's output —
-            // confusing when scrolling chat history.
-            user: Color::Cyan,
-            system: Color::DarkGreen,
-            tool: Color::Green,
-            perm: Color::Yellow,
-            result: Color::DarkGreen,
-            // Magenta reads distinct from the green/cyan axis — the critic
-            // is a separate reviewing voice. (Freed up now that thinking no
-            // longer monopolizes the magenta register.)
-            critic: Color::Magenta,
-            // Soft desaturated green-grey: clearly recessive next to the
-            // bright prose, so transient thinking output reads as quiet
-            // background, never competing with the answer.
+            // CYAN — your messages. Cool complement to green; bright enough
+            // to scan your own turns, clearly distinct from the agent.
+            user: Color::Rgb {
+                r: 125,
+                g: 205,
+                b: 210,
+            },
+            // Muted green-grey — system / info notes ("context loaded",
+            // compactions). Supporting; recedes below the conversation.
+            system: Color::Rgb {
+                r: 106,
+                g: 140,
+                b: 120,
+            },
+            // TEAL — tool headers ("what's running"). In the agent's green
+            // family (a tool is the agent acting) but cooler so it reads as
+            // activity, not answer; brighter than its own output below.
+            tool: Color::Rgb {
+                r: 108,
+                g: 188,
+                b: 150,
+            },
+            // AMBER — permission prompts. Needs YOU: warm + bright so it
+            // jumps off the green field and demands a glance.
+            perm: Color::Rgb {
+                r: 255,
+                g: 185,
+                b: 85,
+            },
+            // Dim green — tool OUTPUT body. Readable, but well below the
+            // header: the result is detail, the header is the headline.
+            result: Color::Rgb {
+                r: 118,
+                g: 158,
+                b: 132,
+            },
+            // LAVENDER — the critic's review voice. Off the green/cyan axis
+            // so it instantly reads as "a different speaker"; mid brightness.
+            critic: Color::Rgb {
+                r: 186,
+                g: 166,
+                b: 216,
+            },
+            // Soft green-grey — the thinking register. Quiet background that
+            // never competes with the answer.
             thinking: Color::Rgb {
                 r: 128,
                 g: 150,
                 b: 140,
             },
-            error: Color::Red,
-            warn: Color::Yellow,
-            accent: Color::Green,
-            dim: Color::DarkGreen,
-            header: Color::Green,
-            divider: Color::DarkGreen,
-            banner_primary: Color::Green,
-            banner_secondary: Color::DarkGreen,
+            // RED — errors. The loudest thing on screen; the eye must snap
+            // to it. The one place we keep high saturation AND brightness.
+            error: Color::Rgb {
+                r: 255,
+                g: 95,
+                b: 90,
+            },
+            // Muted amber — warnings. Same warm "attention" hue as perms,
+            // dimmer: notable, not act-now.
+            warn: Color::Rgb {
+                r: 212,
+                g: 168,
+                b: 96,
+            },
+            // Light green — accents / focused picker rows / strings in code.
+            // Distinct from `header` so highlighted strings ≠ types.
+            accent: Color::Rgb {
+                r: 158,
+                g: 238,
+                b: 172,
+            },
+            // Dark green-grey — low-noise auxiliary text + comments; recedes hard.
+            dim: Color::Rgb {
+                r: 86,
+                g: 116,
+                b: 96,
+            },
+            // Vivid green — panel headers + code types; a scan target.
+            header: Color::Rgb {
+                r: 96,
+                g: 220,
+                b: 140,
+            },
+            // Dimmest green — separators; barely registers.
+            divider: Color::Rgb {
+                r: 72,
+                g: 98,
+                b: 82,
+            },
+            banner_primary: Color::Rgb {
+                r: 138,
+                g: 232,
+                b: 156,
+            },
+            banner_secondary: Color::Rgb {
+                r: 86,
+                g: 116,
+                b: 96,
+            },
             label: "PHOSPHOR",
         }
     }
@@ -512,17 +584,31 @@ mod tests {
     /// every preset — that's the load-bearing semantic contract.
     #[test]
     fn error_and_warn_stay_loud() {
+        // The contract is semantic, not a specific palette entry: errors
+        // must read red-family and warnings amber/warm, however the theme
+        // expresses it (named ANSI or a custom RGB tone).
+        fn is_reddish(c: Color) -> bool {
+            match c {
+                Color::Red | Color::DarkRed => true,
+                Color::Rgb { r, g, b } => r > 180 && r >= g + 40 && r >= b + 40,
+                _ => false,
+            }
+        }
+        fn is_amber(c: Color) -> bool {
+            match c {
+                Color::Yellow | Color::DarkYellow => true,
+                // Warm: red + green high, blue low (amber/gold).
+                Color::Rgb { r, g, b } => r >= 160 && g >= 120 && r >= g && b + 40 <= g,
+                _ => false,
+            }
+        }
         for t in [Theme::phosphor(), Theme::plain()] {
             assert!(
-                matches!(t.error, Color::Red | Color::DarkRed),
+                is_reddish(t.error),
                 "theme {} broke error contract",
-                t.label,
+                t.label
             );
-            assert!(
-                matches!(t.warn, Color::Yellow | Color::DarkYellow),
-                "theme {} broke warn contract",
-                t.label,
-            );
+            assert!(is_amber(t.warn), "theme {} broke warn contract", t.label);
         }
     }
 
@@ -587,12 +673,15 @@ mod tests {
     fn theme_json_partial_override_inherits_base() {
         let json = r#"{"agent": "blue"}"#;
         let overrides: ThemeJson = serde_json::from_str(json).unwrap();
-        let theme = overrides.merge_into(Theme::phosphor(), "TEST").unwrap();
+        let base = Theme::phosphor();
+        let theme = overrides.merge_into(base, "TEST").unwrap();
         assert!(matches!(theme.agent, Color::Blue), "agent overridden");
-        // Everything else stays phosphor.
-        assert!(matches!(theme.error, Color::Red), "error unchanged");
-        assert!(matches!(theme.warn, Color::Yellow), "warn unchanged");
-        assert!(matches!(theme.user, Color::Cyan), "user unchanged");
+        // Everything else stays exactly the base preset's value (compare to
+        // the preset, not a hardcoded color, so the test survives palette
+        // tuning).
+        assert_eq!(theme.error, base.error, "error unchanged");
+        assert_eq!(theme.warn, base.warn, "warn unchanged");
+        assert_eq!(theme.user, base.user, "user unchanged");
     }
 
     /// All-fields override produces a fully custom theme.
