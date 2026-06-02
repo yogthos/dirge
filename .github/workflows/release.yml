@@ -24,10 +24,13 @@ jobs:
           # Cross-compile the Intel target on the Apple-Silicon runner.
           # `macos-13` (Intel) runners are scarce and frequently sit
           # queued until the 24h timeout; `macos-latest` is plentiful and
-          # ships both-arch SDKs, so `--target x86_64-apple-darwin` builds
-          # there fine (default features only — no Janet plugin to link).
+          # ships both-arch SDKs. Build the no-plugin set (same as
+          # Windows): `evil_janet`'s C lib only compiles for the host
+          # arch, so the Janet `plugin` feature can't link for x86_64 when
+          # cross-building. The native arm64 build below keeps the plugin.
           - os: macos-latest
             target: x86_64-apple-darwin
+            cargo_flags: "--no-default-features --features windows-default"
           - os: macos-latest
             target: aarch64-apple-darwin
           # Windows MSVC can't build the Janet `plugin` feature
