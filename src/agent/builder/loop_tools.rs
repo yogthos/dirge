@@ -425,13 +425,11 @@ pub async fn build_loop_tools(
     #[cfg(feature = "dap")]
     {
         #[cfg(feature = "lsp")]
-        let dap_tool = tools::DebugTool::new_with_lsp(
-            permission.clone(),
-            ask_tx.clone(),
-            lsp_manager
-                .clone()
-                .expect("lsp_manager required for dap+lsp"),
-        );
+        let dap_tool = if let Some(lsp) = lsp_manager.clone() {
+            tools::DebugTool::new_with_lsp(permission.clone(), ask_tx.clone(), lsp)
+        } else {
+            tools::DebugTool::new(permission.clone(), ask_tx.clone())
+        };
         #[cfg(not(feature = "lsp"))]
         let dap_tool = tools::DebugTool::new(permission.clone(), ask_tx.clone());
 
