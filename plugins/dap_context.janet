@@ -1,17 +1,19 @@
-# dap-context — auto-inject rich debug context after every DAP stop
+# dap_context.janet — auto-inject rich debug context after every DAP stop
 #
-# Hooks on-tool-end and checks if a DAP session is active and stopped.
-# If so, automatically evaluates every variable in scope, captures the
-# full stack trace with source locations, lists threads, and displays
-# the complete picture inline in the chat as a notification.
+# Hooks on-tool-end. Checks if a DAP session is active and stopped.
+# If so, captures the full stack trace with source locations and
+# displays the complete picture inline in the chat as a notification.
+# Also lists all threads in the debuggee.
 #
-# This eliminates the manual "step, inspect, evaluate, bt, threads"
-# loop you'd otherwise do for every breakpoint hit.
+# NOTE: when dap/stack-trace returns [] (empty frames), it often means
+# the program hasn't actually stopped at a user-visible frame — it's
+# inside a system call or the entry breakpoint hasn't resolved yet.
+# In that case we skip notification to avoid noise.
 #
 # Architecture:
 #   Plugin → dap/sessions (check if stopped)
-#          → dap/stack-trace (get frames + frame IDs)
-#          → for each frame: dap/scopes → dap/variables (drill every scope)
+#          → dap/stack-trace (get frames)
+#          → dap/threads (get thread list)
 #          → harness/notify (print everything)
 #
 # Uses the DAP Janet FFI bindings (src/dap/janet_bindings.rs) which
@@ -21,7 +23,7 @@
 
 # ── helpers ──────────────────────────────────────────────────────────
 # Janet's bundled runtime has no JSON decoder. All DAP FFI functions
-# return human-readable strings or structured text we can slice.
+# return human-readable strings; we do string matching.
 
 (defn- json-extract [s key]
   # Extract a quoted string value for a given key from JSON-like text.
@@ -67,10 +69,7 @@
 # ── main hook — fires after every tool call ──────────────────────────
 
 (defn on-tool-end [ctx]
-  # Only fire when there's an active stopped session AND the tool was
-  # a DAP control operation (step, continue, step-in, step-out, launch).
-  # We detect DAP operations by checking if a session is active AND
-  # stopped. For non-DAP tools (read, grep, edit), we stay quiet.
+  # Only fire when there's an active stopped session.
   (when (not (dap/session-active?))
     (break nil))
 
@@ -91,7 +90,7 @@
     (set out (string out "  |  Thread: " thread-id)))
   (set out (string out "\n\n"))
 
-  # 2. Stack trace (all frames)
+  # 2. Stack trace (all frames, skip runtime/library frames)
   (def bt-str (dap/stack-trace))
   (when bt-str
     (set out (string out "── Stack Trace ──\n"))
@@ -99,25 +98,35 @@
     (def files (json-extract-array bt-str "path"))
     (def lines-str (json-extract-array bt-str "line"))
 
+    (var shown 0)
     (for i 0 (length names)
-      (def name (get names i))
-      (def file (if (< i (length files)) (get files i) "?"))
-      (def line (if (< i (length lines-str)) (get lines-str i) "?"))
-      (def marker (if (= i 0) "→" " "))
-      # Show first 8 frames, skip runtime frames
-      (when (< i 8)
-        (when (not (string/find "runpy" file))
-          (set out (string out "  " marker " " name " @ " file ":" line "\n")))))
+      (when (< shown 8)
+        (def name (get names i))
+        (def file (if (< i (length files)) (get files i) "?"))
+        (def line (if (< i (length lines-str)) (get lines-str i) "?"))
+        (def marker (if (= i 0) "→" " "))
+        (when (and (not (string/find "runpy" file))
+                   (not (string/find "_run_" name)))
+          (set out (string out "  " marker " " name " @ " file ":" line "\n"))
+          (set shown (+ shown 1)))))
     (set out (string out "\n")))
 
-  # 3. Top-frame Locals (if scope ref available)
-  # dap/sessions returns JSON with scope info — we call dap/vars if we
-  # can extract a known scopes ref. But Janet has no JSON parser, so
-  # we use a heuristic: call dap/vars on ref 1000 (first scope ref),
-  # which won't return meaningful data unless there's a real frame.
-  # For now, we skip auto-scopes (future: add dap/scopes C fn to get
-  # the ref programmatically).
+  # 3. Threads
+  (def th-str (dap/threads))
+  (when th-str
+    (set out (string out "── Threads ──\n"))
+    (def tids (json-extract-array th-str "id"))
+    (def tnames (json-extract-array th-str "name"))
+    (var shown 0)
+    (for i 0 (length tids)
+      (when (< shown 10)
+        (def tid (get tids i))
+        (def name (if (< i (length tnames)) (get tnames i) "?"))
+        (set out (string out "  [" tid "] " name "\n"))
+        (set shown (+ shown 1))))
+    (set out (string out "\n")))
 
+  # 4. Quick inspect hints
   (set out (string out "── Quick Inspect ──\n"))
   (set out (string out "  Try: /dap-repl p '<var>' to evaluate\n"))
   (set out (string out "       /dap-repl vars <ref> to drill scopes\n"))

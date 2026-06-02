@@ -21,7 +21,7 @@ use crate::agent::tools::{
     AskSender, PermCheck, ToolError, check_perm, head_cap, required_nonblank,
 };
 use crate::dap::config::{self, ConnectMode, ResolvedAdapter};
-use crate::dap::session::{DAP_MANAGER, DapSessionManager};
+use crate::dap::session::{DAP_MANAGER, DAP_PERM_CHECK, DapSessionManager};
 use crate::dap::types::SourceBreakpoint;
 
 #[cfg(feature = "lsp")]
@@ -76,6 +76,7 @@ impl DebugTool {
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
         let session = Arc::new(DapSessionManager::new());
         *DAP_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
+        *DAP_PERM_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = permission.clone();
         Self {
             permission,
             ask_tx,
@@ -93,6 +94,7 @@ impl DebugTool {
     ) -> Self {
         let session = Arc::new(DapSessionManager::new());
         *DAP_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
+        *DAP_PERM_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = permission.clone();
         Self {
             permission,
             ask_tx,
@@ -450,6 +452,18 @@ impl Tool for DebugTool {
             Action::Evaluate => {
                 let expression =
                     required_nonblank(args.expression.as_deref(), "expression", "evaluate")?;
+                // Permission check for the specific expression, in addition
+                // to the generic check_perm("debug", action_str) above.
+                // Expressions execute in the debuggee's context with full
+                // process privileges — the permission dialog names the
+                // expression so the user can inspect it before allowing.
+                check_perm(
+                    &self.permission,
+                    &self.ask_tx,
+                    "debug",
+                    &format!("evaluate {expression}"),
+                )
+                .await?;
                 let context = args.context.as_deref();
                 let result = mgr
                     .evaluate(expression, args.frame_id, context, timeout)

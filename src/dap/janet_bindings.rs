@@ -32,6 +32,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc as tmpsc;
 
+use crate::dap::session::DAP_PERM_CHECK;
+
 // ---------------------------------------------------------------------------
 // DapCommand — message from Janet C function to the bridge task
 // ---------------------------------------------------------------------------
@@ -606,12 +608,35 @@ async fn handle_dap_command(cmd: DapCommand) {
 
     let signal = AbortSignal::new();
     let timeout = Duration::from_secs(30);
-    let result: Result<String, ToolError> = match cmd {
-        DapCommand::Launch {
-            ref file,
-            ref adapter,
-            ..
-        } => {
+
+    // For expression evaluation, check the permission engine before
+    // forwarding to the adapter. Expressions execute in the debuggee's
+    // context with full process privileges. Ask results are treated as
+    // denial (no dialog in the bridge task).
+    if let DapCommand::Evaluate { expression, .. } = &cmd {
+        if let Some(perm) = DAP_PERM_CHECK.lock().ok().and_then(|g| g.clone()) {
+            if let Ok(mut checker) = perm.lock() {
+                use crate::permission::checker::CheckResult;
+                match checker.check("debug", &format!("evaluate {expression}")) {
+                    CheckResult::Allowed => {}
+                    CheckResult::Ask => {
+                        send_dap_reply(
+                            &cmd,
+                            Err("expression evaluation requires permission dialog (not available in plugin bridge)".to_string()),
+                        );
+                        return;
+                    }
+                    CheckResult::Denied(r) => {
+                        send_dap_reply(&cmd, Err(format!("expression evaluation denied: {r}")));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    let result: Result<String, ToolError> = match &cmd {
+        DapCommand::Launch { file, adapter, .. } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let prog_path = std::path::Path::new(file);
 
@@ -643,9 +668,7 @@ async fn handle_dap_command(cmd: DapCommand) {
                 None => Err(ToolError::Msg(format!("no debug adapter found for {file}"))),
             }
         }
-        DapCommand::Attach {
-            pid, ref adapter, ..
-        } => {
+        DapCommand::Attach { pid, adapter, .. } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
             let resolved = if let Some(name) = adapter {
@@ -662,7 +685,7 @@ async fn handle_dap_command(cmd: DapCommand) {
                         &a.resolved_command.to_string_lossy(),
                         &a.args,
                         &cwd.to_string_lossy(),
-                        Some(pid),
+                        Some(*pid),
                         None,
                         None,
                         Some(a.attach_defaults.clone()),
@@ -694,16 +717,16 @@ async fn handle_dap_command(cmd: DapCommand) {
             .continue_(0, &signal, timeout)
             .await
             .map(|o| serde_json::to_string_pretty(&o).unwrap_or_else(|_| format!("{o:?}"))),
-        DapCommand::Breakpoint { ref file, line, .. } => {
+        DapCommand::Breakpoint { file, line, .. } => {
             let bp = crate::dap::types::SourceBreakpoint {
-                line: line as i64,
+                line: *line as i64,
                 ..Default::default()
             };
             mgr.set_breakpoints(file, vec![bp], timeout)
                 .await
                 .map(|r| serde_json::to_string_pretty(&r).unwrap_or_else(|_| format!("{r:?}")))
         }
-        DapCommand::Evaluate { ref expression, .. } => mgr
+        DapCommand::Evaluate { expression, .. } => mgr
             .evaluate(expression, None, None, timeout)
             .await
             .map(|r| serde_json::to_string_pretty(&r).unwrap_or_else(|_| format!("{r:?}"))),
@@ -724,7 +747,7 @@ async fn handle_dap_command(cmd: DapCommand) {
             None => Err(ToolError::Msg("no active debug session".to_string())),
         },
         DapCommand::Variables { var_ref, .. } => mgr
-            .variables(var_ref, timeout)
+            .variables(*var_ref, timeout)
             .await
             .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{v:?}"))),
     };

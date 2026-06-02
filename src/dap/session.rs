@@ -18,12 +18,20 @@ use crate::dap::client::{DapClient, RpcError};
 #[cfg(test)]
 use crate::dap::client::DapRpc;
 use crate::dap::types::*;
+use crate::permission::checker::PermCheck;
 
 /// Global DAP session manager — set during `DebugTool` construction,
 /// read by the UI loop for debug panel snapshots. Uses a std Mutex
 /// (not tokio) so it can be written from sync constructors and read
 /// from the UI loop without an async context.
 pub static DAP_MANAGER: StdMutex<Option<std::sync::Arc<DapSessionManager>>> = StdMutex::new(None);
+
+/// Global DAP permission checker — set during `DebugTool` construction
+/// alongside `DAP_MANAGER`. Read by the Janet FFI bridge to gate
+/// expression evaluation (`dap/eval`) through the same permission
+/// engine the agent tool path uses. Ask results from the engine are
+/// treated as denial (no dialog in the bridge task).
+pub static DAP_PERM_CHECK: StdMutex<Option<PermCheck>> = StdMutex::new(None);
 
 // ---------------------------------------------------------------------------
 // Output cap
