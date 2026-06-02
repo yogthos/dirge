@@ -43,6 +43,11 @@ pub(crate) enum DapCommand {
         adapter: Option<String>,
         reply: mpsc::Sender<Result<String, String>>,
     },
+    Attach {
+        pid: u32,
+        adapter: Option<String>,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
     StepOver {
         reply: mpsc::Sender<Result<String, String>>,
     },
@@ -167,6 +172,51 @@ unsafe fn dap_launch_body(
     unsafe { dap_send_and_wait(cmd, rx) }
 }
 
+/// C function backing `dap/__attach`. Args: pid, adapter-name-or-nil.
+unsafe extern "C-unwind" fn dap_attach_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        dap_attach_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(_) => unsafe { janet_wrap_nil() },
+    }
+}
+
+unsafe fn dap_attach_body(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if argc < 1 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let pid: u32 = match unsafe { read_dap_str(argv, 0) } {
+        Some(s) => s.parse().unwrap_or(0),
+        None => return unsafe { janet_wrap_nil() },
+    };
+    if pid == 0 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let adapter = if argc >= 2 {
+        unsafe { read_dap_str(argv, 1) }
+    } else {
+        None
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let cmd = DapCommand::Attach {
+        pid,
+        adapter,
+        reply: tx,
+    };
+    unsafe { dap_send_and_wait(cmd, rx) }
+}
+
 unsafe extern "C-unwind" fn dap_step_cfn(
     _argc: i32,
     _argv: *mut janetrs::lowlevel::Janet,
@@ -193,6 +243,7 @@ unsafe fn dap_generic_body(mut cmd: DapCommand) -> janetrs::lowlevel::Janet {
 unsafe fn set_dap_reply(cmd: &mut DapCommand, tx: mpsc::Sender<Result<String, String>>) {
     match cmd {
         DapCommand::Launch { reply, .. } => *reply = tx,
+        DapCommand::Attach { reply, .. } => *reply = tx,
         DapCommand::StepOver { reply } => *reply = tx,
         DapCommand::StepIn { reply } => *reply = tx,
         DapCommand::StepOut { reply } => *reply = tx,
@@ -461,6 +512,7 @@ use janetrs::env::CFunOptions;
 pub fn register_dap_cfns(client: &mut janetrs::client::JanetClient) {
     if let Some(env) = client.env_mut() {
         env.add_c_fn(CFunOptions::new(c"__launch", dap_launch_cfn).namespace(c"dap"));
+        env.add_c_fn(CFunOptions::new(c"__attach", dap_attach_cfn).namespace(c"dap"));
         env.add_c_fn(CFunOptions::new(c"__step", dap_step_cfn).namespace(c"dap"));
         env.add_c_fn(CFunOptions::new(c"__step_in", dap_step_in_cfn).namespace(c"dap"));
         env.add_c_fn(CFunOptions::new(c"__step_out", dap_step_out_cfn).namespace(c"dap"));
@@ -489,6 +541,9 @@ pub const HARNESS_DAP_INIT: &str = r#"
 
 (defn dap/launch [file &opt adapter]
   (dap/__launch file (if adapter adapter nil)))
+
+(defn dap/attach [pid &opt adapter]
+  (dap/__attach (string pid) (if adapter adapter nil)))
 
 (defn dap/step [] (dap/__step))
 (defn dap/step-in [] (dap/__step_in))
@@ -588,6 +643,41 @@ async fn handle_dap_command(cmd: DapCommand) {
                 None => Err(ToolError::Msg(format!("no debug adapter found for {file}"))),
             }
         }
+        DapCommand::Attach {
+            pid,
+            ref adapter,
+            ..
+        } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+            let resolved = if let Some(name) = adapter {
+                crate::dap::config::resolve_adapter(name)
+            } else {
+                crate::dap::config::select_attach_adapter(None, None)
+            };
+
+            match resolved {
+                Some(a) => {
+                    let languages = a.languages.clone();
+                    mgr.attach(
+                        &a.name,
+                        &a.resolved_command.to_string_lossy(),
+                        &a.args,
+                        &cwd.to_string_lossy(),
+                        Some(pid),
+                        None,
+                        None,
+                        Some(a.attach_defaults.clone()),
+                        &signal,
+                        timeout,
+                        languages,
+                    )
+                    .await
+                    .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}")))
+                }
+                None => Err(ToolError::Msg("no debug adapter available for attach".to_string())),
+            }
+        }
         DapCommand::StepOver { .. } => mgr
             .step_over(0, &signal, timeout)
             .await
@@ -653,6 +743,7 @@ fn send_dap_reply(cmd: &DapCommand, result: Result<String, String>) {
     }
     match cmd {
         DapCommand::Launch { reply, .. } => reply!(reply),
+        DapCommand::Attach { reply, .. } => reply!(reply),
         DapCommand::StepOver { reply } => reply!(reply),
         DapCommand::StepIn { reply } => reply!(reply),
         DapCommand::StepOut { reply } => reply!(reply),

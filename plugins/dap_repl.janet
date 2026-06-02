@@ -45,9 +45,19 @@
           (or res "launch failed — check adapter"))))
 
     "attach" (do
-      (def pid (get parts 1))
-      # attach not yet exposed as Janet FFI function; stub.
-      "attach not yet available via Janet FFI — use `launch` instead")
+      (def pid-str (get parts 1))
+      (def adapter (get parts 2))
+      (if (not pid-str)
+        "usage: attach <pid> [adapter]"
+        (do
+          (def pid (math/parse-int pid-str))
+          (if (not pid)
+            (string "invalid pid: " pid-str)
+            (do
+              (def res (if adapter
+                         (dap/attach pid adapter)
+                         (dap/attach pid)))
+              (or res "attach failed — check adapter and pid"))))))
 
     "terminate" (do
       (def res (dap/terminate))
@@ -102,6 +112,7 @@
     "help" "
 DAP REPL commands:
   launch <file> [adapter]  Start debugging a program
+  attach <pid> [adapter]   Attach to a running process
   terminate                 End debug session
   c / continue              Resume execution
   n / next / step           Step over current line
@@ -157,7 +168,8 @@ DAP REPL commands:
       (harness/request-prompt "dap> ")
       "
 DAP REPL started. Commands:
-  launch <file> [adapter]  — start debugging
+  launch <file> [adapter]   — start debugging
+  attach <pid> [adapter]    — attach to process
   c/continue, n/next/step, s/step-in, fin/step-out
   p/eval <expr>, bt/backtrace, bp/break <file> <line>
   sessions, vars <ref>, terminate, q/quit
