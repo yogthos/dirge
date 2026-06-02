@@ -32,6 +32,17 @@ cargo build --features dap
 /debug terminate
 ```
 
+Or use the Janet-powered `/dap-repl`:
+
+```
+/dap-repl launch src/tests/dap/fixtures/test_program.py
+dap> bp src/tests/dap/fixtures/test_program.py 95
+dap> c
+dap> p "counter.value"
+dap> n
+dap> terminate
+```
+
 ## Prerequisites
 
 Install the debug adapter for your language:
@@ -274,6 +285,82 @@ TUI responsive even if the adapter takes seconds to initialize.
   Before that, `/debug` subcommands that need a session return "start a
   conversation first".
 
+### Janet FFI bridge and plugins
+
+When built with both `dap` and `plugin` features, dirge exposes the DAP
+session manager to Janet plugins through a FFI bridge (`src/dap/janet_bindings.rs`).
+Plugins can call 12 DAP functions directly — no agent middleman needed.
+
+**Janet FFI functions:**
+
+| Janet function | Args | What it does |
+|---|---|---|
+| `(dap/launch file adapter?)` | file path, optional adapter name | Spawn adapter, launch debuggee |
+| `(dap/attach pid adapter?)` | process ID, optional adapter name | Attach to running process |
+| `(dap/step)` | — | Step over current line |
+| `(dap/step-in)` | — | Step into function call |
+| `(dap/step-out)` | — | Step out of current function |
+| `(dap/continue)` | — | Resume execution |
+| `(dap/bp file line)` | file path, line number | Set breakpoint |
+| `(dap/eval expr)` | expression string | Evaluate in debuggee |
+| `(dap/stack-trace)` | — | Get call stack (JSON) |
+| `(dap/threads)` | — | List threads (JSON) |
+| `(dap/sessions)` | — | Active session summary (JSON) |
+| `(dap/vars var-ref)` | variablesReference number | Drill into scope variables |
+| `(dap/terminate)` | — | End debug session |
+| `(dap/available?)` | — | Feature detection predicate |
+| `(dap/session-active?)` | — | True when a session is active |
+
+Architecture: plugin calls Janet FFI function → C function extracts args,
+builds `DapCommand`, sends via thread-local `DAP_TX` (tokio `UnboundedSender`)
+→ `spawn_dap_bridge()` tokio task → `DapSessionManager` async methods
+→ JSON result back via std `mpsc` channel → Janet string (or nil on error).
+Follows the same channel-bridge pattern as `harness/confirm` and `harness/lsp`
+in `src/plugin/worker.rs`.
+
+**Bundled Janet plugins:**
+
+| Plugin | Slash command | What it does |
+|--------|-------------|-------------|
+| `dap_repl.janet` | `/dap-repl` | gdb-like interactive debug sub-mode (launch, step, continue, bp, eval, bt, sessions, terminate) |
+| `dap_profiler.janet` | `/dap-profile start <interval-ms>` | Statistical sampling profiler — periodic `dap/stack-trace` → per-function aggregation → top-20 hotspot report |
+| `dap_watch.janet` | `/dap-watch add <expr>` | Expression watchpoints — evaluates registered expressions via `dap/eval` after every stop |
+| `dap_context.janet` | (auto) | Auto-injects rich debug context (session summary, stack trace, inspect hints) after every DAP stop via `on-tool-end` hook |
+
+**Quick start with `/dap-repl`:**
+
+```
+/dap-repl launch src/tests/dap/fixtures/test_program.py
+dap> bp src/tests/dap/fixtures/test_program.py 95
+dap> c
+dap> bt                    # full stack trace
+dap> p "counter.value"     # evaluate expression
+dap> n                     # step over
+dap> p "counter.value"     # see value change
+dap> terminate
+```
+
+**Dirge-debugging-dirge via attach:**
+
+```
+# Terminal 1: normal dirge session (the target)
+dirge
+> hello
+
+# Terminal 2: controlling dirge with DAP
+dirge --features dap,plugin
+> hello
+/dap-repl attach 12345 --adapter lldb-dap
+dap> bp src/dap/session.rs 277
+dap> c             # dirge in terminal 1 resumes
+# ... interact in terminal 1; breakpoint hits in terminal 2 ...
+dap> bt            # stack trace at breakpoint
+dap> terminate
+```
+
+Requires `kernel.yama.ptrace_scope=0` or launching the target dirge
+via `lldb-dap` directly (which sidesteps ptrace restrictions).
+
 ### TUI debug panel
 
 The right panel shows live session state (adapter name, status, stop reason,
@@ -353,3 +440,69 @@ $ cargo run --features dap
 /debug terminate
 # → debug session terminated. exit code: none
 ```
+
+## Full worked example (C)
+
+```
+# Compile the fixture first (one-time)
+$ gcc -g src/tests/dap/fixtures/test_program.c -o src/tests/dap/fixtures/test_program_c
+
+# In the TUI:
+> debug test_program_c
+
+/debug launch src/tests/dap/fixtures/test_program_c --adapter lldb-dap
+# → right panel switches to debug view
+# → "Session dap-2 (lldb-dap) — Stopped"
+
+/debug bp src/tests/dap/fixtures/test_program.c 149
+# → set 1 breakpoint(s), line 149 — verified: true
+
+/debug continue
+# → stopped at breakpoint
+# → Program output: number = 42\npi = 3.14159...\n...
+
+/debug evaluate "conn.adapter.name"
+# → "\"debugpy\""
+
+/debug evaluate "conn.counter.value"
+# → 10
+
+/debug evaluate "conn.last_error"
+# → ERR_TIMEOUT
+
+/debug step
+# → stopped — reason: step, thread: 213354
+
+/debug evaluate "c.value"
+# → 10
+
+/debug terminate
+```
+
+## Full worked example (Rust)
+
+```
+# Compile the fixture first (one-time)
+$ rustc -g src/tests/dap/fixtures/test_program.rs -o src/tests/dap/fixtures/test_program_rs
+
+# In the TUI:
+> debug test_program_rs
+
+/debug launch src/tests/dap/fixtures/test_program_rs --adapter lldb-dap
+/debug bp src/tests/dap/fixtures/test_program.rs 124
+/debug continue
+# → stopped at breakpoint
+
+/debug evaluate "counter.value"
+# → 10
+
+/debug evaluate "adapter.name"
+# → "debugpy"
+
+/debug evaluate "last_error"
+# → Timeout(30)
+
+/debug terminate
+```
+
+## Full worked example (Python)
