@@ -183,9 +183,7 @@ unsafe extern "C-unwind" fn dap_step_cfn(
     }
 }
 
-unsafe fn dap_generic_body(
-    mut cmd: DapCommand,
-) -> janetrs::lowlevel::Janet {
+unsafe fn dap_generic_body(mut cmd: DapCommand) -> janetrs::lowlevel::Janet {
     // Replace the zeroed reply with a real channel.
     let (tx, rx) = mpsc::channel();
     unsafe { set_dap_reply(&mut cmd, tx) };
@@ -225,12 +223,10 @@ unsafe fn dap_send_and_wait(
     let start = std::time::Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(Ok(json)) => {
-                match unsafe { dap_wrap_str(&json) } {
-                    Some(j) => return j,
-                    None => return unsafe { janet_wrap_nil() },
-                }
-            }
+            Ok(Ok(json)) => match unsafe { dap_wrap_str(&json) } {
+                Some(j) => return j,
+                None => return unsafe { janet_wrap_nil() },
+            },
             Ok(Err(_)) => return unsafe { janet_wrap_nil() },
             Err(mpsc::RecvTimeoutError::Disconnected) => return unsafe { janet_wrap_nil() },
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -264,27 +260,48 @@ macro_rules! dap_simple_cfn {
     };
 }
 
-dap_simple_cfn!(dap_step_in_cfn, DapCommand::StepIn {
-    reply: std::mem::zeroed()
-});
-dap_simple_cfn!(dap_step_out_cfn, DapCommand::StepOut {
-    reply: std::mem::zeroed()
-});
-dap_simple_cfn!(dap_continue_cfn, DapCommand::Continue {
-    reply: std::mem::zeroed()
-});
-dap_simple_cfn!(dap_stack_trace_cfn, DapCommand::StackTrace {
-    reply: std::mem::zeroed()
-});
-dap_simple_cfn!(dap_threads_cfn, DapCommand::Threads {
-    reply: std::mem::zeroed()
-});
-dap_simple_cfn!(dap_terminate_cfn, DapCommand::Terminate {
-    reply: std::mem::zeroed()
-});
-dap_simple_cfn!(dap_sessions_cfn, DapCommand::Sessions {
-    reply: std::mem::zeroed()
-});
+dap_simple_cfn!(
+    dap_step_in_cfn,
+    DapCommand::StepIn {
+        reply: std::mem::zeroed()
+    }
+);
+dap_simple_cfn!(
+    dap_step_out_cfn,
+    DapCommand::StepOut {
+        reply: std::mem::zeroed()
+    }
+);
+dap_simple_cfn!(
+    dap_continue_cfn,
+    DapCommand::Continue {
+        reply: std::mem::zeroed()
+    }
+);
+dap_simple_cfn!(
+    dap_stack_trace_cfn,
+    DapCommand::StackTrace {
+        reply: std::mem::zeroed()
+    }
+);
+dap_simple_cfn!(
+    dap_threads_cfn,
+    DapCommand::Threads {
+        reply: std::mem::zeroed()
+    }
+);
+dap_simple_cfn!(
+    dap_terminate_cfn,
+    DapCommand::Terminate {
+        reply: std::mem::zeroed()
+    }
+);
+dap_simple_cfn!(
+    dap_sessions_cfn,
+    DapCommand::Sessions {
+        reply: std::mem::zeroed()
+    }
+);
 
 // Evaluate — takes an expression string arg.
 unsafe extern "C-unwind" fn dap_evaluate_cfn(
@@ -313,10 +330,12 @@ unsafe fn dap_eval_body(
         Some(s) => s,
         None => return unsafe { janet_wrap_nil() },
     };
-    unsafe { dap_generic_body(DapCommand::Evaluate {
-        expression,
-        reply: std::mem::zeroed(),
-    }) }
+    unsafe {
+        dap_generic_body(DapCommand::Evaluate {
+            expression,
+            reply: std::mem::zeroed(),
+        })
+    }
 }
 
 // Breakpoint — takes file + line.
@@ -334,10 +353,7 @@ unsafe extern "C-unwind" fn dap_breakpoint_cfn(
     }
 }
 
-unsafe fn dap_bp_body(
-    argc: i32,
-    argv: *mut janetrs::lowlevel::Janet,
-) -> janetrs::lowlevel::Janet {
+unsafe fn dap_bp_body(argc: i32, argv: *mut janetrs::lowlevel::Janet) -> janetrs::lowlevel::Janet {
     use janetrs::lowlevel::*;
     if argc < 2 {
         return unsafe { janet_wrap_nil() };
@@ -353,11 +369,13 @@ unsafe fn dap_bp_body(
     if line == 0 {
         return unsafe { janet_wrap_nil() };
     }
-    unsafe { dap_generic_body(DapCommand::Breakpoint {
-        file,
-        line,
-        reply: std::mem::zeroed(),
-    }) }
+    unsafe {
+        dap_generic_body(DapCommand::Breakpoint {
+            file,
+            line,
+            reply: std::mem::zeroed(),
+        })
+    }
 }
 
 // Variables — takes variable reference number.
@@ -387,10 +405,12 @@ unsafe fn dap_vars_body(
         Some(s) => s.parse().unwrap_or(0),
         None => return unsafe { janet_wrap_nil() },
     };
-    unsafe { dap_generic_body(DapCommand::Variables {
-        var_ref,
-        reply: std::mem::zeroed(),
-    }) }
+    unsafe {
+        dap_generic_body(DapCommand::Variables {
+            var_ref,
+            reply: std::mem::zeroed(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,10 +529,7 @@ pub fn spawn_dap_bridge() -> (
     let (tx, mut rx) = tmpsc::unbounded_channel::<DapCommand>();
     let handle = tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
-            let result = handle_dap_command(cmd).await;
-            // result is sent back via the oneshot embedded in the command.
-            // handle_dap_command already does this internally.
-            let _ = result;
+            handle_dap_command(cmd).await;
         }
     });
     (handle, tx)
@@ -520,15 +537,11 @@ pub fn spawn_dap_bridge() -> (
 
 /// Process a single DAP command on the tokio runtime.
 async fn handle_dap_command(cmd: DapCommand) {
-    use crate::dap::session::DAP_MANAGER;
     use crate::agent::agent_loop::tool::AbortSignal;
     use crate::agent::tools::ToolError;
+    use crate::dap::session::DAP_MANAGER;
 
-    let mgr = match DAP_MANAGER
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-    {
+    let mgr = match DAP_MANAGER.lock().ok().and_then(|g| g.clone()) {
         Some(m) => m,
         None => {
             send_dap_reply(&cmd, Err("no DAP session manager".to_string()));
@@ -539,9 +552,12 @@ async fn handle_dap_command(cmd: DapCommand) {
     let signal = AbortSignal::new();
     let timeout = Duration::from_secs(30);
     let result: Result<String, ToolError> = match cmd {
-        DapCommand::Launch { ref file, ref adapter, .. } => {
-            let cwd = std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        DapCommand::Launch {
+            ref file,
+            ref adapter,
+            ..
+        } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let prog_path = std::path::Path::new(file);
 
             let resolved = if let Some(name) = adapter {
@@ -558,7 +574,7 @@ async fn handle_dap_command(cmd: DapCommand) {
                         &a.resolved_command.to_string_lossy(),
                         &a.args,
                         &cwd.to_string_lossy(),
-                        &file,
+                        file,
                         &[],
                         Some(true),
                         Some(a.launch_defaults.clone()),
@@ -567,48 +583,27 @@ async fn handle_dap_command(cmd: DapCommand) {
                         languages,
                     )
                     .await
-                    .map(|s| {
-                        serde_json::to_string_pretty(&s)
-                            .unwrap_or_else(|_| format!("{s:?}"))
-                    })
+                    .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}")))
                 }
-                None => Err(ToolError::Msg(format!(
-                    "no debug adapter found for {file}"
-                ))),
+                None => Err(ToolError::Msg(format!("no debug adapter found for {file}"))),
             }
         }
-        DapCommand::StepOver { .. } => {
-            mgr.step_over(0, &signal, timeout)
-                .await
-                .map(|s| {
-                    serde_json::to_string_pretty(&s)
-                        .unwrap_or_else(|_| format!("{s:?}"))
-                })
-        }
-        DapCommand::StepIn { .. } => {
-            mgr.step_in(0, &signal, timeout)
-                .await
-                .map(|s| {
-                    serde_json::to_string_pretty(&s)
-                        .unwrap_or_else(|_| format!("{s:?}"))
-                })
-        }
-        DapCommand::StepOut { .. } => {
-            mgr.step_out(0, &signal, timeout)
-                .await
-                .map(|s| {
-                    serde_json::to_string_pretty(&s)
-                        .unwrap_or_else(|_| format!("{s:?}"))
-                })
-        }
-        DapCommand::Continue { .. } => {
-            mgr.continue_(0, &signal, timeout)
-                .await
-                .map(|o| {
-                    serde_json::to_string_pretty(&o)
-                        .unwrap_or_else(|_| format!("{o:?}"))
-                })
-        }
+        DapCommand::StepOver { .. } => mgr
+            .step_over(0, &signal, timeout)
+            .await
+            .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}"))),
+        DapCommand::StepIn { .. } => mgr
+            .step_in(0, &signal, timeout)
+            .await
+            .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}"))),
+        DapCommand::StepOut { .. } => mgr
+            .step_out(0, &signal, timeout)
+            .await
+            .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}"))),
+        DapCommand::Continue { .. } => mgr
+            .continue_(0, &signal, timeout)
+            .await
+            .map(|o| serde_json::to_string_pretty(&o).unwrap_or_else(|_| format!("{o:?}"))),
         DapCommand::Breakpoint { ref file, line, .. } => {
             let bp = crate::dap::types::SourceBreakpoint {
                 line: line as i64,
@@ -616,58 +611,32 @@ async fn handle_dap_command(cmd: DapCommand) {
             };
             mgr.set_breakpoints(file, vec![bp], timeout)
                 .await
-                .map(|r| {
-                    serde_json::to_string_pretty(&r)
-                        .unwrap_or_else(|_| format!("{r:?}"))
-                })
+                .map(|r| serde_json::to_string_pretty(&r).unwrap_or_else(|_| format!("{r:?}")))
         }
-        DapCommand::Evaluate { ref expression, .. } => {
-            mgr.evaluate(expression, None, None, timeout)
-                .await
-                .map(|r| {
-                    serde_json::to_string_pretty(&r)
-                        .unwrap_or_else(|_| format!("{r:?}"))
-                })
-        }
-        DapCommand::StackTrace { .. } => {
-            mgr.stack_trace(0, None, timeout)
-                .await
-                .map(|f| {
-                    serde_json::to_string_pretty(&f)
-                        .unwrap_or_else(|_| format!("{f:?}"))
-                })
-        }
-        DapCommand::Threads { .. } => {
-            mgr.threads(timeout)
-                .await
-                .map(|t| {
-                    serde_json::to_string_pretty(&t)
-                        .unwrap_or_else(|_| format!("{t:?}"))
-                })
-        }
-        DapCommand::Terminate { .. } => {
-            mgr.terminate(timeout)
-                .await
-                .map(|s| {
-                    serde_json::to_string_pretty(&s)
-                        .unwrap_or_else(|_| format!("{s:?}"))
-                })
-        }
-        DapCommand::Sessions { .. } => {
-            match mgr.active_summary().await {
-                Some(s) => Ok(serde_json::to_string_pretty(&s)
-                    .unwrap_or_else(|_| format!("{s:?}"))),
-                None => Err(ToolError::Msg("no active debug session".to_string())),
-            }
-        }
-        DapCommand::Variables { var_ref, .. } => {
-            mgr.variables(var_ref, timeout)
-                .await
-                .map(|v| {
-                    serde_json::to_string_pretty(&v)
-                        .unwrap_or_else(|_| format!("{v:?}"))
-                })
-        }
+        DapCommand::Evaluate { ref expression, .. } => mgr
+            .evaluate(expression, None, None, timeout)
+            .await
+            .map(|r| serde_json::to_string_pretty(&r).unwrap_or_else(|_| format!("{r:?}"))),
+        DapCommand::StackTrace { .. } => mgr
+            .stack_trace(0, None, timeout)
+            .await
+            .map(|f| serde_json::to_string_pretty(&f).unwrap_or_else(|_| format!("{f:?}"))),
+        DapCommand::Threads { .. } => mgr
+            .threads(timeout)
+            .await
+            .map(|t| serde_json::to_string_pretty(&t).unwrap_or_else(|_| format!("{t:?}"))),
+        DapCommand::Terminate { .. } => mgr
+            .terminate(timeout)
+            .await
+            .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}"))),
+        DapCommand::Sessions { .. } => match mgr.active_summary().await {
+            Some(s) => Ok(serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}"))),
+            None => Err(ToolError::Msg("no active debug session".to_string())),
+        },
+        DapCommand::Variables { var_ref, .. } => mgr
+            .variables(var_ref, timeout)
+            .await
+            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{v:?}"))),
     };
 
     match result {

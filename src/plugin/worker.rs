@@ -1025,19 +1025,28 @@ fn worker_loop(
         let _ = init_tx.send(Err(format!("harness sandbox init failed: {e}")));
         return;
     }
+
     // Run the DAP Janet bindings prelude when the dap feature is enabled.
     // This defines (dap/launch ...), (dap/step), etc. as wrappers over
     // the C functions registered above. Plugins can call these directly.
+    // DAP bridge: stores channel before init completes; the Janet
+    // thread consumes it in set_ce_fn. Must precede dap init so plugins
+    // that invoke dap/ functions during their own setup don't hit NPE.
     #[cfg(feature = "dap")]
     {
+        let (_dap_handle, dap_tx) = crate::dap::janet_bindings::spawn_dap_bridge();
+        crate::dap::janet_bindings::store_dap_tx(dap_tx);
+        // Run Janet init that binds dap/ C fns.
+        // Must run AFTER harness-sandbox so overridden fns that touch
+        // DAP internals can't be shadowed.
         if let Err(e) = client.run(crate::dap::janet_bindings::HARNESS_DAP_INIT) {
             let _ = init_tx.send(Err(format!("dap init failed: {e}")));
             return;
         }
-        // Install the DAP bridge sender on this thread BEFORE any plugin
-        // code runs — plugins that call (dap/launch) during load need the
-        // bridge to be live. The bridge receiver is spawned by the plugin
-        // manager right after worker init.
+        // Install the bridge sender on the Janet thread so C-fns can
+        // reach the tokio worker. Must happen here, inside the worker,
+        // because `store_dap_tx` already primed the channel from the
+        // plugin-manager side.
         crate::dap::janet_bindings::install_dap_tx(
             crate::dap::janet_bindings::take_dap_tx_for_worker(),
         );
