@@ -67,7 +67,7 @@ fn validate_session_id(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn save_session(session: &Session) -> anyhow::Result<()> {
+pub fn save_session(session: &mut Session) -> anyhow::Result<()> {
     validate_session_id(&session.id)?;
     // SESS-15: refuse to save a session that was loaded from a
     // file with `schema_version > SCHEMA_VERSION`. Newer-version
@@ -135,6 +135,18 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     // `tokio::fs::write` directly which truncates in place — a
     // corruption vector on crash.
     crate::fs_atomic::atomic_write_sync(&path, json.as_bytes())?;
+
+    // dirge-yrql: refresh `loaded_mtime` to OUR write's mtime. Without this,
+    // a resumed session (loaded_mtime = Some) would mistake its own previous
+    // write for a concurrent instance on the NEXT save — the first save
+    // advances the file mtime past the stale `loaded_mtime`, so every later
+    // save would conflict-divert to a `.conflict-*.json` and the real file
+    // would stop updating. Re-stat after the rename so the recorded mtime is
+    // the file's actual on-disk value; a truly concurrent write after this
+    // point is still caught (its mtime will exceed what we just recorded).
+    if let Ok(meta) = std::fs::metadata(&path) {
+        session.loaded_mtime = meta.modified().ok();
+    }
     Ok(())
 }
 
@@ -417,7 +429,7 @@ mod tests {
         sess.id = compact_str::CompactString::from(id.clone());
 
         // First write — establishes the on-disk file with mtime T0.
-        save_session(&sess).expect("first save");
+        save_session(&mut sess).expect("first save");
 
         // Simulate "loaded earlier": set loaded_mtime to T0 - 1s so
         // the on-disk mtime is necessarily newer. (We could also
@@ -427,7 +439,7 @@ mod tests {
 
         // Second save with stale loaded_mtime — should detect the
         // newer on-disk file and divert.
-        let result = save_session(&sess);
+        let result = save_session(&mut sess);
         assert!(result.is_err(), "expected conflict error");
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("modified by another"), "got: {err_msg}");
@@ -464,9 +476,102 @@ mod tests {
         let mut sess = Session::new("openrouter", "test-model", 128_000);
         sess.id = compact_str::CompactString::from(id.clone());
         assert!(sess.loaded_mtime.is_none());
-        save_session(&sess).expect("fresh save must succeed");
+        save_session(&mut sess).expect("fresh save must succeed");
         let dir = session_dir();
         let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+    }
+
+    /// dirge-yrql contract: after a successful save, `loaded_mtime` tracks
+    /// the file we just wrote. Deterministic catcher for the self-conflict
+    /// bug — before the fix `save_session` took `&Session` and could not
+    /// refresh it, so it stayed `None`/stale and the NEXT save mistook our
+    /// own write for a concurrent instance.
+    #[test]
+    fn save_refreshes_loaded_mtime_to_written_file() {
+        use crate::session::Session;
+        let id = format!(
+            "test-mtime-{}",
+            std::process::id() as u64 * 1000
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        );
+        let mut sess = Session::new("openrouter", "test-model", 128_000);
+        sess.id = compact_str::CompactString::from(id.clone());
+        let dir = session_dir();
+        let path = dir.join(format!("{id}.json"));
+
+        save_session(&mut sess).expect("save");
+        let disk = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            sess.loaded_mtime,
+            Some(disk),
+            "loaded_mtime must be refreshed to the just-written file's mtime",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// dirge-yrql regression: a RESUMED session (loaded_mtime = Some) must
+    /// keep persisting to its real file on every save — never self-conflict
+    /// and divert to `.conflict-*` siblings.
+    #[test]
+    fn resumed_session_keeps_saving_without_self_conflict() {
+        use crate::session::{MessageRole, Session};
+        let id = format!(
+            "test-resume-{}",
+            std::process::id() as u64 * 1000
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        );
+        let mut sess = Session::new("openrouter", "test-model", 128_000);
+        sess.id = compact_str::CompactString::from(id.clone());
+        let dir = session_dir();
+        let path = dir.join(format!("{id}.json"));
+
+        // Seed the file, then LOAD it so loaded_mtime is Some (a resume).
+        save_session(&mut sess).expect("seed save");
+        let mut resumed = load_session(&id).expect("load");
+        assert!(resumed.loaded_mtime.is_some(), "load records mtime");
+
+        // Repeated saves of the resumed session must all succeed.
+        for i in 0..3 {
+            resumed.add_message(MessageRole::User, &format!("msg {i}"));
+            save_session(&mut resumed)
+                .unwrap_or_else(|e| panic!("resumed save {i} must succeed; got: {e}"));
+        }
+
+        // No conflict siblings were created.
+        let conflicts = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&format!("{id}.conflict-")))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            conflicts, 0,
+            "resumed saves must not divert to conflict files"
+        );
+
+        // The real file reflects the latest content.
+        let reloaded = load_session(&id).expect("reload");
+        assert!(
+            reloaded
+                .messages
+                .iter()
+                .any(|m| m.content.contains("msg 2")),
+            "the real session file must hold the latest message",
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // --- Integration: full persistence round-trips -------------------
@@ -510,7 +615,7 @@ mod tests {
         let orig_msg_count = s.messages.len();
         let orig_tokens = s.total_estimated_tokens;
 
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
         let loaded = load_session(&id).expect("load");
         cleanup_session(&id);
 
@@ -547,7 +652,7 @@ mod tests {
             }],
         );
 
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
         let loaded = load_session(&id).expect("load");
         cleanup_session(&id);
 
@@ -579,7 +684,7 @@ mod tests {
             pattern: "/tmp/**".to_string(),
         });
 
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
         let loaded = load_session(&id).expect("load");
         cleanup_session(&id);
 
@@ -603,7 +708,7 @@ mod tests {
         s.add_message(MessageRole::Assistant, "reply 2");
         s.compress("summary of first 4 messages".to_string(), 4, 50);
 
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
         let loaded = load_session(&id).expect("load");
         cleanup_session(&id);
 
@@ -636,7 +741,7 @@ mod tests {
         s.fork_at(&fork_target).expect("fork");
         s.add_message(MessageRole::Assistant, "alternate answer");
 
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
         let loaded = load_session(&id).expect("load");
         cleanup_session(&id);
 
@@ -676,7 +781,7 @@ mod tests {
         s.append_plugin_entry("bookmark", "save point 1", true);
         s.append_plugin_entry("stats", r#"{"tokens": 500}"#, false);
 
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
         let loaded = load_session(&id).expect("load");
         cleanup_session(&id);
 
@@ -701,12 +806,12 @@ mod tests {
         let mut s = Session::new("openrouter", "test", 100_000);
         s.id = compact_str::CompactString::from(id.clone());
         let orig_created = s.created_at.clone();
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
 
         // Load, modify, re-save.
         let mut loaded = load_session(&id).expect("load");
         loaded.add_message(crate::session::MessageRole::User, "added after reload");
-        save_session(&loaded).expect("resave");
+        save_session(&mut loaded).expect("resave");
 
         let reloaded = load_session(&id).expect("reload");
         cleanup_session(&id);
@@ -727,7 +832,7 @@ mod tests {
         let id = unique_test_id("roundtrip-delete");
         let mut s = Session::new("p", "m", 100_000);
         s.id = compact_str::CompactString::from(id.clone());
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
 
         delete_session(&id).expect("delete");
         let err = load_session(&id).expect_err("load after delete must fail");
@@ -756,7 +861,7 @@ mod tests {
             created_at: "2026-05-01T00:00:00Z".to_string(),
         });
 
-        save_session(&s).expect("save");
+        save_session(&mut s).expect("save");
         let loaded = load_session(&id).expect("load");
         cleanup_session(&id);
 

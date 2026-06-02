@@ -928,7 +928,7 @@ async fn main() -> anyhow::Result<()> {
             session.add_message(MessageRole::User, &msg);
             session.add_message(MessageRole::Assistant, &response);
             crate::agent::review::maybe_fire_session_end(&agent, &session);
-            if let Err(e) = session::storage::save_session(&session) {
+            if let Err(e) = session::storage::save_session(&mut session) {
                 eprintln!("warning: failed to save session: {}", e);
             }
         }
