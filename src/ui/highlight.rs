@@ -59,6 +59,14 @@ pub fn highlight_code(code: &str, lang: &str) -> Vec<Vec<Span>> {
     out
 }
 
+/// Whether `lang` (or one of its aliases) has dedicated highlighting
+/// rules. Callers that render unknown content in their own plain color
+/// (e.g. `read` boxes for `.txt`/`.md`) use this to skip highlighting
+/// rather than paint everything the uniform fallback color.
+pub fn supports(lang: &str) -> bool {
+    rules_for(normalize_lang(lang)).is_some()
+}
+
 /// Normalize fence info strings to a stable language id.
 fn normalize_lang(lang: &str) -> &str {
     // Some markdown sources include attributes like ```rust,no_run.

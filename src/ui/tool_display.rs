@@ -281,8 +281,21 @@ pub(crate) fn render_tool_output(
         };
         renderer.write_line(&chamber_row(placeholder, inner), theme::dim())?;
     }
-    for line in &lines[..shown_lines] {
-        renderer.write_line(&chamber_row(line, inner), theme::result())?;
+    // dirge-hukk: syntax-highlight `read` boxes (file content) by the file's
+    // extension. Unknown/extensionless files fall through to the plain path.
+    if let Some(lang) = read_highlight_lang(tool_name, banner_value) {
+        let highlighted = crate::ui::highlight::highlight_code(&char_sliced, &lang);
+        for spans in highlighted.iter().take(shown_lines) {
+            let ansi = spans_to_ansi(spans);
+            renderer.write_line(
+                &chamber_row_styled(&ansi, inner, theme::result()),
+                theme::result(),
+            )?;
+        }
+    } else {
+        for line in &lines[..shown_lines] {
+            renderer.write_line(&chamber_row(line, inner), theme::result())?;
+        }
     }
     if hidden_lines > 0 {
         let note = format!(
@@ -343,6 +356,85 @@ pub(crate) fn chamber_bottom(frame_w: usize) -> String {
 
 pub(crate) fn chamber_row(content: &str, inner: usize) -> String {
     box_render::row(box_render::BoxStyle::Rounded, content, inner + 4)
+}
+
+/// Chamber row for ANSI-styled content (syntax-highlighted code). Unlike
+/// [`chamber_row`], which is byte-width based and expects plain text, this
+/// measures with the ANSI-aware [`crate::ui::wrap::visible_width`], truncates
+/// without cutting an SGR sequence, and restores `base` (the row's themed
+/// color) for the trailing padding + border so highlight colors don't bleed
+/// into the chamber frame. dirge-hukk.
+pub(crate) fn chamber_row_styled(content: &str, inner: usize, base: Color) -> String {
+    let base_ansi = crate::ui::markdown::ansi_fg(base);
+    let vis = crate::ui::wrap::visible_width(content);
+    let body = if vis <= inner {
+        format!("{content}{base_ansi}{}", " ".repeat(inner - vis))
+    } else {
+        // Reserve one cell for the `…` ellipsis.
+        let truncated = truncate_ansi(content, inner.saturating_sub(1));
+        format!("{truncated}{base_ansi}…")
+    };
+    format!("│ {body} │")
+}
+
+/// Truncate an ANSI-styled string to at most `max` visible cells, copying
+/// SGR escape sequences through verbatim (0 width) so a color code is never
+/// cut in half.
+fn truncate_ansi(s: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::with_capacity(s.len());
+    let mut width = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Copy the whole escape sequence: ESC, then up to the final
+            // letter (e.g. `m` for SGR). Zero display width.
+            out.push(c);
+            for ec in chars.by_ref() {
+                out.push(ec);
+                if ec.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + w > max {
+            break;
+        }
+        out.push(c);
+        width += w;
+    }
+    out
+}
+
+/// Flatten one highlighted line's spans into an ANSI-embedded string
+/// (`<color-sgr><text>` per span). Consumed by [`chamber_row_styled`].
+fn spans_to_ansi(spans: &[crate::ui::highlight::Span]) -> String {
+    let mut out = String::new();
+    for span in spans {
+        out.push_str(&crate::ui::markdown::ansi_fg(span.color));
+        out.push_str(&span.text);
+    }
+    out
+}
+
+/// The fenced-code language id for a `read` box, derived from the file
+/// path's extension (`banner_value`). `None` disables highlighting (plain
+/// `theme::result()` rendering) — for extensionless files and non-`read`
+/// tools whose output isn't a single source file.
+fn read_highlight_lang(tool_name: &str, banner_value: &str) -> Option<String> {
+    if tool_name != "read" {
+        return None;
+    }
+    let ext = std::path::Path::new(banner_value.trim())
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    // Only highlight languages we actually have rules for; otherwise leave
+    // the content in the plain themed color (don't paint it the uniform
+    // fallback tone).
+    crate::ui::highlight::supports(&ext).then_some(ext)
 }
 
 pub(crate) fn chamber_row_with_bg(content: &str, inner: usize, bg_idx: u8) -> String {
@@ -752,5 +844,38 @@ mod tests {
         let visible = crate::ui::wrap::visible_width(&row);
         assert_eq!(visible, inner + 4);
         assert!(row.ends_with('│'));
+    }
+
+    // dirge-hukk: a styled (ANSI-colored) chamber row pads to the same
+    // visible width as a plain one — the embedded SGR codes are zero-width,
+    // so the right border still aligns.
+    #[test]
+    fn chamber_row_styled_aligns_despite_ansi() {
+        let inner = 30;
+        let content = format!("\x1b[32mfn\x1b[0m main() {{}}");
+        let row = chamber_row_styled(&content, inner, Color::Green);
+        assert_eq!(crate::ui::wrap::visible_width(&row), inner + 4);
+        assert!(row.starts_with("│ ") && row.ends_with(" │"));
+    }
+
+    // Long styled content truncates with `…`, still aligns, and never cuts
+    // an SGR escape in half (every ESC is followed by its terminator).
+    #[test]
+    fn chamber_row_styled_truncates_without_orphaning_escapes() {
+        let inner = 8;
+        let content = "\x1b[32mverylongidentifier_here\x1b[0m".to_string();
+        let row = chamber_row_styled(&content, inner, Color::Green);
+        assert_eq!(crate::ui::wrap::visible_width(&row), inner + 4);
+        assert!(row.contains('…'));
+        // No ESC left dangling without an alphabetic terminator before EOL.
+        let bytes: Vec<char> = row.chars().collect();
+        for (i, c) in bytes.iter().enumerate() {
+            if *c == '\x1b' {
+                assert!(
+                    bytes[i + 1..].iter().any(|d| d.is_ascii_alphabetic()),
+                    "dangling ESC at {i} in {row:?}"
+                );
+            }
+        }
     }
 }
