@@ -93,14 +93,16 @@ impl Theme {
     /// monochrome monitor.
     pub const fn phosphor() -> Self {
         Theme {
-            // The AI's prose is the focal point — push it close to white
-            // (high brightness, low saturation) so the eye lands there
-            // first, while the green chrome (tool/header/accent) recedes
-            // around it. A faint green tint keeps the phosphor identity.
+            // The AI's prose is the focal point: a bright phosphor green —
+            // a modern take on the 80s CRT look. Light and green-forward so
+            // the eye lands here first and it reads unmistakably as the
+            // green-terminal voice, while the more-saturated/darker green
+            // chrome (tool/header/accent) recedes around it. Not near-white
+            // (loses the CRT character) and not neon (#00ff00 is harsh).
             agent: Color::Rgb {
-                r: 222,
-                g: 248,
-                b: 226,
+                r: 138,
+                g: 232,
+                b: 156,
             },
             // Cyan complements phosphor green without breaking the
             // CRT aesthetic — classic CRTs shipped with green OR
