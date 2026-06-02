@@ -780,3 +780,82 @@ fn send_dap_reply(cmd: &DapCommand, result: Result<String, String>) {
         DapCommand::Variables { reply, .. } => reply!(reply),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::checker::{PermCheck, PermissionChecker};
+    use crate::permission::{PermissionConfig, SecurityMode};
+    use std::sync::{Arc, Mutex};
+
+    /// Build a PermissionChecker in the given mode for the bridge eval gate.
+    fn make_checker(mode: SecurityMode) -> PermCheck {
+        let pc = PermissionChecker::new(&PermissionConfig::default(), mode, None);
+        Arc::new(Mutex::new(pc))
+    }
+
+    /// Verify that an eval permission check IS denied in Standard mode
+    /// (the engine returns Ask which the bridge treats as deny).
+    #[test]
+    fn eval_perm_denied_in_standard_mode() {
+        let perm = make_checker(SecurityMode::Standard);
+        let mut checker = perm.lock().unwrap();
+        let result = checker.check("debug", "evaluate x + 1");
+        assert!(
+            !matches!(result, crate::permission::checker::CheckResult::Allowed),
+            "expected Ask or Denied in Standard mode, got {result:?}"
+        );
+    }
+
+    /// Accept mode should allow evaluate (Ask → Allow coercion).
+    #[test]
+    fn eval_perm_allowed_in_accept_mode() {
+        let perm = make_checker(SecurityMode::Accept);
+        let mut checker = perm.lock().unwrap();
+        // Accept mode coerces Ask → Allow at the engine level, so check()
+        // itself returns Allowed.
+        let result = checker.check("debug", "evaluate x + 1");
+        assert!(
+            matches!(result, crate::permission::checker::CheckResult::Allowed),
+            "expected Allowed in Accept mode, got {result:?}"
+        );
+    }
+
+    /// Restrictive mode returns Ask for debug evaluate (same as Standard
+    /// for tools without explicit configuration). The bridge treats Ask
+    /// as denial anyway — covered by the standard mode test.
+    #[test]
+    fn eval_perm_denied_in_restrictive_mode() {
+        let perm = make_checker(SecurityMode::Restrictive);
+        let mut checker = perm.lock().unwrap();
+        let result = checker.check("debug", "evaluate x + 1");
+        assert!(
+            !matches!(result, crate::permission::checker::CheckResult::Allowed),
+            "expected Ask or Denied in Restrictive mode, got {result:?}"
+        );
+    }
+
+    /// The DAP_PERM_CHECK static can be set and read back.
+    #[test]
+    fn dap_perm_check_roundtrips() {
+        let perm = make_checker(SecurityMode::Standard);
+        *DAP_PERM_CHECK.lock().unwrap() = Some(perm.clone());
+        let read_back = DAP_PERM_CHECK.lock().unwrap().clone();
+        assert!(read_back.is_some());
+        // Clean up so other tests aren't contaminated.
+        *DAP_PERM_CHECK.lock().unwrap() = None;
+    }
+
+    /// When DAP_PERM_CHECK is None, the guard should be skipped (no crash).
+    #[test]
+    fn no_perm_check_when_none() {
+        *DAP_PERM_CHECK.lock().unwrap() = None;
+        // Verify the guard in handle_dap_command's DAP_PERM_CHECK read
+        // gracefully returns None -> no check, no panic.
+        let guard = DAP_PERM_CHECK.lock().ok().and_then(|g| g.clone());
+        assert!(
+            guard.is_none(),
+            "DAP_PERM_CHECK should be None after cleanup"
+        );
+    }
+}

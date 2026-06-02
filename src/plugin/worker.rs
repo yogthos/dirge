@@ -1034,8 +1034,10 @@ fn worker_loop(
     // that invoke dap/ functions during their own setup don't hit NPE.
     #[cfg(feature = "dap")]
     {
-        let (_dap_handle, dap_tx) = crate::dap::janet_bindings::spawn_dap_bridge();
-        crate::dap::janet_bindings::store_dap_tx(dap_tx);
+        // Note: the DAP bridge is already spawned by spawn_dap_responder()
+        // in main.rs (from a tokio runtime). We just take the pre-stored
+        // sender — calling spawn_dap_bridge() here would panic because
+        // the Janet worker is a std::thread with no tokio runtime.
         // Run Janet init that binds dap/ C fns.
         // Must run AFTER harness-sandbox so overridden fns that touch
         // DAP internals can't be shadowed.
