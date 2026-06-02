@@ -2,7 +2,7 @@
 //! the status row.
 //!
 //! The strip occupies three rects from `Layout`: `avatar_box` (the
-//! face on the bottom-left), `input_box` (between the chat ║
+//! face on the bottom-left), `input_box` (between the chat │
 //! columns), and `right_margin` (mirror gutter, always blank). The
 //! `status` rect at the very bottom is a single row holding the
 //! BBS-style status chips.
@@ -268,6 +268,14 @@ fn paint_empty_box(buf: &mut Buffer, area: Rect, style: Style) {
     paint_frame(buf, area, None, style);
 }
 
+/// Width (in cells) of the input prompt zone — the prompt glyph plus
+/// one trailing space. The running spinner `░▌` is 2 cells (zone 3);
+/// the idle `>` is 1 cell (zone 2). Shared by `paint_editor_box` (text
+/// column) and `scene.rs` (hardware cursor) so they never drift.
+pub fn input_prompt_width(is_running: bool) -> u16 {
+    if is_running { 3 } else { 2 }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_editor_box(
     buf: &mut Buffer,
@@ -283,12 +291,16 @@ fn paint_editor_box(
         return;
     }
     let inner_w = area.width as usize - 2;
-    let prompt_main = if is_running { "░▌ " } else { "▌▌ " };
-    // Continuation prompt — a single dim glyph + spaces — so wrapped
-    // lines visually attach to the prompt above without taking
-    // another bold spinner.
-    let prompt_cont = "▏  ";
-    let prompt_w = 3_usize; // both prompts are 3 cells
+    // Prompt glyph + exactly one trailing space, so the text column sits
+    // one cell past the glyph. The running spinner `░▌` is 2 cells wide
+    // (zone 3); the idle `>` is 1 cell (zone 2). `prompt_w` MUST equal
+    // `input_prompt_width(is_running)` so `scene.rs`'s cursor lands on
+    // the same column as the painted text.
+    let prompt_main = if is_running { "░▌ " } else { "> " };
+    // Continuation prompt — a thin glyph padded to the same zone width —
+    // so wrapped lines visually attach to the prompt above.
+    let prompt_cont = if is_running { "▏  " } else { "▏ " };
+    let prompt_w = input_prompt_width(is_running) as usize;
     let accent = Style::default().fg(RColor::Yellow);
     let user = Style::default().fg(RColor::White);
     let dim = Style::default().fg(RColor::DarkGray);
@@ -570,11 +582,18 @@ mod tests {
         let top = row_chars(&backend, area.y, area.x, area.width);
         assert_eq!(top[0], '╭');
         assert_eq!(top[area.width as usize - 1], '╮');
-        // First inner row contains the prompt + "hi".
+        // First inner row contains the prompt + "hi". The idle prompt
+        // zone is `> ` (glyph + one space), so the text follows with a
+        // single space.
         let body: String = row_chars(&backend, area.y + 1, area.x, area.width)
             .into_iter()
             .collect();
-        assert!(body.contains("▌▌ hi"), "got body {:?}", body);
+        assert!(body.contains("> hi"), "got body {:?}", body);
+        // ...and NOT a double space (regression guard for the extra gap).
+        assert!(
+            !body.contains(">  hi"),
+            "extra space before input: {body:?}"
+        );
         // First and last cells are the side borders.
         let chars: Vec<char> = body.chars().collect();
         assert_eq!(chars[0], '│');

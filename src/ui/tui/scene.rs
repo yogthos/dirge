@@ -84,12 +84,12 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     // Left panel — idle card or subagent list. Skip on narrow terminals.
     if scene.show_left_panel && layout.left_panel.width >= 12 {
         f.render_widget(
-            LeftPanel::new(scene.left_info, scene.subagents),
+            LeftPanel::new(scene.left_info, scene.subagents).border_style(frame_style),
             layout.left_panel,
         );
     }
 
-    // Chat region (content + ║ verticals).
+    // Chat region (content + │ verticals).
     let mut chat =
         ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset).border_style(frame_style);
     if let Some(sel) = scene.chat_selection {
@@ -100,12 +100,14 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     // Right panel — stacked sub-panels. Skip on narrow terminals.
     if scene.show_right_panel && layout.right_panel.width >= 16 {
         f.render_widget(
-            RightPanel::new(scene.panel_data).modified_offset(scene.modified_offset),
+            RightPanel::new(scene.panel_data)
+                .border_style(frame_style)
+                .modified_offset(scene.modified_offset),
             layout.right_panel,
         );
     }
 
-    // Chat bottom frame (╚═══╝ in chat band only).
+    // Chat bottom frame (╰───╯ in chat band only).
     f.render_widget(ChatBotFrame::new(&layout).style(frame_style), area);
 
     // Bottom strip (avatar + input box / overlay + status).
@@ -126,10 +128,13 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     if let BottomBody::Editor {
         cursor_row,
         cursor_col,
+        is_running,
         ..
     } = scene.body
     {
-        let prompt_w: u16 = 3; // both prompts are 3 cells
+        // Must match `paint_editor_box`'s prompt zone (2 cells idle,
+        // 3 while running) so the cursor sits on the painted text.
+        let prompt_w = super::bottom::input_prompt_width(is_running);
         let cursor_x = layout
             .input_box
             .x
@@ -210,7 +215,7 @@ mod tests {
 
     /// End-to-end render: empty buffer, no overlay, defaults.
     /// Verifies the top frame title shows up and the chat band
-    /// renders ║ borders.
+    /// renders │ borders.
     #[test]
     fn renders_empty_scene_with_frames_and_borders() {
         let buf: Vec<LineEntry> = Vec::new();
@@ -232,7 +237,7 @@ mod tests {
         assert!(row0.contains("[AGENT LOG STREAM]"));
         assert!(row0.contains("[SYSTEM]"));
 
-        // Chat ║ verticals on row 1.
+        // Chat │ verticals on row 1.
         let layout = Layout::new(160, 30, 1);
         assert_eq!(
             backend
@@ -240,7 +245,7 @@ mod tests {
                 .cell((layout.chat_v_left_col, 1))
                 .unwrap()
                 .symbol(),
-            "║"
+            "│"
         );
         assert_eq!(
             backend
@@ -248,7 +253,7 @@ mod tests {
                 .cell((layout.chat_v_right_col, 1))
                 .unwrap()
                 .symbol(),
-            "║"
+            "│"
         );
 
         // Status row contains the status text.

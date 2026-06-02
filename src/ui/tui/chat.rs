@@ -1,7 +1,7 @@
 //! Chat region widget.
 //!
 //! Paints chat scrollback into the `Layout::chat` rect plus the two
-//! vertical ║ borders at `chat_v_left_col` / `chat_v_right_col`. The
+//! vertical │ borders at `chat_v_left_col` / `chat_v_right_col`. The
 //! widget owns the verticals because they extend the full chat
 //! height — making the top frame paint the corners and this widget
 //! the body keeps one source of truth for each row's content.
@@ -32,7 +32,7 @@ pub struct ChatPane<'a> {
     layout: &'a Layout,
     lines: &'a [LineEntry],
     scroll_offset: usize,
-    /// Style for the chat ║ verticals.
+    /// Style for the chat │ verticals.
     border_style: Style,
     /// Active selection range in normalized `(line_idx, char_offset)`
     /// coordinates. Cells inside this range have REVERSED applied on
@@ -51,7 +51,7 @@ impl<'a> ChatPane<'a> {
         }
     }
 
-    /// Override the ║ border style. Default is `Color::Green`.
+    /// Override the │ border style. Default is `Color::Green`.
     pub fn border_style(mut self, style: Style) -> Self {
         self.border_style = style;
         self
@@ -69,17 +69,17 @@ impl<'a> Widget for ChatPane<'a> {
         let l = self.layout;
         let visible = l.chat.height as usize;
 
-        // ── chat ║ verticals on every row of the chat band ──
+        // ── chat │ verticals on every row of the chat band ──
         for dy in 0..l.chat.height {
             let y = l.chat.y + dy;
             if l.chat_v_left_col < buf.area.width {
                 buf[(l.chat_v_left_col, y)]
-                    .set_char('║')
+                    .set_char('│')
                     .set_style(self.border_style);
             }
             if l.chat_v_right_col < buf.area.width {
                 buf[(l.chat_v_right_col, y)]
-                    .set_char('║')
+                    .set_char('│')
                     .set_style(self.border_style);
             }
         }
@@ -93,7 +93,7 @@ impl<'a> Widget for ChatPane<'a> {
         let start = end.saturating_sub(visible);
         let slice = &self.lines[start..end];
         // Reserve a one-cell right margin so content doesn't sit
-        // flush against the chat ║ border on the right.
+        // flush against the chat │ border on the right.
         let text_w = l.chat.width.saturating_sub(1);
         for (i, entry) in slice.iter().enumerate() {
             let y = l.chat.y + i as u16;
@@ -271,7 +271,7 @@ mod tests {
         }
     }
 
-    /// ║ borders appear on every chat row even when the buffer
+    /// │ borders appear on every chat row even when the buffer
     /// is empty.
     #[test]
     fn renders_borders_on_empty_buffer() {
@@ -295,8 +295,8 @@ mod tests {
                     .cell((layout.chat_v_left_col, y))
                     .unwrap()
                     .symbol(),
-                "║",
-                "missing left ║ at row {y}"
+                "│",
+                "missing left │ at row {y}"
             );
             assert_eq!(
                 backend
@@ -304,14 +304,14 @@ mod tests {
                     .cell((layout.chat_v_right_col, y))
                     .unwrap()
                     .symbol(),
-                "║",
-                "missing right ║ at row {y}"
+                "│",
+                "missing right │ at row {y}"
             );
         }
     }
 
     /// Lines paint into the chat rect, starting at chat.y. Text is
-    /// clipped to chat.width so it cannot overwrite the right ║.
+    /// clipped to chat.width so it cannot overwrite the right │.
     #[test]
     fn paints_buffer_lines_into_chat_rect() {
         let layout = Layout::new(160, 30, 1);
@@ -350,7 +350,7 @@ mod tests {
     }
 
     /// Long text is clipped at chat.width and never touches the
-    /// right ║ column.
+    /// right │ column.
     #[test]
     fn long_line_clips_at_chat_width() {
         let layout = Layout::new(40, 10, 1);
@@ -371,7 +371,7 @@ mod tests {
         let row = layout.chat.y;
         // Content fills cols [chat.x, chat.x + chat.width - 1).
         // The last cell is reserved as a 1-cell right margin so
-        // content doesn't run into the ║ border.
+        // content doesn't run into the │ border.
         let text_w = layout.chat.width - 1;
         for i in 0..text_w {
             assert_eq!(
@@ -395,14 +395,14 @@ mod tests {
             " ",
             "expected the 1-cell right margin to be blank"
         );
-        // Right ║ must NOT be overwritten.
+        // Right │ must NOT be overwritten.
         assert_eq!(
             backend
                 .buffer()
                 .cell((layout.chat_v_right_col, row))
                 .unwrap()
                 .symbol(),
-            "║"
+            "│"
         );
     }
 
