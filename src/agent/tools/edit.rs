@@ -141,6 +141,22 @@ impl Tool for EditTool {
         let resolved_path =
             check_perm_path_resolve(&self.permission, &self.ask_tx, "edit", &args.path).await?;
 
+        // Read-before-edit gate (ported from vix session_read_gate.go): refuse
+        // to edit a file the model hasn't read this session, so `old_text` is
+        // matched against content the model actually saw — not hallucinated or
+        // stale context. Only enforced when a session cache is present (the
+        // read-tracker); skipped for cache-less constructions (tests).
+        if let Some(ref cache) = self.cache
+            && !cache.has_been_read(std::path::Path::new(&resolved_path))
+        {
+            return Err(ToolError::Msg(format!(
+                "edit was blocked because \"{}\" has not been read in this session yet. \
+                 Call read on this path first so your change is based on the current \
+                 on-disk contents.",
+                args.path
+            )));
+        }
+
         // Pre-check size before reading. The edit tool isn't meant
         // for huge generated artifacts; cap at 100 MiB so an LLM
         // pointing it at a gigabyte log file fails fast rather
@@ -331,8 +347,12 @@ impl Tool for EditTool {
             .await?;
         crate::agent::tools::modified::mark_modified(std::path::Path::new(&resolved_path));
         // File mutated → invalidate cached reads/greps/listings for this turn.
+        // A successful edit leaves the model with accurate on-disk knowledge,
+        // so keep the path marked read for subsequent edits (clear() preserves
+        // the read-set).
         if let Some(ref cache) = self.cache {
             cache.clear();
+            cache.mark_read(std::path::Path::new(&resolved_path));
         }
 
         // Path lives in the chamber banner (`╭─ EDIT ─ "<path>" ─╮`),
@@ -704,5 +724,84 @@ mod fuzzy_tests {
             out.replace_range(s..e, "_");
         }
         assert_eq!(out, "a__c");
+    }
+}
+
+#[cfg(test)]
+mod read_gate_tests {
+    use super::*;
+    use crate::agent::tools::EditArgs;
+    use crate::agent::tools::cache::ToolCache;
+
+    fn tool_with_cache(cache: ToolCache) -> EditTool {
+        EditTool {
+            permission: None,
+            ask_tx: None,
+            cache: Some(cache),
+            #[cfg(feature = "lsp")]
+            lsp_manager: None,
+        }
+    }
+
+    /// vix read-before-edit gate: editing a file not read this session is
+    /// refused; reading it (marking the cache) then editing succeeds.
+    #[tokio::test]
+    async fn edit_blocked_until_file_is_read() {
+        let dir = std::env::temp_dir().join(format!("dirge-edit-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("g.txt");
+        std::fs::write(&path, "hello\nworld\n").unwrap();
+        let abs = path.to_string_lossy().to_string();
+        // Mark using the SAME resolution the tool uses (the gate keys on
+        // `check_perm_path_resolve`'s output, not raw canonicalize()).
+        let resolved = crate::agent::tools::check_perm_path_resolve(&None, &None, "read", &abs)
+            .await
+            .unwrap();
+
+        let cache = ToolCache::new();
+        let tool = tool_with_cache(cache.clone());
+        let args = || EditArgs {
+            path: abs.clone(),
+            old_text: "world".to_string(),
+            new_text: "WORLD".to_string(),
+            replace_all: None,
+        };
+
+        // Unread → blocked.
+        let blocked = tool.call(args()).await;
+        let err = blocked.expect_err("edit must be gated before read");
+        assert!(
+            err.to_string().contains("has not been read"),
+            "gate message; got {err}"
+        );
+
+        // Mark read (as ReadTool would) → allowed.
+        cache.mark_read(std::path::Path::new(&resolved));
+        let ok = tool.call(args()).await;
+        assert!(ok.is_ok(), "edit should succeed after read; got {ok:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nWORLD\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No cache (e.g. cache-less construction) ⇒ no gate (can't track reads).
+    #[tokio::test]
+    async fn no_cache_means_no_gate() {
+        let dir = std::env::temp_dir().join(format!("dirge-edit-nogate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("g.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+
+        let tool = EditTool::new(None, None);
+        let ok = tool
+            .call(EditArgs {
+                path: path.to_string_lossy().to_string(),
+                old_text: "b".to_string(),
+                new_text: "B".to_string(),
+                replace_all: None,
+            })
+            .await;
+        assert!(ok.is_ok(), "no cache ⇒ ungated; got {ok:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

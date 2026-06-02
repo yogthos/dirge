@@ -132,8 +132,12 @@ impl Tool for WriteTool {
         crate::fs_atomic::atomic_write(path, args.content.as_bytes()).await?;
         crate::agent::tools::modified::mark_modified(path);
         // File mutated → invalidate cached reads/greps/listings for this turn.
+        // A wholesale write means the model now knows the on-disk content, so
+        // mark it read (matches vix readTrackingTools incl. write_file) — a
+        // later `edit` on this path won't be gate-blocked.
         if let Some(ref cache) = self.cache {
             cache.clear();
+            cache.mark_read(path);
         }
 
         // Path lives in the chamber banner (`╭─ WRITE ─ "<path>" ─╮`),

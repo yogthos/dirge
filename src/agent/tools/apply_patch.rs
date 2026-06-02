@@ -331,6 +331,22 @@ impl Tool for ApplyPatchTool {
                 break;
             }
 
+            // Read-before-edit gate (vix session_read_gate): an `update` op
+            // matches `old_text` against existing content, so it must have
+            // been read this session. create/delete/rename don't match content
+            // and aren't gated. Skipped when no session cache is present.
+            if let PatchOp::Update { .. } = op
+                && let Some(ref cache) = self.cache
+                && !cache.has_been_read(std::path::Path::new(&resolved_path))
+            {
+                results.push(format!(
+                    "FAILED: \"{}\" has not been read in this session yet; read it first so the \
+                     update matches the current on-disk contents",
+                    op_path
+                ));
+                break;
+            }
+
             let result = match op {
                 PatchOp::Create { content, .. } => apply_create(&resolved_path, content).await,
                 PatchOp::Update {
@@ -357,15 +373,23 @@ impl Tool for ApplyPatchTool {
                         PatchOp::Create { .. }
                         | PatchOp::Update { .. }
                         | PatchOp::Delete { .. } => {
-                            crate::agent::tools::modified::mark_modified(std::path::Path::new(
-                                &resolved_path,
-                            ));
+                            let p = std::path::Path::new(&resolved_path);
+                            crate::agent::tools::modified::mark_modified(p);
+                            // create/update leave the model with accurate
+                            // on-disk knowledge → satisfy the read gate for
+                            // follow-up edits (delete removes the file, so
+                            // marking it is harmless).
+                            if let Some(ref cache) = self.cache {
+                                cache.mark_read(p);
+                            }
                         }
                         PatchOp::Rename { .. } => {
                             if let Some(ref np) = resolved_new_path {
-                                crate::agent::tools::modified::mark_modified(std::path::Path::new(
-                                    np,
-                                ));
+                                let p = std::path::Path::new(np);
+                                crate::agent::tools::modified::mark_modified(p);
+                                if let Some(ref cache) = self.cache {
+                                    cache.mark_read(p);
+                                }
                             }
                         }
                     }

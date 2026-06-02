@@ -228,6 +228,9 @@ impl Tool for ReadTool {
         if let Some(ref cache) = self.cache
             && let Some(cached) = cache.get(&cache_key)
         {
+            // A cache hit means the model has already seen this file's content
+            // this session — keep the read-before-edit gate satisfied.
+            cache.mark_read(std::path::Path::new(&resolved_path));
             return Ok(cached);
         }
 
@@ -392,6 +395,9 @@ impl Tool for ReadTool {
 
         if let Some(ref cache) = self.cache {
             cache.set(&cache_key, info.clone());
+            // Satisfy the read-before-edit gate (vix session_read_gate): the
+            // model has now seen the on-disk content.
+            cache.mark_read(std::path::Path::new(&resolved_path));
         }
 
         // Fire-and-forget LSP warmup so the server already has the file

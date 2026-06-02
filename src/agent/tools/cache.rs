@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +47,15 @@ struct CacheEntry {
 pub struct ToolCache {
     entries: Arc<Mutex<HashMap<String, CacheEntry>>>,
     generation: Arc<AtomicU64>,
+    /// Read-before-edit gate (ported from vix `session_read_gate.go`): the
+    /// set of canonical paths the model has read this session. `edit`/
+    /// `apply_patch`-update refuse a file not in this set so a change can't be
+    /// built against unread (hallucinated/stale) content. Lives here because
+    /// `ToolCache` is the shared per-session handle already threaded into
+    /// read/edit/write/apply_patch. Deliberately NOT touched by `clear()` —
+    /// it's session-lifetime tracking, independent of the content cache's
+    /// per-turn generation.
+    read_files: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl Default for ToolCache {
@@ -60,7 +69,27 @@ impl ToolCache {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(0)),
+            read_files: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Record that `path` (canonical) has been read this session. Called by
+    /// `read` and on a successful `edit`/`write`/`apply_patch` (a successful
+    /// mutation leaves the model with accurate knowledge of on-disk content).
+    pub fn mark_read(&self, path: &Path) {
+        self.read_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf());
+    }
+
+    /// Whether `path` (canonical) has been read this session. The edit gate
+    /// blocks when this is false.
+    pub fn has_been_read(&self, path: &Path) -> bool {
+        self.read_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(path)
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
@@ -146,5 +175,40 @@ mod tests {
         cache1.set("x", "y".to_string());
         cache2.clear();
         assert!(cache1.get("x").is_none());
+    }
+
+    #[test]
+    fn read_gate_tracks_and_reports() {
+        let cache = ToolCache::new();
+        let p = Path::new("/tmp/dirge-read-gate.rs");
+        assert!(!cache.has_been_read(p), "unread by default");
+        cache.mark_read(p);
+        assert!(cache.has_been_read(p), "marked read");
+        assert!(
+            !cache.has_been_read(Path::new("/tmp/other.rs")),
+            "only the marked path"
+        );
+    }
+
+    #[test]
+    fn read_set_survives_clear() {
+        // `clear()` invalidates the content cache (per-turn) but MUST NOT drop
+        // the session read-set, or every post-edit `clear` would re-block edits.
+        let cache = ToolCache::new();
+        let p = Path::new("/tmp/dirge-read-survive.rs");
+        cache.mark_read(p);
+        cache.clear();
+        assert!(cache.has_been_read(p), "read-set persists across clear");
+    }
+
+    #[test]
+    fn read_set_shared_across_clones() {
+        // Tools each get a clone of the session cache; a read via one tool
+        // must satisfy the gate checked by another.
+        let cache1 = ToolCache::new();
+        let cache2 = cache1.clone();
+        let p = Path::new("/tmp/dirge-read-shared.rs");
+        cache1.mark_read(p);
+        assert!(cache2.has_been_read(p), "read-set shares the inner Arc");
     }
 }
