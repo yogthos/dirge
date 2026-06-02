@@ -158,10 +158,24 @@ impl DapSession {
     /// Drain all pending output events into the output buffer.
     fn drain_output(&mut self) {
         while let Ok(evt) = self.events.output.try_recv() {
+            // Stop appending once at the cap (keep draining the channel so a
+            // flooding adapter can't back it up), so the buffer can't grow
+            // unbounded before the post-hoc truncate.
+            if self.output.len() >= MAX_OUTPUT_BYTES {
+                self.output_truncated = true;
+                continue;
+            }
             self.output.push_str(&evt.output);
         }
         if self.output.len() > MAX_OUTPUT_BYTES {
-            self.output.truncate(MAX_OUTPUT_BYTES);
+            // `String::truncate` panics if the index isn't on a char
+            // boundary, and `evt.output` is adapter-controlled — back off to
+            // the nearest boundary at or below the cap.
+            let mut cut = MAX_OUTPUT_BYTES;
+            while cut > 0 && !self.output.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.output.truncate(cut);
             self.output_truncated = true;
         }
     }
@@ -196,6 +210,12 @@ impl DapSession {
 pub struct DapSessionManager {
     active: Mutex<Option<DapSession>>,
     next_id: std::sync::atomic::AtomicU64,
+    /// Last successfully-built panel snapshot. The session methods hold
+    /// `active` across their adapter round-trip, so the UI's `try_lock` in
+    /// `debug_snapshot` fails for that whole window — returning this cached
+    /// copy keeps the debug panel showing the last-known state instead of
+    /// blanking out. A plain `std::sync::Mutex`, never held across `.await`.
+    last_snapshot: std::sync::Mutex<Option<DebugPanelData>>,
 }
 
 impl DapSessionManager {
@@ -203,6 +223,7 @@ impl DapSessionManager {
         Self {
             active: Mutex::new(None),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            last_snapshot: std::sync::Mutex::new(None),
         }
     }
 
@@ -895,9 +916,20 @@ impl DapSessionManager {
     /// never blocks waiting for a DAP tool call. Returns `None`
     /// when no session is active or the lock is held by a tool.
     pub fn debug_snapshot(&self) -> Option<DebugPanelData> {
-        let active = self.active.try_lock().ok()?;
-        let session = active.as_ref()?;
-        Some(DebugPanelData {
+        // If `active` is locked (an op is mid-round-trip), fall back to the
+        // last cached snapshot so the panel doesn't blank out for the whole
+        // call. On a successful lock, rebuild and refresh the cache.
+        let active = match self.active.try_lock() {
+            Ok(active) => active,
+            Err(_) => {
+                return self
+                    .last_snapshot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+            }
+        };
+        let snapshot = active.as_ref().map(|session| DebugPanelData {
             adapter: session.client.adapter_name.clone(),
             status: session.status.clone(),
             session_summary: Some(session.summary()),
@@ -909,12 +941,28 @@ impl DapSessionManager {
             output: session.output.clone(),
             output_truncated: session.output_truncated,
             exit_code: session.exit_code,
-        })
+        });
+        *self.last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
+        snapshot
     }
 
     /// Force-terminate the active session (drop = kill_on_drop).
     async fn terminate_active(&self) {
         let mut active = self.active.lock().await;
+        if let Some(session) = active.as_mut() {
+            // Best-effort graceful disconnect (terminate the debuggee) before
+            // dropping, which otherwise hard-SIGKILLs the process group. Short
+            // timeout; errors are ignored — the drop is the fallback.
+            let args = DisconnectArgs {
+                restart: Some(false),
+                terminate_debuggee: Some(true),
+                extra: Default::default(),
+            };
+            let _ = session
+                .client
+                .request::<_, Value>("disconnect", &args, Duration::from_secs(2))
+                .await;
+        }
         *active = None;
     }
 }

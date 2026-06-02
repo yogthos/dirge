@@ -28,9 +28,14 @@
 
 # ── Hook — sample on each tool-end if profiling ──────────────────────
 
+# Monotonic-ish millisecond clock. `os/clock` returns seconds as a double;
+# `os/time` is whole seconds, which made the `profile-interval` (ms) math
+# off by ~1000x (a "200ms" profile sampled every 200s).
+(defn- now-ms [] (* (os/clock) 1000))
+
 (defn on-tool-end [ctx]
-  (when (and profiling (>= (os/time) profile-next-sample))
-    (set profile-next-sample (+ (os/time) profile-interval))
+  (when (and profiling (>= (now-ms) profile-next-sample))
+    (set profile-next-sample (+ (now-ms) profile-interval))
     (take-sample)))
 
 # ── Sample logic ─────────────────────────────────────────────────────
@@ -97,7 +102,7 @@
   (set profile-interval (max 50 interval))
   (set profile-max-samples 100)
   (set profile-samples 0)
-  (set profile-next-sample (+ (os/time) profile-interval))
+  (set profile-next-sample (+ (now-ms) profile-interval))
   (set profile-counts @{})
   (string "Profiling started — " profile-max-samples
           " samples at " profile-interval "ms intervals"))

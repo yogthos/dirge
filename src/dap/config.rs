@@ -157,15 +157,14 @@ fn get_matching_adapters(program: &Path, cwd: &Path) -> Vec<ResolvedAdapter> {
                 .collect()
         }
         Some(ref ext) => {
-            let exact: Vec<_> = available
+            // Partition the already-resolved list once: exact file-type
+            // matches, else fall back to all available adapters. (Previously
+            // the no-match branch re-ran `get_available_adapters()`, re-doing
+            // every `which` lookup + defaults.json parse on the launch path.)
+            let (exact, rest): (Vec<_>, Vec<_>) = available
                 .into_iter()
-                .filter(|a| a.file_types.iter().any(|ft| ft.eq_ignore_ascii_case(ext)))
-                .collect();
-            if !exact.is_empty() {
-                exact
-            } else {
-                get_available_adapters() // re-fetch; original was consumed
-            }
+                .partition(|a| a.file_types.iter().any(|ft| ft.eq_ignore_ascii_case(ext)));
+            if exact.is_empty() { rest } else { exact }
         }
     }
 }

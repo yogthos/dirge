@@ -45,7 +45,7 @@
       (set start (+ start (length pat)))
       (var end start)
       (while (and (< end (length s))
-                  (or (>= (get s end) 48) (<= (get s end) 57)))
+                  (>= (get s end) 48) (<= (get s end) 57))
         (set end (+ end 1)))
       (def num-str (string/slice s start end))
       (if (empty? num-str) nil (math/parse-int num-str)))))

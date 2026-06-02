@@ -226,9 +226,7 @@ unsafe extern "C-unwind" fn dap_step_cfn(
 ) -> janetrs::lowlevel::Janet {
     use janetrs::lowlevel::*;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        dap_generic_body(DapCommand::StepOver {
-            reply: std::mem::zeroed(),
-        })
+        dap_generic_body(|reply| DapCommand::StepOver { reply })
     }));
     match result {
         Ok(j) => j,
@@ -236,29 +234,22 @@ unsafe extern "C-unwind" fn dap_step_cfn(
     }
 }
 
-unsafe fn dap_generic_body(mut cmd: DapCommand) -> janetrs::lowlevel::Janet {
-    // Replace the zeroed reply with a real channel.
+/// Build a command from a freshly-created reply channel and dispatch it.
+///
+/// The caller passes a constructor that receives the `Sender` and returns a
+/// fully-initialized `DapCommand`. This is the ONLY correct way to build the
+/// command: an earlier version pre-built it with `reply: std::mem::zeroed()`
+/// and overwrote the field later, but a zeroed `mpsc::Sender` is an invalid
+/// (Arc-backed) value — merely producing it is UB, and overwriting it ran the
+/// zeroed `Sender`'s destructor (refcount decrement through a null pointer →
+/// segfault). `catch_unwind` does not guard against that (it's UB, not a
+/// panic). Constructing the channel first sidesteps it entirely.
+unsafe fn dap_generic_body(
+    make_cmd: impl FnOnce(mpsc::Sender<Result<String, String>>) -> DapCommand,
+) -> janetrs::lowlevel::Janet {
     let (tx, rx) = mpsc::channel();
-    unsafe { set_dap_reply(&mut cmd, tx) };
+    let cmd = make_cmd(tx);
     unsafe { dap_send_and_wait(cmd, rx) }
-}
-
-unsafe fn set_dap_reply(cmd: &mut DapCommand, tx: mpsc::Sender<Result<String, String>>) {
-    match cmd {
-        DapCommand::Launch { reply, .. } => *reply = tx,
-        DapCommand::Attach { reply, .. } => *reply = tx,
-        DapCommand::StepOver { reply } => *reply = tx,
-        DapCommand::StepIn { reply } => *reply = tx,
-        DapCommand::StepOut { reply } => *reply = tx,
-        DapCommand::Continue { reply } => *reply = tx,
-        DapCommand::Breakpoint { reply, .. } => *reply = tx,
-        DapCommand::Evaluate { reply, .. } => *reply = tx,
-        DapCommand::StackTrace { reply } => *reply = tx,
-        DapCommand::Threads { reply } => *reply = tx,
-        DapCommand::Terminate { reply } => *reply = tx,
-        DapCommand::Sessions { reply } => *reply = tx,
-        DapCommand::Variables { reply, .. } => *reply = tx,
-    }
 }
 
 unsafe fn dap_send_and_wait(
@@ -287,8 +278,12 @@ unsafe fn dap_send_and_wait(
                 if start.elapsed() >= DAP_CMD_TIMEOUT {
                     return unsafe { janet_wrap_nil() };
                 }
-                // Check shutdown — read from the worker's SHUTDOWN thread-local.
-                // We can't access it directly, so just keep polling.
+                // Bail promptly if the worker thread is shutting down, so a
+                // UI exit doesn't pin this thread for the full DAP_CMD_TIMEOUT
+                // (mirrors send_dialog).
+                if crate::plugin::worker::worker_is_shutting_down() {
+                    return unsafe { janet_wrap_nil() };
+                }
             }
         }
     }
@@ -297,14 +292,14 @@ unsafe fn dap_send_and_wait(
 // Evaluate — takes an expression string arg.
 
 macro_rules! dap_simple_cfn {
-    ($name:ident, $cmd:expr) => {
+    ($name:ident, $make:expr) => {
         unsafe extern "C-unwind" fn $name(
             _argc: i32,
             _argv: *mut janetrs::lowlevel::Janet,
         ) -> janetrs::lowlevel::Janet {
             use janetrs::lowlevel::*;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                dap_generic_body($cmd)
+                dap_generic_body($make)
             }));
             match result {
                 Ok(j) => j,
@@ -314,48 +309,15 @@ macro_rules! dap_simple_cfn {
     };
 }
 
-dap_simple_cfn!(
-    dap_step_in_cfn,
-    DapCommand::StepIn {
-        reply: std::mem::zeroed()
-    }
-);
-dap_simple_cfn!(
-    dap_step_out_cfn,
-    DapCommand::StepOut {
-        reply: std::mem::zeroed()
-    }
-);
-dap_simple_cfn!(
-    dap_continue_cfn,
-    DapCommand::Continue {
-        reply: std::mem::zeroed()
-    }
-);
-dap_simple_cfn!(
-    dap_stack_trace_cfn,
-    DapCommand::StackTrace {
-        reply: std::mem::zeroed()
-    }
-);
-dap_simple_cfn!(
-    dap_threads_cfn,
-    DapCommand::Threads {
-        reply: std::mem::zeroed()
-    }
-);
-dap_simple_cfn!(
-    dap_terminate_cfn,
-    DapCommand::Terminate {
-        reply: std::mem::zeroed()
-    }
-);
-dap_simple_cfn!(
-    dap_sessions_cfn,
-    DapCommand::Sessions {
-        reply: std::mem::zeroed()
-    }
-);
+dap_simple_cfn!(dap_step_in_cfn, |reply| DapCommand::StepIn { reply });
+dap_simple_cfn!(dap_step_out_cfn, |reply| DapCommand::StepOut { reply });
+dap_simple_cfn!(dap_continue_cfn, |reply| DapCommand::Continue { reply });
+dap_simple_cfn!(dap_stack_trace_cfn, |reply| DapCommand::StackTrace {
+    reply
+});
+dap_simple_cfn!(dap_threads_cfn, |reply| DapCommand::Threads { reply });
+dap_simple_cfn!(dap_terminate_cfn, |reply| DapCommand::Terminate { reply });
+dap_simple_cfn!(dap_sessions_cfn, |reply| DapCommand::Sessions { reply });
 
 // Evaluate — takes an expression string arg.
 unsafe extern "C-unwind" fn dap_evaluate_cfn(
@@ -384,12 +346,7 @@ unsafe fn dap_eval_body(
         Some(s) => s,
         None => return unsafe { janet_wrap_nil() },
     };
-    unsafe {
-        dap_generic_body(DapCommand::Evaluate {
-            expression,
-            reply: std::mem::zeroed(),
-        })
-    }
+    unsafe { dap_generic_body(move |reply| DapCommand::Evaluate { expression, reply }) }
 }
 
 // Breakpoint — takes file + line.
@@ -423,13 +380,7 @@ unsafe fn dap_bp_body(argc: i32, argv: *mut janetrs::lowlevel::Janet) -> janetrs
     if line == 0 {
         return unsafe { janet_wrap_nil() };
     }
-    unsafe {
-        dap_generic_body(DapCommand::Breakpoint {
-            file,
-            line,
-            reply: std::mem::zeroed(),
-        })
-    }
+    unsafe { dap_generic_body(move |reply| DapCommand::Breakpoint { file, line, reply }) }
 }
 
 // Variables — takes variable reference number.
@@ -459,12 +410,7 @@ unsafe fn dap_vars_body(
         Some(s) => s.parse().unwrap_or(0),
         None => return unsafe { janet_wrap_nil() },
     };
-    unsafe {
-        dap_generic_body(DapCommand::Variables {
-            var_ref,
-            reply: std::mem::zeroed(),
-        })
-    }
+    unsafe { dap_generic_body(move |reply| DapCommand::Variables { var_ref, reply }) }
 }
 
 // ---------------------------------------------------------------------------

@@ -960,11 +960,53 @@ mod tests {
         assert!(result.contains("No active debug session"));
     }
 
-    #[test]
-    fn definition_has_all_actions() {
+    /// The debug tool launches subprocesses and evaluates expressions, so the
+    /// permission gate is its security boundary. A denying checker must make
+    /// `call` error before any action dispatches (the gate runs first).
+    #[tokio::test]
+    async fn permission_denied_blocks_debug_actions() {
+        use crate::permission::{
+            Action as PermAction, OpSpec, PermissionConfig, RuleConfig, SecurityMode,
+            checker::PermissionChecker,
+        };
+        use std::sync::Mutex;
+
+        // The `debug` tool classifies as Operation::Other; `OpSpec::Any`
+        // matches every operation, so this rule denies it.
+        let config = PermissionConfig {
+            rules: vec![RuleConfig {
+                op: OpSpec::Any,
+                pattern: "**".into(),
+                effect: PermAction::Deny,
+                tool: None,
+            }],
+            ..Default::default()
+        };
+        let checker = PermissionChecker::new(
+            &config,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        );
+        let perm: PermCheck = Arc::new(Mutex::new(checker));
+        let tool = DebugTool::new(Some(perm), None);
+
+        // Benign action (no live adapter needed) — still rejected at the gate.
+        let result = tool
+            .call(DebugArgs {
+                action: Some("sessions".into()),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "denied debug tool must error; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn definition_has_all_actions() {
         let tool = DebugTool::new(None, None);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let def = rt.block_on(tool.definition(String::new()));
+        let def = tool.definition(String::new()).await;
         let params: Value = def.parameters;
 
         // Every action in the enum list must be in the schema.
@@ -1004,11 +1046,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn definition_name_matches() {
+    #[tokio::test]
+    async fn definition_name_matches() {
         let tool = DebugTool::new(None, None);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let def = rt.block_on(tool.definition(String::new()));
+        let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "debug");
     }
 

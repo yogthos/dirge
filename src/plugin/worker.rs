@@ -1265,6 +1265,25 @@ where
     }
 }
 
+/// Whether the worker thread this C-function is running on has been asked to
+/// shut down. Reads the same `SHUTDOWN` thread-local `send_dialog` polls, so
+/// blocking FFI bridges (e.g. the DAP `dap_send_and_wait` loop) can bail out
+/// promptly on UI exit instead of pinning the worker thread until their own
+/// timeout. Returns `false` when called off the worker thread (flag unset).
+//
+// Gated on `dap + plugin` to match its only caller (the DAP Janet bridge in
+// `dap::janet_bindings`, itself `cfg(all(dap, plugin))`); a `dap`-only gate
+// would leave it dead in the dap-without-plugin build.
+#[cfg(all(feature = "dap", feature = "plugin"))]
+pub(crate) fn worker_is_shutting_down() -> bool {
+    SHUTDOWN.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|f| f.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    })
+}
+
 /// Read a Janet string at argv[i] and decode as UTF-8. Returns None for
 /// non-string args or invalid UTF-8 (we don't surface lossy strings to
 /// plugins — caller handles the None as a no-op).

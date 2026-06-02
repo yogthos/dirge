@@ -79,3 +79,70 @@ where
     reader.read_exact(&mut body).await?;
     Ok(body)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    async fn decode(bytes: &[u8]) -> io::Result<Vec<u8>> {
+        let mut reader = BufReader::new(bytes);
+        decode_frame(&mut reader).await
+    }
+
+    #[tokio::test]
+    async fn encode_decode_round_trip() {
+        let mut buf = Vec::new();
+        encode_frame(&mut buf, br#"{"seq":1}"#).await.unwrap();
+        assert!(buf.starts_with(b"Content-Length: 9\r\n\r\n"));
+        assert_eq!(decode(&buf).await.unwrap(), br#"{"seq":1}"#);
+    }
+
+    #[tokio::test]
+    async fn decodes_two_frames_in_sequence() {
+        let mut buf = Vec::new();
+        encode_frame(&mut buf, b"AA").await.unwrap();
+        encode_frame(&mut buf, b"BBB").await.unwrap();
+        let mut reader = BufReader::new(&buf[..]);
+        assert_eq!(decode_frame(&mut reader).await.unwrap(), b"AA");
+        assert_eq!(decode_frame(&mut reader).await.unwrap(), b"BBB");
+    }
+
+    #[tokio::test]
+    async fn extra_headers_are_ignored() {
+        let raw = b"X-Foo: bar\r\nContent-Length: 2\r\n\r\nhi";
+        assert_eq!(decode(raw).await.unwrap(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn missing_content_length_errors() {
+        let err = decode(b"X-Foo: bar\r\n\r\n").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn malformed_content_length_errors() {
+        let err = decode(b"Content-Length: abc\r\n\r\n").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_rejected_without_allocating() {
+        let raw = format!("Content-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1);
+        let err = decode(raw.as_bytes()).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn eof_mid_body_errors() {
+        // Header claims 10 bytes; only 3 follow.
+        let err = decode(b"Content-Length: 10\r\n\r\nabc").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn eof_mid_header_errors() {
+        let err = decode(b"Content-Length: 5").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+}

@@ -22,6 +22,14 @@ use tokio::time::timeout;
 use crate::dap::framing::{decode_frame, encode_frame};
 use crate::dap::types::Capabilities;
 
+/// Cap on how long a single frame write to the adapter may block. The
+/// per-request `timeout` only covers the *response* (`rx`); without this a
+/// wedged adapter that stops draining its stdin (full pipe) would block
+/// every caller on `writer.lock()` + `write_all` indefinitely, since the
+/// writer mutex is held across the await. On expiry the write future is
+/// dropped, releasing the lock.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // DAP RPC — lightweight seq→request_seq correlation
 // ---------------------------------------------------------------------------
@@ -50,7 +58,11 @@ pub type NotificationHandler = Box<dyn Fn(Value) + Send + Sync>;
 struct Inner {
     next_seq: AtomicU64,
     pending: Mutex<Pending>,
-    handlers: Mutex<HashMap<String, NotificationHandler>>,
+    // Stored as `Arc` (the public `on_event` still takes a `Box` and converts
+    // via `Arc::from`) so `dispatch` can clone the handler and release the
+    // `handlers` lock BEFORE invoking it — a slow or re-entrant handler must
+    // not stall the read loop or deadlock by re-locking `handlers`.
+    handlers: Mutex<HashMap<String, Arc<dyn Fn(Value) + Send + Sync>>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
     closed: std::sync::atomic::AtomicBool,
 }
@@ -109,13 +121,21 @@ impl DapRpc {
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().await.insert(seq, tx);
 
-        let send_result = {
+        let send_result = timeout(WRITE_TIMEOUT, async {
             let mut writer = self.inner.writer.lock().await;
             encode_frame(&mut *writer, &bytes).await
-        };
-        if let Err(e) = send_result {
-            self.inner.pending.lock().await.remove(&seq);
-            return Err(RpcError::Io(e));
+        })
+        .await;
+        match send_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.inner.pending.lock().await.remove(&seq);
+                return Err(RpcError::Io(e));
+            }
+            Err(_) => {
+                self.inner.pending.lock().await.remove(&seq);
+                return Err(RpcError::Timeout(WRITE_TIMEOUT));
+            }
         }
 
         let value = match timeout(request_timeout, rx).await {
@@ -148,18 +168,27 @@ impl DapRpc {
             "arguments": serde_json::to_value(arguments)?,
         });
         let bytes = serde_json::to_vec(&body)?;
-        let mut writer = self.inner.writer.lock().await;
-        encode_frame(&mut *writer, &bytes).await?;
+        match timeout(WRITE_TIMEOUT, async {
+            let mut writer = self.inner.writer.lock().await;
+            encode_frame(&mut *writer, &bytes).await
+        })
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => return Err(RpcError::Timeout(WRITE_TIMEOUT)),
+        }
         Ok(())
     }
 
     /// Register a handler for an incoming DAP event (e.g. "stopped", "output").
     pub async fn on_event(&self, event_type: &str, handler: NotificationHandler) {
+        // Convert the boxed handler into an `Arc` (reuses the allocation) so
+        // `dispatch` can clone + drop the lock before calling it.
         self.inner
             .handlers
             .lock()
             .await
-            .insert(event_type.to_string(), handler);
+            .insert(event_type.to_string(), Arc::from(handler));
     }
 }
 
@@ -215,8 +244,11 @@ async fn dispatch(inner: &Arc<Inner>, msg: Value) {
         }
         "event" => {
             let event_type = msg.get("event").and_then(|v| v.as_str()).unwrap_or("");
-            let handlers = inner.handlers.lock().await;
-            if let Some(handler) = handlers.get(event_type) {
+            // Clone the handler Arc and release the lock before invoking, so a
+            // slow/blocking/re-entrant handler can't stall the read loop or
+            // deadlock by re-locking `handlers`.
+            let handler = inner.handlers.lock().await.get(event_type).cloned();
+            if let Some(handler) = handler {
                 let body = msg.get("body").cloned().unwrap_or(Value::Null);
                 handler(body);
             }
@@ -248,6 +280,13 @@ struct DapProcessGuard {
 #[cfg(unix)]
 impl Drop for DapProcessGuard {
     fn drop(&mut self) {
+        // Never signal group 0 or 1: `kill(-0, …)` targets dirge's OWN
+        // process group (suicide) and `kill(-1, …)` every process we can
+        // signal. `setsid()` makes the adapter's pgid == its PID (always
+        // > 1 in practice), but guard defensively against a 0/1 slipping in.
+        if self.pgid <= 1 {
+            return;
+        }
         unsafe {
             let _ = libc::kill(-(self.pgid as libc::pid_t), libc::SIGKILL);
         }
@@ -256,12 +295,18 @@ impl Drop for DapProcessGuard {
 
 /// Handle to a running debug adapter process.
 pub struct DapClient {
+    /// Process-group cleanup guard. Not armed in tests.
+    ///
+    /// Declared BEFORE `_child` so it drops first (fields drop in
+    /// declaration order): the group SIGKILL (`kill(-pgid)`) must fire
+    /// while the leader child is still un-reaped, because the live zombie
+    /// pins the PID/PGID and prevents the kernel from recycling it for an
+    /// unrelated group between the two drops.
+    #[cfg(unix)]
+    _pg_guard: Option<DapProcessGuard>,
     /// Held so `kill_on_drop` works when the client goes out of scope.
     /// `None` only in tests (where RPC runs over duplex channels).
     _child: Option<tokio::process::Child>,
-    /// Process-group cleanup guard. Not armed in tests.
-    #[cfg(unix)]
-    _pg_guard: Option<DapProcessGuard>,
     pub(crate) rpc: DapRpc,
     /// Task draining adapter stderr to tracing.
     _stderr_task: JoinHandle<()>,
