@@ -2,7 +2,7 @@
 //! the status row.
 //!
 //! The strip occupies three rects from `Layout`: `avatar_box` (the
-//! face on the bottom-left), `input_box` (between the chat ║
+//! face on the bottom-left), `input_box` (between the chat │
 //! columns), and `right_margin` (mirror gutter, always blank). The
 //! `status` rect at the very bottom is a single row holding the
 //! BBS-style status chips.
@@ -283,12 +283,16 @@ fn paint_editor_box(
         return;
     }
     let inner_w = area.width as usize - 2;
-    let prompt_main = if is_running { "░▌ " } else { "▌▌ " };
+    let prompt_main = if is_running { "░▌ " } else { "> " };
     // Continuation prompt — a single dim glyph + spaces — so wrapped
     // lines visually attach to the prompt above without taking
     // another bold spinner.
     let prompt_cont = "▏  ";
-    let prompt_w = 3_usize; // both prompts are 3 cells
+    // Reserve 3 cells for the prompt zone regardless of which glyph
+    // fills it (running spinner `░▌ ` is 3 cells; idle `> ` paints 2
+    // and leaves the 3rd blank). Keeping the width fixed keeps the
+    // editor text column and `scene.rs`'s cursor math aligned.
+    let prompt_w = 3_usize;
     let accent = Style::default().fg(RColor::Yellow);
     let user = Style::default().fg(RColor::White);
     let dim = Style::default().fg(RColor::DarkGray);
@@ -570,11 +574,13 @@ mod tests {
         let top = row_chars(&backend, area.y, area.x, area.width);
         assert_eq!(top[0], '╭');
         assert_eq!(top[area.width as usize - 1], '╮');
-        // First inner row contains the prompt + "hi".
+        // First inner row contains the prompt + "hi". The idle
+        // prompt `> ` fills 2 of the 3 reserved prompt cells (3rd
+        // stays blank), so the text starts after two spaces.
         let body: String = row_chars(&backend, area.y + 1, area.x, area.width)
             .into_iter()
             .collect();
-        assert!(body.contains("▌▌ hi"), "got body {:?}", body);
+        assert!(body.contains(">  hi"), "got body {:?}", body);
         // First and last cells are the side borders.
         let chars: Vec<char> = body.chars().collect();
         assert_eq!(chars[0], '│');

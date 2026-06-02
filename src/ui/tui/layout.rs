@@ -23,9 +23,9 @@ pub const MAX_INPUT_ROWS: u16 = 8;
 /// Layout rows top → bottom:
 ///
 /// ```text
-/// row 0                       top_frame    ═══[AGENT STATUS]═══╔═══[AGENT LOG STREAM]═══╗═══[SYSTEM]═══
-/// rows 1..=chat_bot_frame-1   chat / left_panel / right_panel  (chat ║ on each side)
-/// row chat_bot_frame          chat closes (╚═══╝ inside chat band, blanks outside)
+/// row 0                       top_frame    ───[AGENT STATUS]───╭───[AGENT LOG STREAM]───╮───[SYSTEM]───
+/// rows 1..=chat_bot_frame-1   chat / left_panel / right_panel  (chat │ on each side)
+/// row chat_bot_frame          chat closes (╰───╯ inside chat band, blanks outside)
 /// row bottom_strip_top        avatar/input top frame  (╭───╮ inside chat band)
 /// rows ..                     avatar (centered face) | input editor | right margin (blank)
 /// row bottom_strip_bot        avatar/input bot frame  (╰───╯ inside chat band)
@@ -36,9 +36,9 @@ pub const MAX_INPUT_ROWS: u16 = 8;
 ///
 /// ```text
 /// cols [0, left_panel.right)        left panel content
-/// col  left_panel.right - 1         (== chat.left - 1: paint chat's left ║ at chat.x - 1)
-/// cols [chat.x, chat.right)         chat content (between the ║ borders)
-/// col  chat.right                   chat's right ║
+/// col  left_panel.right - 1         (== chat.left - 1: paint chat's left │ at chat.x - 1)
+/// cols [chat.x, chat.right)         chat content (between the │ borders)
+/// col  chat.right                   chat's right │
 /// cols [chat.right+1, cols)         right panel content
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,17 +47,17 @@ pub struct Layout {
     pub full: Rect,
     /// Top frame row (single row, full width).
     pub top_frame: Rect,
-    /// Chat content inner rect (between the ║ borders, top frame, and chat bottom frame).
+    /// Chat content inner rect (between the │ borders, top frame, and chat bottom frame).
     pub chat: Rect,
-    /// Left panel content (excluding chat's left ║).
+    /// Left panel content (excluding chat's left │).
     pub left_panel: Rect,
-    /// Right panel content (excluding chat's right ║).
+    /// Right panel content (excluding chat's right │).
     pub right_panel: Rect,
-    /// Column where the chat's left ║ sits (row range = chat.y..chat_bot_frame.y).
+    /// Column where the chat's left │ sits (row range = chat.y..chat_bot_frame.y).
     pub chat_v_left_col: u16,
-    /// Column where the chat's right ║ sits.
+    /// Column where the chat's right │ sits.
     pub chat_v_right_col: u16,
-    /// Chat bottom frame row (single row, full width — ╚═══╝ painted in chat band only).
+    /// Chat bottom frame row (single row, full width — ╰───╯ painted in chat band only).
     pub chat_bot_frame: Rect,
     /// Avatar box rect — bottom-left, mirrors the input box's vertical extent.
     pub avatar_box: Rect,
@@ -134,16 +134,16 @@ impl Layout {
             if show_left { 0 } else { base_gutter } + if show_right { 0 } else { base_gutter };
         let chat_content_w = base_chat_w.saturating_add(freed);
 
-        let chat_v_left_col = left_gutter; // col of chat's left ║
+        let chat_v_left_col = left_gutter; // col of chat's left │
         let chat_x = chat_v_left_col.saturating_add(1);
         let chat_v_right_col = chat_x.saturating_add(chat_content_w);
-        // Right panel starts after the right ║. Compute its width
+        // Right panel starts after the right │. Compute its width
         // as remainder so any rounding from the symmetric gutter
         // math doesn't leak (right side absorbs the +1).
         let right_panel_x = chat_v_right_col.saturating_add(1);
         let right_panel_w = cols.saturating_sub(right_panel_x);
 
-        // Chat content rect — between ║ borders, rows 1..chat_bot_frame_y.
+        // Chat content rect — between │ borders, rows 1..chat_bot_frame_y.
         let chat = Rect::new(chat_x, chat_content_top, chat_content_w, chat_h);
 
         let left_panel = Rect::new(0, chat_content_top, left_gutter, chat_h);
@@ -257,7 +257,7 @@ mod tests {
         let l = Layout::with_panels(200, 30, 1, false, false);
         assert_eq!(l.left_panel.width, 0);
         assert_eq!(l.right_panel.width, 0);
-        assert_eq!(l.chat.width, 198); // cols - 2 (the two ║ borders)
+        assert_eq!(l.chat.width, 198); // cols - 2 (the two │ borders)
         assert_eq!(l.chat.x, 1);
     }
 
@@ -320,12 +320,12 @@ mod tests {
     }
 
     /// Horizontally the four regions on a chat row tile: left panel
-    /// + chat-║ + chat content + chat-║ + right panel == cols.
+    /// + chat-│ + chat content + chat-│ + right panel == cols.
     #[test]
     fn horizontal_tiling_on_chat_row() {
         let l = Layout::new(200, 30, 1);
         let cols = 200_u16;
-        // left_panel + 1 (left ║) + chat + 1 (right ║) + right_panel == cols
+        // left_panel + 1 (left │) + chat + 1 (right │) + right_panel == cols
         let sum = l.left_panel.width + 1 + l.chat.width + 1 + l.right_panel.width;
         assert_eq!(sum, cols, "horizontal tiling: {:?}", l);
         // chat_v_left_col immediately after left_panel.
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(l.chat_v_right_col, cols - l.right_panel.width - 1);
     }
 
-    /// Input box overlays the chat ║ columns so the input frame's
+    /// Input box overlays the chat │ columns so the input frame's
     /// ╭ ╮ ╰ ╯ corners sit exactly at the chat's vertical lines.
     #[test]
     fn input_box_aligns_with_chat_verticals() {

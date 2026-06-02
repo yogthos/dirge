@@ -89,7 +89,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
         );
     }
 
-    // Chat region (content + ║ verticals).
+    // Chat region (content + │ verticals).
     let mut chat =
         ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset).border_style(frame_style);
     if let Some(sel) = scene.chat_selection {
@@ -105,7 +105,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
         );
     }
 
-    // Chat bottom frame (╚═══╝ in chat band only).
+    // Chat bottom frame (╰───╯ in chat band only).
     f.render_widget(ChatBotFrame::new(&layout).style(frame_style), area);
 
     // Bottom strip (avatar + input box / overlay + status).
@@ -210,7 +210,7 @@ mod tests {
 
     /// End-to-end render: empty buffer, no overlay, defaults.
     /// Verifies the top frame title shows up and the chat band
-    /// renders ║ borders.
+    /// renders │ borders.
     #[test]
     fn renders_empty_scene_with_frames_and_borders() {
         let buf: Vec<LineEntry> = Vec::new();
@@ -232,7 +232,7 @@ mod tests {
         assert!(row0.contains("[AGENT LOG STREAM]"));
         assert!(row0.contains("[SYSTEM]"));
 
-        // Chat ║ verticals on row 1.
+        // Chat │ verticals on row 1.
         let layout = Layout::new(160, 30, 1);
         assert_eq!(
             backend
@@ -240,7 +240,7 @@ mod tests {
                 .cell((layout.chat_v_left_col, 1))
                 .unwrap()
                 .symbol(),
-            "║"
+            "│"
         );
         assert_eq!(
             backend
@@ -248,7 +248,7 @@ mod tests {
                 .cell((layout.chat_v_right_col, 1))
                 .unwrap()
                 .symbol(),
-            "║"
+            "│"
         );
 
         // Status row contains the status text.

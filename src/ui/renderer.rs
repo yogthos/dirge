@@ -76,7 +76,7 @@ pub const MAX_INPUT_VISIBLE_LINES: usize = 8;
 
 /// ui-redesign: the bottom [ALERT] panel wraps the input area in a
 /// double-line frame. Two reserved rows = top border (with title)
-/// plus bottom border. Side borders (║ ... ║) are painted on every
+/// plus bottom border. Side borders (│ ... │) are painted on every
 /// input row so the entire input area reads as one framed card,
 /// matching the mockup's bottom strip.
 ///
@@ -87,7 +87,7 @@ pub const ALERT_FRAME_ROWS: u16 = 2;
 /// ui-redesign: chat area is wrapped in a heavy double-line frame
 /// titled `[AGENT LOG STREAM]`. Two reserved rows = top border
 /// (row 0) + bottom border (row 1 + visible_lines). Side borders
-/// (║ … ║) are painted at the chat-band edges on every visible
+/// (│ … │) are painted at the chat-band edges on every visible
 /// chat row when there's room (content_indent >= 1).
 pub const CHAT_FRAME_ROWS: u16 = 2;
 
@@ -1051,7 +1051,7 @@ impl Renderer {
     }
 
     /// Raw width of the chat band (terminal width minus 2 cols for
-    /// the chat frame's left + right ║). Used for *positioning*
+    /// the chat frame's left + right │). Used for *positioning*
     /// math (`content_indent`, panel widths) — chat text wrapping
     /// should go through `max_line_width` / `content_width` so it
     /// honors the 120-col cap.
